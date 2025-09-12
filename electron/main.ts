@@ -309,7 +309,7 @@ const RENEWAL_CONFIG = {
     min: 30,  // seconds
     max: 60   // seconds
   },
-  fallbackCheckInterval: 5 * 60 * 1000, // 5 minutes in ms for fallback polling
+  fallbackCheckInterval: 30 * 60 * 1000, // 30 minutes in ms for emergency fallback only
 }
 
 // Helper to add grace period to any time
@@ -431,22 +431,25 @@ const scheduleNextRenewal = () => {
         }, 1000)
       }
     } else {
-      // No valid target time - use fallback polling
-      renewalLogger.info(`No specific renewal time available, using fallback check in ${RENEWAL_CONFIG.fallbackCheckInterval / 60000} minutes`, 'schedule')
-      renewalTimer = setTimeout(() => {
-        try {
-          const currentStatus = getRenewalStatus()
-          if (currentStatus.enabled && currentStatus.running) {
+      // No valid target time - only use emergency fallback if system is in unknown state
+      const currentStatus = getRenewalStatus()
+      if (!currentStatus.currentBlock && currentStatus.enabled && currentStatus.running) {
+        renewalLogger.warn(`No current block detected and no renewal time available, using emergency fallback check in ${RENEWAL_CONFIG.fallbackCheckInterval / 60000} minutes`, 'schedule')
+        renewalTimer = setTimeout(() => {
+          try {
             performRenewalCheck()
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
             }
+            scheduleNextRenewal() // Reschedule once to see if we now have valid timing
+          } catch (error) {
+            renewalLogger.error(`Error in emergency fallback renewal check: ${error instanceof Error ? error.message : String(error)}`, 'renewal')
           }
-        } catch (error) {
-          renewalLogger.error(`Error in fallback renewal check: ${error instanceof Error ? error.message : String(error)}`, 'renewal')
-        }
-        scheduleNextRenewal() // Reschedule
-      }, RENEWAL_CONFIG.fallbackCheckInterval)
+        }, RENEWAL_CONFIG.fallbackCheckInterval)
+      } else {
+        renewalLogger.info(`No specific renewal time available but system appears stable - waiting for next status change`, 'schedule')
+        // Do not schedule any fallback - wait for external triggers or schedule changes
+      }
     }
   } catch (error) {
     renewalLogger.error(`Error scheduling next renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')

@@ -6,7 +6,7 @@
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
-import { setImmediate } from 'timers'
+import { setImmediate, setTimeout } from 'timers'
 
 import { 
   startRenewalService as startRenewalServiceLib,
@@ -25,6 +25,7 @@ const LAST_BLOCK_STATE_FILE = join(HOME, '.claude-last-block-state')
 const RENEWAL_LOCK_FILE = join(HOME, '.claude-sentinel-renewal-lock')
 const LAST_RENEWAL_CHECK_FILE = join(HOME, '.claude-last-renewal-check')
 const SCHEDULED_RENEWAL_STATE_FILE = join(HOME, '.claude-scheduled-renewal-state')
+const LAST_SUCCESSFUL_RENEWAL_FILE = join(HOME, '.claude-last-successful-renewal')
 
 type SimpleConfig = { 
   enabled: boolean; 
@@ -146,19 +147,31 @@ function detectAndLogBlockChanges(currentBlock: any) {
 function acquireLock(): boolean {
   try {
     if (existsSync(RENEWAL_LOCK_FILE)) {
-      // Check if lock is stale (older than 5 minutes)
-      const lockTimestamp = parseInt(readFileSync(RENEWAL_LOCK_FILE, 'utf8').trim(), 10)
+      // Check if lock is stale (older than 10 minutes to be safe)
+      const lockData = readFileSync(RENEWAL_LOCK_FILE, 'utf8').trim()
+      const lockInfo = JSON.parse(lockData || '{}')
+      const lockTimestamp = lockInfo.timestamp || parseInt(lockData, 10)
       const lockAge = Date.now() - lockTimestamp
-      if (lockAge < 300000) { // 5 minutes
+      
+      if (lockAge < 600000) { // 10 minutes
+        const lockAgeMinutes = (lockAge / 60000).toFixed(1)
+        renewalLogger.info(`🔒 Lock held by PID ${lockInfo.pid || 'unknown'} (${lockAgeMinutes} min ago)`, 'service')
         return false // Lock is held by another process
       } else {
         // Stale lock, remove it
+        renewalLogger.warn(`🔓 Removing stale lock (${(lockAge / 60000).toFixed(1)} min old)`, 'service')
         unlinkSync(RENEWAL_LOCK_FILE)
       }
     }
     
-    // Acquire lock
-    writeFileSync(RENEWAL_LOCK_FILE, Date.now().toString())
+    // Acquire lock with more information
+    const lockInfo = {
+      timestamp: Date.now(),
+      pid: process.pid,
+      operation: 'renewal-check'
+    }
+    writeFileSync(RENEWAL_LOCK_FILE, JSON.stringify(lockInfo))
+    renewalLogger.info(`🔒 Lock acquired by PID ${process.pid}`, 'service')
     return true
   } catch (error) {
     renewalLogger.error(`Failed to acquire lock: ${error instanceof Error ? error.message : String(error)}`, 'service')
@@ -197,6 +210,55 @@ function recordRenewalCheck() {
   } catch (error) {
     renewalLogger.warn(`Failed to record renewal check time: ${error instanceof Error ? error.message : String(error)}`, 'service')
   }
+}
+
+function recordSuccessfulRenewal() {
+  try {
+    const renewalData = {
+      timestamp: Math.floor(Date.now() / 1000),
+      isoTime: new Date().toISOString()
+    }
+    writeFileSync(LAST_SUCCESSFUL_RENEWAL_FILE, JSON.stringify(renewalData))
+    renewalLogger.info(`Recorded successful renewal at ${renewalData.isoTime}`, 'renewal')
+  } catch (error) {
+    renewalLogger.warn(`Failed to record successful renewal: ${error instanceof Error ? error.message : String(error)}`, 'service')
+  }
+}
+
+function getLastSuccessfulRenewal(): number | null {
+  try {
+    if (!existsSync(LAST_SUCCESSFUL_RENEWAL_FILE)) return null
+    
+    const data = JSON.parse(readFileSync(LAST_SUCCESSFUL_RENEWAL_FILE, 'utf8'))
+    return data.timestamp || null
+  } catch {
+    return null
+  }
+}
+
+function canPerformRenewal(): { allowed: boolean; reason?: string; hoursRemaining?: number } {
+  const lastRenewal = getLastSuccessfulRenewal()
+  
+  if (!lastRenewal) {
+    // No previous renewal recorded - allow first renewal
+    return { allowed: true }
+  }
+  
+  const now = Math.floor(Date.now() / 1000)
+  const hoursSinceLastRenewal = (now - lastRenewal) / 3600
+  const MINIMUM_HOURS_BETWEEN_RENEWALS = 5.0 // 5 hours minimum (Claude session duration)
+  
+  if (hoursSinceLastRenewal < MINIMUM_HOURS_BETWEEN_RENEWALS) {
+    const hoursRemaining = MINIMUM_HOURS_BETWEEN_RENEWALS - hoursSinceLastRenewal
+    const lastRenewalTime = new Date(lastRenewal * 1000).toLocaleString()
+    return {
+      allowed: false,
+      reason: `Last renewal was ${hoursSinceLastRenewal.toFixed(1)} hours ago (${lastRenewalTime}). Must wait ${MINIMUM_HOURS_BETWEEN_RENEWALS} hours between renewals (Claude session duration).`,
+      hoursRemaining: hoursRemaining
+    }
+  }
+  
+  return { allowed: true }
 }
 
 // Generate random delay between 1-5 minutes (60-300 seconds)
@@ -331,6 +393,13 @@ export function performRenewalCheck(): { success: boolean; action?: string; erro
       renewalLogger.info('Starting renewal check...', 'renewal')
       recordRenewalCheck()
       
+      // Check if enough time has passed since last renewal (4-hour minimum)
+      const renewalCheck = canPerformRenewal()
+      if (!renewalCheck.allowed) {
+        renewalLogger.info(`🚫 RENEWAL BLOCKED: ${renewalCheck.reason}`, 'renewal')
+        return { success: true, action: `Renewal blocked: ${renewalCheck.hoursRemaining?.toFixed(1)} hours remaining` }
+      }
+      
       const block = getCurrentBlockInfoLib()
       
       // Detect and log any block state changes during renewal check
@@ -387,6 +456,7 @@ export function performRenewalCheck(): { success: boolean; action?: string; erro
                 renewalLogger.info(`✅ SESSION START RESULT: ${result}`, 'session')
                 if (result) {
                   renewalLogger.info('🎯 NEW CLAUDE SESSION STARTED SUCCESSFULLY (SCHEDULED)', 'session')
+                  recordSuccessfulRenewal() // Record the successful renewal
                 } else {
                   renewalLogger.error('❌ SCHEDULED SESSION START FAILED', 'session')
                 }
@@ -436,6 +506,7 @@ export function performRenewalCheck(): { success: boolean; action?: string; erro
             renewalLogger.info(`✅ SESSION START RESULT: ${result}`, 'session')
             if (result) {
               renewalLogger.info('🎯 NEW CLAUDE SESSION STARTED SUCCESSFULLY', 'session')
+              recordSuccessfulRenewal() // Record the successful renewal
             } else {
               renewalLogger.error('❌ SESSION START FAILED', 'session')
             }
@@ -471,7 +542,8 @@ export function resetSessionTracking(): { success: boolean; error?: string } {
       LAST_BLOCK_STATE_FILE,
       RENEWAL_LOCK_FILE,
       LAST_RENEWAL_CHECK_FILE,
-      SCHEDULED_RENEWAL_STATE_FILE
+      SCHEDULED_RENEWAL_STATE_FILE,
+      LAST_SUCCESSFUL_RENEWAL_FILE
     ]
     const resetFiles: string[] = []
     

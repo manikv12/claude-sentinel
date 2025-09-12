@@ -14,8 +14,8 @@ import {
   detectBlockChanges
 } from './block-tracker'
 
-// Toggle verbose logging via env var (temporarily enabled for debugging)
-const DEBUG = process.env.SENTINEL_DEBUG === '1' || true
+// Toggle verbose logging via env var
+const DEBUG = process.env.SENTINEL_DEBUG === '1'
 
 // Cache for loaded data to prevent repeated file I/O
 let cachedData: SentinelUsageEntry[] | null = null
@@ -24,7 +24,7 @@ let lastCacheTime = 0
 let cachedAnalysis: SentinelUsageAnalysis | null = null
 
 let fileModTimes: Map<string, number> = new Map() // Track file modification times
-const CACHE_DURATION = 60000 // 1 minute cache
+const CACHE_DURATION = 300000 // 5 minute cache
 const INCREMENTAL_CHECK_INTERVAL = 10000 // 10 second interval for incremental checks
 let lastIncrementalCheck = 0
 
