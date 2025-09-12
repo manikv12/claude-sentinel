@@ -158,11 +158,11 @@ export function startClaudeSession(): boolean {
         
         // Only assume successful if we got some reasonable output
         if (stdoutData.trim().length > 0) {
-          log('Timeout but got output - marking as successful', 'info', 'session')
-          writeFileSync(LAST_ACTIVITY_FILE, Math.floor(Date.now() / 1000).toString())
-          log(`Last activity file written: ${LAST_ACTIVITY_FILE}`, 'info', 'session')
+          log('⏰ Timeout but got output - marking as successful', 'info', 'session')
+          // Note: No longer writing to lastActivity file - using block data instead
+          log(`🔄 Session activity detected at: ${new Date().toLocaleString()}`, 'info', 'session')
         } else {
-          log('Timeout with no output - marking as failed', 'error', 'session')
+          log('⏰ Timeout with no output - marking as failed', 'error', 'session')
         }
         completed = true
       }
@@ -178,15 +178,15 @@ export function startClaudeSession(): boolean {
       completed = true
       
       if (code === 0) {
-        log('Claude session started successfully', 'info', 'session')
+        log('✅ Claude session started successfully', 'info', 'session')
         try {
-          writeFileSync(LAST_ACTIVITY_FILE, Math.floor(Date.now() / 1000).toString())
-          log(`Last activity file written successfully: ${LAST_ACTIVITY_FILE}`, 'info', 'session')
-        } catch (writeError) {
-          log(`Failed to write last activity file: ${writeError}`, 'error', 'session')
+          // Note: No longer writing to lastActivity file - using block data instead
+          log(`🔄 Session completed successfully at: ${new Date().toLocaleString()}`, 'info', 'session')
+        } catch (logError) {
+          log(`❌ Failed to log session completion: ${logError}`, 'error', 'session')
         }
       } else {
-        log(`Claude session failed with exit code ${code}`, 'error', 'session')
+        log(`❌ Claude session failed with exit code ${code}`, 'error', 'session')
       }
     })
     
@@ -232,21 +232,8 @@ function calculateSleepDuration(): number {
     return 600 // 10 minutes
   }
   
-  // Fallback to time-based estimation if block info isn't available
-  if (existsSync(LAST_ACTIVITY_FILE)) {
-    try {
-      const lastActivity = parseInt(readFileSync(LAST_ACTIVITY_FILE, 'utf8').trim())
-      const now = Math.floor(Date.now() / 1000)
-      const timeSinceActivity = now - lastActivity
-      const timeUntilReset = 18000 - timeSinceActivity // 5 hours in seconds
-      
-      if (timeUntilReset <= 300) return 30 // 30 seconds if close to reset
-      if (timeUntilReset <= 1800) return 120 // 2 minutes if within 30 min
-      return 600 // 10 minutes otherwise
-    } catch (error) {
-      log(`Error reading last activity: ${error}`, 'error', 'service')
-    }
-  }
+  // No block info available, use default intervals
+  log('No current block data available for sleep calculation', 'warn', 'service')
   
   return 300 // Default 5 minutes
 }
@@ -331,15 +318,16 @@ export function getRenewalStatus(): RenewalStatus {
     }
   }
   
-  // Get last activity
+  // Get last activity from current block instead of file
   let lastActivity: Date | undefined
-  if (existsSync(LAST_ACTIVITY_FILE)) {
-    try {
-      const timestamp = parseInt(readFileSync(LAST_ACTIVITY_FILE, 'utf8').trim())
-      lastActivity = new Date(timestamp * 1000)
-    } catch (error) {
-      log(`Error reading last activity: ${error}`, 'error', 'service')
-    }
+  let block: any = null
+  try {
+    const { getCurrentBlockInfo } = require('./ccusage-integration')
+    block = getCurrentBlockInfo()
+    lastActivity = block && block.startTime ? new Date(block.startTime) : undefined
+  } catch (error) {
+    // Fallback if ccusage-integration is not available
+    lastActivity = undefined
   }
   
   // Get time until reset
@@ -413,34 +401,183 @@ export function stopRenewalService(): { success: boolean; error?: string } {
 }
 
 /**
+ * Reset session tracking files to handle orphaned sessions
+ */
+export function resetSessionTracking(): { success: boolean; error?: string } {
+  try {
+    const filesToReset = [
+      LAST_ACTIVITY_FILE, 
+      START_TIME_FILE,
+      join(homedir(), '.claude-last-block-state'),
+      join(homedir(), '.claude-last-renewal-check'),
+      join(homedir(), '.claude-sentinel-renewal-lock')
+    ]
+    const resetFiles: string[] = []
+    
+    for (const file of filesToReset) {
+      if (existsSync(file)) {
+        unlinkSync(file)
+        resetFiles.push(file)
+        log(`Deleted session file: ${file}`, 'info', 'session')
+      }
+    }
+    
+    if (resetFiles.length > 0) {
+      log(`Session reset complete. Deleted ${resetFiles.length} files: ${resetFiles.map(f => f.split('/').pop()).join(', ')}`, 'info', 'session')
+      return { success: true }
+    } else {
+      log('No session files found to reset', 'info', 'session')
+      return { success: true }
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error'
+    log(`Failed to reset session tracking: ${errorMessage}`, 'error', 'session')
+    return { success: false, error: errorMessage }
+  }
+}
+
+/**
+ * Force start a new Claude session and reset tracking
+ */
+export function forceStartNewSession(): { success: boolean; error?: string } {
+  try {
+    log('Force starting new Claude session...', 'info', 'session')
+    
+    // Reset session tracking first
+    const resetResult = resetSessionTracking()
+    if (!resetResult.success) {
+      return resetResult
+    }
+    
+    // Start new session
+    const sessionResult = startClaudeSession()
+    if (sessionResult) {
+      log('New session forced successfully', 'info', 'session')
+      return { success: true }
+    } else {
+      log('Failed to force start new session', 'error', 'session')
+      return { success: false, error: 'Failed to start Claude session' }
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error'
+    log(`Error forcing new session: ${errorMessage}`, 'error', 'session')
+    return { success: false, error: errorMessage }
+  }
+}
+
+/**
+ * Get session status and detect potential orphans
+ */
+export function getSessionStatus(): { 
+  hasLocalActivity: boolean; 
+  lastActivityTime?: Date; 
+  timeSinceActivity?: number;
+  sessionFiles: string[];
+  orphanedSession: boolean;
+} {
+  const sessionFiles: string[] = []
+  // Include all Claude-related files that might exist
+  const allSessionFiles = [
+    LAST_ACTIVITY_FILE,
+    START_TIME_FILE, 
+    PID_FILE,
+    CONFIG_FILE,
+    join(homedir(), '.claude-last-block-state'),
+    join(homedir(), '.claude-last-renewal-check'),
+    join(homedir(), '.claude-sentinel-renewal-lock')
+  ]
+  
+  for (const file of allSessionFiles) {
+    if (existsSync(file)) {
+      sessionFiles.push(file.split('/').pop() || file)
+    }
+  }
+  
+  // Use block data instead of lastActivity file for session status
+  let block: any = null
+  try {
+    const { getCurrentBlockInfo } = require('./ccusage-integration')
+    block = getCurrentBlockInfo()
+  } catch (error) {
+    // Fallback if ccusage-integration is not available
+    block = null
+  }
+  
+  let lastActivityTime: Date | undefined
+  let timeSinceActivity: number | undefined
+  let orphanedSession = false
+  
+  if (block && block.startTime) {
+    lastActivityTime = new Date(block.startTime)
+    timeSinceActivity = Math.floor((Date.now() - lastActivityTime.getTime()) / 1000)
+    
+    // Consider session orphaned if block is inactive but should still be active
+    if (!block.isActive && block.timeRemaining && block.timeRemaining > 0) {
+      orphanedSession = true
+      log(`Potential orphaned session detected: block shows inactive but should have ${block.timeRemaining} minutes remaining`, 'warn', 'session')
+    }
+  }
+  
+  return {
+    hasLocalActivity: !!lastActivityTime,
+    lastActivityTime,
+    timeSinceActivity,
+    sessionFiles,
+    orphanedSession
+  }
+}
+
+/**
  * Perform a single renewal check and action if needed
  * Non-blocking implementation that returns immediately
  */
 export function performRenewalCheck(): { success: boolean; action?: string; error?: string } {
   try {
-    const minutesUntilReset = getMinutesUntilReset()
+    const scheduledStartTime = existsSync(START_TIME_FILE) ? readFileSync(START_TIME_FILE, 'utf8').trim() : null
     let shouldRenew = false
     let reason = ''
     
-    if (minutesUntilReset !== null && minutesUntilReset <= 2) {
-      shouldRenew = true
-      reason = `Reset imminent (${minutesUntilReset} minutes remaining)`
-    } else if (existsSync(LAST_ACTIVITY_FILE)) {
-      const lastActivity = parseInt(readFileSync(LAST_ACTIVITY_FILE, 'utf8').trim())
-      const now = Math.floor(Date.now() / 1000)
-      const timeSinceActivity = now - lastActivity
+    // 1. Check if user has scheduled a future start time
+    if (scheduledStartTime) {
+      const scheduledTime = new Date(scheduledStartTime)
+      const now = new Date()
       
-      if (timeSinceActivity >= 18000) { // 5 hours
-        shouldRenew = true
-        reason = '5 hours elapsed since last activity'
+      if (scheduledTime > now) {
+        // Scheduled time is in the future - wait until then
+        const hoursUntilScheduled = (scheduledTime.getTime() - now.getTime()) / (1000 * 60 * 60)
+        log(`⏰ SCHEDULED RENEWAL: Waiting for scheduled time in ${hoursUntilScheduled.toFixed(1)} hours`, 'info', 'renewal')
+        return { success: true }
+      } else {
+        // Scheduled time has passed - clear schedule and proceed with renewal check
+        log(`⏰ SCHEDULED TIME REACHED: Clearing schedule and checking for renewal`, 'info', 'renewal')
+        if (existsSync(START_TIME_FILE)) unlinkSync(START_TIME_FILE)
       }
-    } else {
+    }
+
+    // 2. Base renewal decision on current block state instead of lastActivity
+    let block: any = null
+    try {
+      const { getCurrentBlockInfo } = require('./ccusage-integration')
+      block = getCurrentBlockInfo()
+    } catch (error) {
+      // Fallback if ccusage-integration is not available
+      block = null
+    }
+    
+    if (!block) {
       shouldRenew = true
-      reason = 'No previous activity recorded'
+      reason = 'No current block detected - starting fresh session'
+    } else if (!block.isActive) {
+      shouldRenew = true
+      reason = 'Current block has expired - starting new session'
+    } else {
+      const timeRemainingHours = (block.timeRemaining || 0) / 60
+      log(`⏳ WAITING: Block still active, ${timeRemainingHours.toFixed(1)} hours remaining`, 'info', 'renewal')
+      return { success: true }
     }
     
     if (shouldRenew) {
-      log(`Renewal needed: ${reason}`, 'info', 'renewal')
+      log(`🚀 SESSION START TRIGGERED: ${reason}`, 'info', 'renewal')
       
       // Start session asynchronously without blocking (fire and forget)
       setImmediate(() => {

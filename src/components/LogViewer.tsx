@@ -10,7 +10,8 @@ import {
   AlertCircle,
   Info,
   CheckCircle,
-  Clock
+  Clock,
+  Trash2
 } from 'lucide-react'
 
 interface LogEntry {
@@ -34,6 +35,7 @@ export function LogViewer() {
     search: ''
   })
   const [logsPath, setLogsPath] = useState<string>('')
+  const [isClearingLogs, setIsClearingLogs] = useState(false)
 
   const loadLogs = async () => {
     setIsLoading(true)
@@ -127,6 +129,28 @@ export function LogViewer() {
     })
   }
 
+  const clearOldLogs = async () => {
+    setIsClearingLogs(true)
+    try {
+      // Calculate date 1 day ago
+      const oneDayAgo = new Date()
+      oneDayAgo.setDate(oneDayAgo.getDate() - 1)
+      
+      const result = await window.electronAPI.clearRenewalLogs?.(oneDayAgo.toISOString())
+      if (result?.success) {
+        // Reload logs to show updated list
+        await loadLogs()
+        console.log('Logs older than 1 day cleared successfully')
+      } else {
+        console.error('Failed to clear old logs:', result?.error)
+      }
+    } catch (error) {
+      console.error('Failed to clear old logs:', error)
+    } finally {
+      setIsClearingLogs(false)
+    }
+  }
+
   return (
     <div className="space-y-4">
       {/* Header */}
@@ -147,6 +171,16 @@ export function LogViewer() {
           <Button onClick={exportLogs} variant="outline" size="sm">
             <Download className="h-4 w-4 mr-2" />
             Export
+          </Button>
+          <Button 
+            onClick={clearOldLogs} 
+            disabled={isClearingLogs} 
+            variant="outline" 
+            size="sm"
+            className="text-red-600 hover:text-red-700 hover:bg-red-50 dark:text-red-400 dark:hover:text-red-300 dark:hover:bg-red-950/20"
+          >
+            <Trash2 className="h-4 w-4 mr-2" />
+            {isClearingLogs ? 'Clearing...' : 'Clear Old'}
           </Button>
         </div>
       </div>

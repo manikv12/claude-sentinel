@@ -6,6 +6,7 @@
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
+import { setImmediate } from 'timers'
 
 import { 
   startRenewalService as startRenewalServiceLib,
@@ -19,8 +20,10 @@ import { getCurrentBlockInfo as getCurrentBlockInfoLib } from '../../src/lib/ccu
 const HOME = homedir()
 const PID_FILE = join(HOME, '.claude-sentinel-renewal.pid')
 const CONFIG_FILE = join(HOME, '.claude-sentinel-config.json')
-const LAST_ACTIVITY_FILE = join(HOME, '.claude-last-activity')
 const START_TIME_FILE = join(HOME, '.claude-auto-renew-start-time')
+const LAST_BLOCK_STATE_FILE = join(HOME, '.claude-last-block-state')
+const RENEWAL_LOCK_FILE = join(HOME, '.claude-sentinel-renewal-lock')
+const LAST_RENEWAL_CHECK_FILE = join(HOME, '.claude-last-renewal-check')
 
 type SimpleConfig = { enabled: boolean; checkInterval?: number; enableLogging?: boolean }
 
@@ -51,14 +54,6 @@ function isProcessRunning(): { running: boolean; pid?: number } {
   }
 }
 
-function readLastActivity(): Date | null {
-  try {
-    if (!existsSync(LAST_ACTIVITY_FILE)) return null
-    const ts = parseInt(readFileSync(LAST_ACTIVITY_FILE, 'utf8').trim(), 10)
-    if (Number.isFinite(ts)) return new Date(ts * 1000)
-  } catch {}
-  return null
-}
 
 function readScheduledStart(): string | null {
   try {
@@ -67,6 +62,130 @@ function readScheduledStart(): string | null {
     return raw || null
   } catch {
     return null
+  }
+}
+
+interface BlockState {
+  isActive: boolean
+  startTime: string | null
+  blockId?: string
+}
+
+function readLastBlockState(): BlockState | null {
+  try {
+    if (!existsSync(LAST_BLOCK_STATE_FILE)) return null
+    const raw = readFileSync(LAST_BLOCK_STATE_FILE, 'utf8').trim()
+    if (!raw) return null
+    return JSON.parse(raw)
+  } catch {
+    return null
+  }
+}
+
+function writeBlockState(state: BlockState) {
+  try {
+    writeFileSync(LAST_BLOCK_STATE_FILE, JSON.stringify(state))
+  } catch (error) {
+    renewalLogger.error(`Failed to write block state: ${error instanceof Error ? error.message : String(error)}`, 'service')
+  }
+}
+
+function detectAndLogBlockChanges(currentBlock: any) {
+  const lastState = readLastBlockState()
+  const currentState: BlockState = {
+    isActive: !!(currentBlock && currentBlock.isActive),
+    startTime: currentBlock?.startTime || null,
+    blockId: currentBlock?.startTime || null // Use start time as block ID
+  }
+
+  if (!lastState) {
+    // First time running - just save current state
+    if (currentState.isActive) {
+      renewalLogger.info(`Initial block detected: started at ${currentState.startTime}`, 'renewal')
+    }
+    writeBlockState(currentState)
+    return
+  }
+
+  // Check for new block starting
+  if (!lastState.isActive && currentState.isActive) {
+    renewalLogger.info(`New usage block started at ${currentState.startTime}`, 'renewal')
+    writeBlockState(currentState)
+    return
+  }
+
+  // Check for block ID change (new block with different start time)
+  if (lastState.isActive && currentState.isActive && lastState.blockId !== currentState.blockId) {
+    renewalLogger.info(`New usage block started (replacing previous): started at ${currentState.startTime}`, 'renewal')
+    writeBlockState(currentState)
+    return
+  }
+
+  // Check for block ending
+  if (lastState.isActive && !currentState.isActive) {
+    renewalLogger.info(`Usage block ended. Previous block started at ${lastState.startTime}`, 'renewal')
+    writeBlockState(currentState)
+    return
+  }
+
+  // No change in block state, but update the state file anyway
+  if (JSON.stringify(lastState) !== JSON.stringify(currentState)) {
+    writeBlockState(currentState)
+  }
+}
+
+function acquireLock(): boolean {
+  try {
+    if (existsSync(RENEWAL_LOCK_FILE)) {
+      // Check if lock is stale (older than 5 minutes)
+      const lockAge = Date.now() - readFileSync(RENEWAL_LOCK_FILE, 'utf8').trim()
+      if (lockAge < 300000) { // 5 minutes
+        return false // Lock is held by another process
+      } else {
+        // Stale lock, remove it
+        unlinkSync(RENEWAL_LOCK_FILE)
+      }
+    }
+    
+    // Acquire lock
+    writeFileSync(RENEWAL_LOCK_FILE, Date.now().toString())
+    return true
+  } catch (error) {
+    renewalLogger.error(`Failed to acquire lock: ${error instanceof Error ? error.message : String(error)}`, 'service')
+    return false
+  }
+}
+
+function releaseLock() {
+  try {
+    if (existsSync(RENEWAL_LOCK_FILE)) {
+      unlinkSync(RENEWAL_LOCK_FILE)
+    }
+  } catch (error) {
+    renewalLogger.warn(`Failed to release lock: ${error instanceof Error ? error.message : String(error)}`, 'service')
+  }
+}
+
+function canPerformRenewalCheck(): boolean {
+  try {
+    if (!existsSync(LAST_RENEWAL_CHECK_FILE)) return true
+    
+    const lastCheck = parseInt(readFileSync(LAST_RENEWAL_CHECK_FILE, 'utf8').trim(), 10)
+    const now = Math.floor(Date.now() / 1000)
+    const timeSinceLastCheck = now - lastCheck
+    
+    // Minimum 30 seconds between renewal checks
+    return timeSinceLastCheck >= 30
+  } catch {
+    return true
+  }
+}
+
+function recordRenewalCheck() {
+  try {
+    writeFileSync(LAST_RENEWAL_CHECK_FILE, Math.floor(Date.now() / 1000).toString())
+  } catch (error) {
+    renewalLogger.warn(`Failed to record renewal check time: ${error instanceof Error ? error.message : String(error)}`, 'service')
   }
 }
 
@@ -90,10 +209,33 @@ export function setScheduledStartTime(isoTime: string | null) {
 export function getRenewalStatus() {
   const cfg = loadConfig()
   const proc = isProcessRunning()
-  const lastActivity = readLastActivity()
   const block = getCurrentBlockInfoLib()
 
-  const timeRemaining = block?.timeRemaining ?? null
+  // Only perform block monitoring if auto-renewal is enabled
+  if (cfg.enabled) {
+    // Detect and log any block state changes using original block data
+    detectAndLogBlockChanges(block)
+  }
+
+  const scheduledStartTime = readScheduledStart()
+  
+  // Calculate next renewal time based on block data instead of lastActivity
+  let nextRenewal: Date | null = null
+  
+  if (scheduledStartTime) {
+    // If user has scheduled a time, that's the next renewal
+    nextRenewal = new Date(scheduledStartTime)
+  } else if (block && block.isActive && block.endTime) {
+    // Next renewal is when current block ends
+    nextRenewal = new Date(block.endTime)
+  } else if (block && block.startTime) {
+    // Fallback: 5 hours after block start time
+    nextRenewal = new Date(new Date(block.startTime).getTime() + 5 * 60 * 60 * 1000)
+  }
+  
+  // Use the current block's time remaining instead of calculating from lastActivity
+  const timeRemaining = block && block.isActive ? block.timeRemaining : null
+
   const currentBlock = block && block.isActive ? {
     startTime: block.startTime ? new Date(block.startTime) : null,
     endTime: block.endTime ? new Date(block.endTime) : null,
@@ -101,7 +243,8 @@ export function getRenewalStatus() {
     limit: block.limit || 0
   } : null
 
-  const scheduledStartTime = readScheduledStart()
+  // For lastActivity, use block start time if available, otherwise null
+  const lastActivity = block && block.startTime ? new Date(block.startTime) : null
 
   return {
     enabled: cfg.enabled,
@@ -109,7 +252,7 @@ export function getRenewalStatus() {
     pid: proc.pid,
     lastActivity,
     timeRemaining,
-    nextRenewal: timeRemaining != null ? new Date(Date.now() + timeRemaining * 60 * 1000) : null,
+    nextRenewal,
     scheduledStartTime,
     currentBlock
   }
@@ -118,70 +261,148 @@ export function getRenewalStatus() {
 // Decide renewal using current block info to avoid shelling out
 export function performRenewalCheck(): { success: boolean; action?: string; error?: string } {
   try {
-    renewalLogger.info('Starting renewal check...', 'renewal')
-    
-    const block = getCurrentBlockInfoLib()
-    const minutesUntilReset = block?.timeRemaining ?? null
-    const lastActivity = readLastActivity()
-    const nowSec = Math.floor(Date.now() / 1000)
-    const lastActivitySec = lastActivity ? Math.floor(lastActivity.getTime() / 1000) : null
-    const timeSinceActivity = lastActivitySec ? nowSec - lastActivitySec : null
-
-    renewalLogger.info(`Renewal check state: block=${JSON.stringify(block)}, minutesUntilReset=${minutesUntilReset}, lastActivity=${lastActivity}, timeSinceActivity=${timeSinceActivity}`, 'renewal')
-
-    let shouldRenew = false
-    let reason = ''
-    const hasActiveBlock = !!(block && block.isActive)
-
-    renewalLogger.info(`Block analysis: hasActiveBlock=${hasActiveBlock}, isActive=${block?.isActive}, timeRemaining=${block?.timeRemaining}`, 'renewal')
-
-    if (minutesUntilReset !== null && minutesUntilReset <= 2) {
-      shouldRenew = true
-      reason = `Reset imminent (${minutesUntilReset} minutes remaining)`
-      renewalLogger.info(`Trigger condition: Reset imminent`, 'renewal')
-    } else if (!hasActiveBlock) {
-      // No active block detected; start a session unless we very recently had activity (< 60s)
-      renewalLogger.info(`No active block detected. lastActivitySec=${lastActivitySec}, timeSinceActivity=${timeSinceActivity}`, 'renewal')
-      if (!lastActivitySec || (timeSinceActivity != null && timeSinceActivity > 60)) {
-        shouldRenew = true
-        reason = 'No active block – starting new session'
-        renewalLogger.info(`Trigger condition: No active block and sufficient time since activity`, 'renewal')
-      } else {
-        renewalLogger.info(`Skipping renewal: recent activity detected (${timeSinceActivity}s ago)`, 'renewal')
-      }
-    } else if (timeSinceActivity != null && timeSinceActivity >= 18000) { // 5h gap
-      shouldRenew = true
-      reason = '5 hours elapsed since last activity'
-      renewalLogger.info(`Trigger condition: 5 hour gap`, 'renewal')
-    } else if (lastActivitySec == null) {
-      shouldRenew = true
-      reason = 'No previous activity recorded'
-      renewalLogger.info(`Trigger condition: No previous activity`, 'renewal')
-    } else {
-      renewalLogger.info(`No renewal needed: hasActiveBlock=${hasActiveBlock}, timeSinceActivity=${timeSinceActivity}`, 'renewal')
+    // Check if auto-renewal is enabled first
+    const cfg = loadConfig()
+    if (!cfg.enabled) {
+      return { success: true }
     }
 
-    if (shouldRenew) {
-      renewalLogger.info(`Renewal triggered: ${reason}`, 'renewal')
-      renewalLogger.info('Starting Claude session via setTimeout...', 'renewal')
+    // Rate limiting check
+    if (!canPerformRenewalCheck()) {
+      renewalLogger.info('⏱️ Rate limiting: renewal check too frequent, skipping', 'renewal')
+      return { success: true }
+    }
+
+    // Try to acquire lock to prevent concurrent checks
+    if (!acquireLock()) {
+      renewalLogger.info('🔒 Another renewal check in progress, skipping', 'renewal')
+      return { success: true }
+    }
+
+    try {
+      renewalLogger.info('Starting renewal check...', 'renewal')
+      recordRenewalCheck()
       
-      // Start session asynchronously (non-blocking)
-      setTimeout(() => {
-        try { 
-          renewalLogger.info('setTimeout callback executing - calling startClaudeSession()', 'renewal')
-          const result = startClaudeSession()
-          renewalLogger.info(`startClaudeSession() returned: ${result}`, 'renewal')
-        } catch (sessionError) {
-          renewalLogger.error(`Error in setTimeout callback: ${sessionError instanceof Error ? sessionError.message : String(sessionError)}`, 'renewal')
+      const block = getCurrentBlockInfoLib()
+      
+      // Detect and log any block state changes during renewal check
+      detectAndLogBlockChanges(block)
+      
+      const scheduledStartTime = readScheduledStart()
+      const now = new Date()
+
+      renewalLogger.info(`Renewal check state: block=${block ? `${block.isActive ? 'ACTIVE' : 'EXPIRED'} (${block.startTime})` : 'NONE'}, scheduledStartTime=${scheduledStartTime}`, 'renewal')
+
+      let shouldRenew = false
+      let reason = ''
+
+      // SCHEDULE-AWARE RENEWAL LOGIC
+      
+      // 1. Check if user has scheduled a future start time
+      if (scheduledStartTime) {
+        const scheduledTime = new Date(scheduledStartTime)
+        
+        if (scheduledTime > now) {
+          // Scheduled time is in the future - wait until then
+          const hoursUntilScheduled = (scheduledTime.getTime() - now.getTime()) / (1000 * 60 * 60)
+          renewalLogger.info(`⏰ SCHEDULED RENEWAL: Waiting for scheduled time in ${hoursUntilScheduled.toFixed(1)} hours`, 'renewal')
+          return { success: true }
+        } else {
+          // Scheduled time has passed - clear schedule and proceed with renewal check
+          renewalLogger.info(`⏰ SCHEDULED TIME REACHED: Clearing schedule and checking for renewal`, 'renewal')
+          setScheduledStartTime(null)
         }
-      }, 0)
-      return { success: true, action: reason }
+      }
+
+      // 2. Base renewal decision on block state instead of lastActivity
+      if (!block) {
+        // No block data - start fresh session
+        shouldRenew = true
+        reason = 'No current block detected - starting fresh session'
+        renewalLogger.info(`✅ TRIGGER: No block data available`, 'renewal')
+      }
+      else if (!block.isActive) {
+        // Block has expired - start new session
+        shouldRenew = true
+        reason = 'Current block has expired - starting new session'
+        renewalLogger.info(`✅ TRIGGER: Block expired`, 'renewal')
+      }
+      else {
+        // Block is still active - wait for it to expire
+        const timeRemainingHours = (block.timeRemaining || 0) / 60
+        renewalLogger.info(`⏳ WAITING: Block still active, ${timeRemainingHours.toFixed(1)} hours remaining`, 'renewal')
+        shouldRenew = false
+      }
+
+      if (shouldRenew) {
+        renewalLogger.info(`🚀 SESSION START TRIGGERED: ${reason}`, 'renewal')
+        renewalLogger.info('Starting Claude session via setTimeout...', 'renewal')
+        
+        // Start session asynchronously (non-blocking)
+        setImmediate(() => {
+          try { 
+            renewalLogger.info('setImmediate callback executing - calling startClaudeSession()', 'renewal')
+            renewalLogger.info('📞 CALLING startClaudeSession() NOW', 'session')
+            const result = startClaudeSession()
+            renewalLogger.info(`✅ SESSION START RESULT: ${result}`, 'session')
+            if (result) {
+              renewalLogger.info('🎯 NEW CLAUDE SESSION STARTED SUCCESSFULLY', 'session')
+            } else {
+              renewalLogger.error('❌ SESSION START FAILED', 'session')
+            }
+          } catch (sessionError) {
+            renewalLogger.error(`💥 Error in setImmediate callback: ${sessionError instanceof Error ? sessionError.message : String(sessionError)}`, 'renewal')
+          }
+        })
+        return { success: true, action: reason }
+      } else {
+        renewalLogger.info('✋ NO SESSION STARTED - conditions not met', 'renewal')
+      }
+      
+      return { success: true }
+    } finally {
+      // Always release the lock
+      releaseLock()
     }
-    renewalLogger.info('Renewal check: no action needed', 'renewal')
-    return { success: true }
   } catch (error) {
     renewalLogger.error(`Renewal check failed: ${error instanceof Error ? error.message : String(error)}`, 'renewal')
+    releaseLock()
     return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
+/**
+ * Force reset session tracking files and clear block state
+ */
+export function resetSessionTracking(): { success: boolean; error?: string } {
+  try {
+    const filesToReset = [
+      START_TIME_FILE,
+      LAST_BLOCK_STATE_FILE,
+      RENEWAL_LOCK_FILE,
+      LAST_RENEWAL_CHECK_FILE
+    ]
+    const resetFiles: string[] = []
+    
+    for (const file of filesToReset) {
+      if (existsSync(file)) {
+        unlinkSync(file)
+        resetFiles.push(file.split('/').pop() || file)
+        renewalLogger.info(`Deleted session file: ${file}`, 'session')
+      }
+    }
+    
+    if (resetFiles.length > 0) {
+      renewalLogger.info(`Session reset complete. Deleted ${resetFiles.length} files: ${resetFiles.join(', ')}`, 'session')
+      return { success: true }
+    } else {
+      renewalLogger.info('No session files found to reset', 'session')
+      return { success: true }
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error'
+    renewalLogger.error(`Failed to reset session tracking: ${errorMessage}`, 'session')
+    return { success: false, error: errorMessage }
   }
 }
 

@@ -25,6 +25,7 @@ interface AppSettings {
   refreshInterval: number
   theme: 'light' | 'dark' | 'system'
   dataPath: string
+  claudePlan: 'pro' | 'max-5x' | 'max-20x' | 'auto' // New Claude plan setting
   autoRenewal: {
     enabled: boolean
     startTime?: string // ISO string for scheduled start
@@ -43,6 +44,7 @@ export function Settings() {
     refreshInterval: 5,
     theme: 'system',
     dataPath: '',
+    claudePlan: 'auto',
     autoRenewal: {
       enabled: false,
       checkInterval: 5,
@@ -136,6 +138,7 @@ export function Settings() {
       refreshInterval: 5,
       theme: 'system',
       dataPath: '',
+      claudePlan: 'auto',
       autoRenewal: {
         enabled: false,
         checkInterval: 5,
@@ -319,6 +322,25 @@ export function Settings() {
               <option value="system">System</option>
               <option value="light">Light</option>
               <option value="dark">Dark</option>
+            </select>
+          </div>
+          
+          <div className="flex items-center justify-between">
+            <div>
+              <label className="text-sm font-medium">Claude Plan</label>
+              <p className="text-xs text-muted-foreground">
+                Select your Claude subscription plan for accurate usage limits
+              </p>
+            </div>
+            <select
+              value={settings.claudePlan}
+              onChange={(e) => updateSetting('claudePlan', e.target.value as 'pro' | 'max-5x' | 'max-20x' | 'auto')}
+              className="px-3 py-1 border rounded-md text-sm bg-secondary text-foreground border-border focus:outline-none focus:ring-1 focus:ring-primary"
+            >
+              <option value="auto">Auto-detect</option>
+              <option value="pro">Pro ($20/month)</option>
+              <option value="max-5x">Max 5x ($100/month)</option>
+              <option value="max-20x">Max 20x ($200/month)</option>
             </select>
           </div>
         </CardContent>

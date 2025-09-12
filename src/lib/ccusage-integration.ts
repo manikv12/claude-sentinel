@@ -6,6 +6,13 @@
 import { readFileSync, existsSync, readdirSync, statSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
+import { 
+  logBlockEvent, 
+  saveBlockSnapshot, 
+  loadBlockSnapshot, 
+  createBlockId,
+  detectBlockChanges
+} from './block-tracker'
 
 // Toggle verbose logging via env var
 const DEBUG = process.env.SENTINEL_DEBUG === '1'
@@ -15,6 +22,7 @@ let cachedData: SentinelUsageEntry[] | null = null
 let lastCacheTime = 0
 // Cache processed analysis too to avoid recomputing on each call
 let cachedAnalysis: SentinelUsageAnalysis | null = null
+
 let fileModTimes: Map<string, number> = new Map() // Track file modification times
 const CACHE_DURATION = 60000 // 1 minute cache
 const INCREMENTAL_CHECK_INTERVAL = 10000 // 10 second interval for incremental checks
@@ -267,14 +275,27 @@ function findAllHistoricalBlocks(entries: SentinelUsageEntry[]): HistoricalBlock
       const lastEntryTime = new Date(lastEntry.timestamp)
       const timeSinceLastEntry = entryTime.getTime() - lastEntryTime.getTime()
       
-      if (timeSinceBlockStart > sessionDurationMs || timeSinceLastEntry > sessionDurationMs) {
-        // Close current block (matches ccusage logic exactly)
+      if (timeSinceBlockStart > sessionDurationMs) {
+        // Close current block when 5-hour window expires (matches ccusage logic exactly)
         const blockEnd = new Date(currentBlockStart.getTime() + sessionDurationMs)
         const blockUsage = currentBlockEntries.reduce((sum, e) => sum + e.totalTokens, 0)
         const lastEntryInBlock = currentBlockEntries[currentBlockEntries.length - 1]
         const actualEndTime = lastEntryInBlock ? new Date(lastEntryInBlock.timestamp) : currentBlockStart
         const isActive = now.getTime() - actualEndTime.getTime() < sessionDurationMs && now < blockEnd
         blocks.push({ isActive, usage: blockUsage, blockStart: currentBlockStart, blockEnd, entryCount: currentBlockEntries.length })
+        
+        // Log block event for tracking
+        logBlockEvent({
+          eventType: isActive ? 'block_detected' : 'block_ended',
+          blockId: createBlockId(currentBlockStart),
+          blockStart: currentBlockStart.toISOString(),
+          blockEnd: blockEnd.toISOString(),
+          usage: blockUsage,
+          isActive,
+          entryCount: currentBlockEntries.length,
+          source: 'ccusage_analysis',
+          details: `Block ${isActive ? 'active' : 'ended'} with ${currentBlockEntries.length} entries`
+        })
         
         // Start new block (floored to the hour like ccusage)
         currentBlockStart = floorToHour(entryTime)
@@ -405,7 +426,7 @@ function identifyBillingBlocks(entries: SentinelUsageEntry[]): SentinelBillingBl
     console.log(`Sentinel: Average tokens per entry: ${Math.round(usage / currentBlockEntries.length)}`)
   }
   
-  // Calculate dynamic limit based on historical max (like ccusage does)
+  // Calculate stable limit based on historical data with smoothing
   // Find all historical completed blocks to determine the maximum usage
   const allBlocks = findAllHistoricalBlocks(entries)
   
@@ -413,29 +434,76 @@ function identifyBillingBlocks(entries: SentinelUsageEntry[]): SentinelBillingBl
   const topBlocks = allBlocks
     .filter(block => !block.isActive && block.usage > 0)
     .sort((a, b) => b.usage - a.usage)
-    .slice(0, 5)
+    .slice(0, 10) // Look at top 10 instead of just top 5 for stability
   
-  if (DEBUG) console.log(`Sentinel: Found ${allBlocks.length} historical blocks, top 5:`)
-  topBlocks.forEach((block, idx) => {
+  if (DEBUG) console.log(`Sentinel: Found ${allBlocks.length} historical blocks, top 10:`)
+  topBlocks.slice(0, 5).forEach((block, idx) => {
     const startDate = block.blockStart ? block.blockStart.toLocaleString() : 'unknown'
     const entryCount = block.entryCount || 'unknown'
     if (DEBUG) console.log(`  Block ${idx + 1}: ${block.usage.toLocaleString()} tokens (${entryCount} entries) ${block.isActive ? '(ACTIVE)' : '(completed)'} - ${startDate}`)
   })
   
-  // Use the maximum from historical blocks detected by our algorithm
-  const algorithmMax = topBlocks.length > 0 ? topBlocks[0].usage : 100000000 // fallback to reasonable default limit
+  // Use a more stable limit calculation based on Claude's actual limits and historical data
+  // Reference: Claude Pro ~45 messages per 5-hour block, Max 5x ~225 messages, Max 20x ~900 messages
+  // Estimated token equivalents: Pro ~100M, Max 5x ~500M, Max 20x ~2B tokens per block
   
-  if (DEBUG) console.log(`Sentinel: Algorithm found max: ${algorithmMax.toLocaleString()}`)
-  const dynamicLimit = algorithmMax
+  // Get user's Claude plan preference (will be passed from settings in the future)
+  // For now, use Pro plan limit for consistent results (100M tokens)
+  let userPlan: 'pro' | 'max-5x' | 'max-20x' | 'auto' = 'max-5x'
   
-  if (DEBUG) console.log(`Sentinel: Using token limit from historical max: ${dynamicLimit.toLocaleString()} tokens (like ccusage)`)
+  // Define plan-specific limits
+  const PLAN_LIMITS = {
+    'pro': 100_000_000,      // 100M tokens
+    'max-5x': 500_000_000,   // 500M tokens  
+    'max-20x': 2_000_000_000 // 2B tokens
+  }
+  
+  let stableLimit: number
+  
+  if (userPlan !== 'auto') {
+    // User explicitly set their plan - use that limit
+    stableLimit = Math.max(PLAN_LIMITS[userPlan], usage * 1.05)
+    if (DEBUG) console.log(`Sentinel: Using user-configured ${userPlan} plan limit: ${stableLimit.toLocaleString()} tokens`)
+    
+  } else if (topBlocks.length >= 3) {
+    // Auto-detect: Calculate stable limit from top 3 historical blocks with reasonable bounds
+    const top3Average = Math.round((topBlocks[0].usage + topBlocks[1].usage + topBlocks[2].usage) / 3)
+    
+    // Apply reasonable bounds based on Claude plan limits (100M to 2B tokens)
+    const MIN_REASONABLE_LIMIT = PLAN_LIMITS['pro']
+    const MAX_REASONABLE_LIMIT = PLAN_LIMITS['max-20x']
+    
+    const boundedLimit = Math.min(Math.max(top3Average, MIN_REASONABLE_LIMIT), MAX_REASONABLE_LIMIT)
+    stableLimit = Math.max(boundedLimit, usage * 1.05) // Ensure limit is at least 5% above current usage
+    
+  } else if (topBlocks.length > 0) {
+    // Single historical block - apply same bounds
+    const MIN_REASONABLE_LIMIT = PLAN_LIMITS['pro']
+    const MAX_REASONABLE_LIMIT = PLAN_LIMITS['max-20x']
+    
+    const boundedLimit = Math.min(Math.max(topBlocks[0].usage, MIN_REASONABLE_LIMIT), MAX_REASONABLE_LIMIT)
+    stableLimit = Math.max(boundedLimit, usage * 1.05)
+    
+  } else {
+    // No historical data - use intelligent default based on current usage
+    if (usage > 500_000_000) {
+      stableLimit = Math.max(PLAN_LIMITS['max-20x'], usage * 1.1) // Assume Max 20x plan for heavy users
+    } else if (usage > 100_000_000) {
+      stableLimit = Math.max(PLAN_LIMITS['max-5x'], usage * 1.1)   // Assume Max 5x plan for moderate users
+    } else {
+      stableLimit = Math.max(PLAN_LIMITS['pro'], usage * 1.1)      // Assume Pro plan for light users
+    }
+  }
+  
+  if (DEBUG) console.log(`Sentinel: Top blocks: ${topBlocks.slice(0, 3).map(b => b.usage.toLocaleString()).join(', ')}`)
+  if (DEBUG) console.log(`Sentinel: Using stable token limit: ${stableLimit.toLocaleString()} tokens (averaged from top 3 historical blocks)`)
 
   return [{
     startTime: blockStart,
     endTime: blockEnd,
     isActive,
     usage,
-    limit: dynamicLimit,
+    limit: stableLimit,
     timeRemaining,
     entries: currentBlockEntries,
     cost
@@ -626,6 +694,27 @@ export function getCurrentSentinelBlockInfo() {
   const analysis = loadSentinelUsageData()
   const currentBlock = analysis.currentBlock
   
+  // Save snapshot of current state for debugging
+  const allBlocks = findAllHistoricalBlocks(cachedData || [])
+  saveBlockSnapshot({
+    activeBlocks: allBlocks.filter(b => b.isActive).map(b => ({
+      blockId: createBlockId(b.blockStart),
+      blockStart: b.blockStart.toISOString(),
+      blockEnd: b.blockEnd.toISOString(),
+      usage: b.usage,
+      timeRemaining: currentBlock?.timeRemaining || null,
+      entryCount: b.entryCount
+    })),
+    historicalBlocks: allBlocks.filter(b => !b.isActive).slice(-10).map(b => ({
+      blockId: createBlockId(b.blockStart),
+      blockStart: b.blockStart.toISOString(),
+      blockEnd: b.blockEnd.toISOString(),
+      usage: b.usage,
+      entryCount: b.entryCount
+    })),
+    lastAnalysis: new Date().toISOString()
+  })
+  
   if (!currentBlock) {
     return {
       timeRemaining: null,
@@ -688,4 +777,18 @@ export function resetUsageCache() {
   fileModTimes = new Map()
   lastCacheTime = 0
   lastIncrementalCheck = 0
+  
+  // Clear any existing logs to prevent duplicate events with new logic
+  const { existsSync, writeFileSync } = require('fs')
+  const { join } = require('path')
+  const { homedir } = require('os')
+  
+  try {
+    const blockLogFile = join(homedir(), '.claude-sentinel-block-log.jsonl')
+    if (existsSync(blockLogFile)) {
+      writeFileSync(blockLogFile, '') // Clear the log file
+    }
+  } catch (error) {
+    console.warn('Failed to clear block log:', error)
+  }
 }

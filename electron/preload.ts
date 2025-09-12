@@ -15,6 +15,20 @@ const electronAPI = {
   setScheduledStartTime: (isoTime: string | null) => ipcRenderer.invoke('set-scheduled-start-time', isoTime),
   performRenewalCheck: () => ipcRenderer.invoke('perform-renewal-check'),
   
+  // Session management
+  getSessionStatus: () => ipcRenderer.invoke('get-session-status'),
+  resetSessionTracking: () => ipcRenderer.invoke('reset-session-tracking'),
+  forceStartNewSession: () => ipcRenderer.invoke('force-start-new-session'),
+  
+  // Block tracking
+  getBlockEvents: (hours?: number) => ipcRenderer.invoke('get-block-events', hours),
+  getBlockSnapshot: () => ipcRenderer.invoke('get-block-snapshot'),
+  getDailyBlocks: (date?: string) => ipcRenderer.invoke('get-daily-blocks', date),
+  
+  // Session files management
+  getSessionFiles: () => ipcRenderer.invoke('get-session-files'),
+  deleteSessionFile: (filePath: string) => ipcRenderer.invoke('delete-session-file', filePath),
+  
   // Settings management
   getSettings: () => ipcRenderer.invoke('get-settings'),
   saveSettings: (settings: any) => ipcRenderer.invoke('save-settings', settings),

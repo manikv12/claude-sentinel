@@ -7,8 +7,16 @@ import { existsSync, writeFileSync, appendFileSync, readFileSync, readdirSync, u
 import { join } from 'path'
 import { app } from 'electron'
 
-const LOG_DIR = join(app.getPath('userData'), 'logs')
 const MAX_LOG_DAYS = 30
+
+// Lazy initialization of LOG_DIR to avoid calling app.getPath before app is ready
+let LOG_DIR: string | null = null
+function getLogDir(): string {
+  if (!LOG_DIR) {
+    LOG_DIR = join(app.getPath('userData'), 'logs')
+  }
+  return LOG_DIR
+}
 
 export interface RenewalLogEntry {
   timestamp: string
@@ -21,7 +29,7 @@ class RenewalLogService {
   private logsDir: string
 
   constructor() {
-    this.logsDir = LOG_DIR
+    this.logsDir = getLogDir()
     this.ensureLogDirectory()
     this.cleanOldLogs()
   }

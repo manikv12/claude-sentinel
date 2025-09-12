@@ -352,23 +352,13 @@ export function Dashboard() {
                 onClick={handleToggleRenewal}
                 disabled={renewalLoading}
                 variant="default"
-                className={`flex-1 border-0 ${status.enabled ? 'glass-button-enabled' : 'glass-button-disabled'}`}
+                className={`w-full border-0 ${status.enabled ? 'glass-button-enabled' : 'glass-button-disabled'}`}
               >
                 {status.enabled ? (
                   <><PauseCircle className="h-4 w-4 mr-2" />Disable</>
                 ) : (
                   <><PlayCircle className="h-4 w-4 mr-2" />Enable</>
                 )}
-              </Button>
-              <Button
-                onClick={() => window.electronAPI.performRenewalCheck?.()}
-                variant="outline"
-                size="icon"
-                disabled={!status.enabled}
-                title="Check now"
-                className="glass-button border-0"
-              >
-                <RefreshCw className="h-4 w-4" />
               </Button>
             </div>
             

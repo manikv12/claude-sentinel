@@ -1,8 +1,17 @@
 import { useState, useEffect } from 'react'
+import React from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card'
 import { Button } from './ui/button'
 import { Switch } from './ui/switch'
 import { DatePicker } from './ui/date-picker'
+import { 
+  Dialog, 
+  DialogContent, 
+  DialogDescription, 
+  DialogHeader, 
+  DialogTitle, 
+  DialogTrigger 
+} from './ui/dialog'
 import { useRenewalStore } from '@/stores/renewalStore'
 import { formatTimeRemaining, getTimeAgo } from '@/lib/utils'
 import { 
@@ -19,13 +28,36 @@ import {
   Settings as SettingsIcon,
   Calendar,
   Zap,
-  Info
+  Info,
+  Trash2,
+  RotateCcw,
+  UserCheck,
+  AlertTriangle,
+  Eye,
+  X
 } from 'lucide-react'
 // Use lucide-react icons (already in project) instead of MUI
 import { Calendar as LucideCalendar, Clock as LucideClock } from 'lucide-react'
 import { Skeleton } from './ui/skeleton'
 
+
 export function AutoRenewal() {
+  // Add error handling for the store hook
+  let storeData
+  try {
+    storeData = useRenewalStore()
+  } catch (error) {
+    console.error('Error accessing renewal store:', error)
+    return (
+      <div className="p-4 text-center">
+        <AlertCircle className="h-8 w-8 text-red-500 mx-auto mb-2" />
+        <p className="text-sm text-muted-foreground">
+          Error loading Auto-Renewal. Please refresh the page.
+        </p>
+      </div>
+    )
+  }
+
   const { 
     status, 
     isLoading, 
@@ -34,19 +66,94 @@ export function AutoRenewal() {
     updateSettings,
     setScheduledStartTime,
     refreshStatus 
-  } = useRenewalStore()
+  } = storeData
   
   const [scheduledTime, setScheduledTime] = useState('')
   const [isInitialLoad, setIsInitialLoad] = useState(true)
+  const [sessionStatus, setSessionStatus] = useState<any>(null)
+  const [isSessionLoading, setIsSessionLoading] = useState(false)
+  const [blocksData, setBlocksData] = useState<any>(null)
+  const [isBlocksLoading, setIsBlocksLoading] = useState(false)
 
   // Load data when AutoRenewal component mounts
   useEffect(() => {
     const loadInitialData = async () => {
-      await refreshStatus()
-      setIsInitialLoad(false)
+      try {
+        await refreshStatus()
+        await loadSessionStatus()
+      } catch (error) {
+        console.error('Error loading initial data:', error)
+      } finally {
+        setIsInitialLoad(false)
+      }
     }
     loadInitialData()
-  }, [])
+  }, [refreshStatus])
+
+  // Load session status
+  const loadSessionStatus = async () => {
+    try {
+      const status = await window.electronAPI.getSessionStatus()
+      setSessionStatus(status)
+    } catch (error) {
+      console.error('Failed to load session status:', error)
+      setSessionStatus(null) // Set to null to show loading state instead of crashing
+    }
+  }
+
+  // Load blocks data
+  const loadBlocksData = async () => {
+    setIsBlocksLoading(true)
+    try {
+      const data = await window.electronAPI.getBlockHistory()
+      setBlocksData(data)
+    } catch (error) {
+      console.error('Failed to load blocks data:', error)
+      setBlocksData(null)
+    } finally {
+      setIsBlocksLoading(false)
+    }
+  }
+
+  // Reset session tracking
+  const handleResetSessionTracking = async () => {
+    setIsSessionLoading(true)
+    try {
+      const result = await window.electronAPI.resetSessionTracking()
+      if (result.success) {
+        await loadSessionStatus()
+        await refreshStatus()
+        window.electronAPI.showNotification('Session tracking files reset successfully')
+      } else {
+        window.electronAPI.showNotification(`Failed to reset session tracking: ${result.error}`)
+      }
+    } catch (error) {
+      console.error('Error resetting session tracking:', error)
+      window.electronAPI.showNotification('Error resetting session tracking')
+    } finally {
+      setIsSessionLoading(false)
+    }
+  }
+
+  // Force start new session
+  const handleForceNewSession = async () => {
+    setIsSessionLoading(true)
+    try {
+      const result = await window.electronAPI.forceStartNewSession()
+      if (result.success) {
+        await loadSessionStatus()
+        await refreshStatus()
+        window.electronAPI.showNotification('New Claude session started successfully')
+      } else {
+        window.electronAPI.showNotification(`Failed to start new session: ${result.error}`)
+      }
+    } catch (error) {
+      console.error('Error starting new session:', error)
+      window.electronAPI.showNotification('Error starting new session')
+    } finally {
+      setIsSessionLoading(false)
+    }
+  }
 
   useEffect(() => {
     // Sync scheduled time from store
@@ -115,11 +222,33 @@ export function AutoRenewal() {
     }
   }
 
+  const [isCheckingManually, setIsCheckingManually] = useState(false)
+  
   const performManualCheck = async () => {
+    if (isCheckingManually) return
+    
+    setIsCheckingManually(true)
     try {
-      await window.electronAPI.performRenewalCheck?.()
+      const result = await window.electronAPI.performRenewalCheck?.()
+      
+      // Show user feedback via notification
+      if (result?.success) {
+        await window.electronAPI.showNotification?.('Renewal check completed successfully')
+        console.log('Manual renewal check completed successfully')
+      } else {
+        await window.electronAPI.showNotification?.('Renewal check completed with warnings')
+        console.warn('Manual renewal check completed with warnings')
+      }
+      
+      // The status will be updated via the 'renewal-status-update' event
     } catch (error) {
       console.error('Manual check failed:', error)
+      await window.electronAPI.showNotification?.('Renewal check failed - see console for details')
+    } finally {
+      // Add a small delay to show the loading state
+      setTimeout(() => {
+        setIsCheckingManually(false)
+      }, 1000)
     }
   }
 
@@ -152,6 +281,25 @@ export function AutoRenewal() {
             <Skeleton className="h-48 w-full" />
             <Skeleton className="h-48 w-full" />
           </div>
+        </div>
+      </div>
+    )
+  }
+
+  // Add safety check for status
+  if (!status) {
+    return (
+      <div className="space-y-6">
+        <div className="p-8 text-center">
+          <AlertCircle className="h-12 w-12 text-yellow-500 mx-auto mb-4" />
+          <h3 className="text-lg font-semibold mb-2">Auto-Renewal Status Unavailable</h3>
+          <p className="text-sm text-muted-foreground mb-4">
+            Unable to load auto-renewal status. Please try refreshing the page.
+          </p>
+          <Button onClick={() => window.location.reload()} variant="outline">
+            <RefreshCw className="h-4 w-4 mr-2" />
+            Refresh Page
+          </Button>
         </div>
       </div>
     )
@@ -372,11 +520,11 @@ export function AutoRenewal() {
             <Button 
               onClick={performManualCheck}
               variant="outline"
-              disabled={!status.enabled || isLoading}
+              disabled={isLoading || isCheckingManually}
               size="lg"
             >
-              <RefreshCw className="h-4 w-4 mr-2" />
-              Check Now
+              <RefreshCw className={`h-4 w-4 mr-2 ${isCheckingManually ? 'animate-spin' : ''}`} />
+              {isCheckingManually ? 'Checking...' : 'Check Now'}
             </Button>
           </div>
         </CardContent>
@@ -404,12 +552,12 @@ export function AutoRenewal() {
                 <div className="text-xs text-muted-foreground">Service Status</div>
               </div>
               
-              {status.timeRemaining && (
+              {status.timeRemaining && status.timeRemaining > 0 && (
                 <div className="text-center p-3 border rounded-lg">
-                  <div className="text-2xl font-bold mb-1 text-orange-600">
+                  <div className="text-2xl font-bold mb-1 text-green-600">
                     {formatTimeRemaining(status.timeRemaining)}
                   </div>
-                  <div className="text-xs text-muted-foreground">Until Reset</div>
+                  <div className="text-xs text-muted-foreground">Session Active</div>
                 </div>
               )}
             </div>
@@ -431,10 +579,15 @@ export function AutoRenewal() {
             {status.nextRenewal && (
               <div className="p-3 bg-secondary/50 rounded-lg">
                 <div className="flex items-center justify-between">
-                  <span className="text-sm font-medium">Next Check</span>
+                  <span className="text-sm font-medium">
+                    {status.scheduledStartTime ? 'Scheduled Renewal' : 'Next Renewal'}
+                  </span>
                   <span className="text-xs text-muted-foreground">
                     {status.nextRenewal.toLocaleTimeString()}
                   </span>
+                </div>
+                <div className="text-xs text-muted-foreground mt-1">
+                  {status.nextRenewal.toLocaleDateString()}
                 </div>
               </div>
             )}
@@ -563,6 +716,264 @@ export function AutoRenewal() {
         </Card>
       </div>
 
+      {/* Session Management */}
+      <Card className="glass-card border-orange-200 dark:border-orange-800">
+          <CardHeader>
+            <CardTitle className="flex items-center space-x-2">
+              <UserCheck className="h-5 w-5 text-orange-600" />
+              <span>Session Management</span>
+            </CardTitle>
+            <CardDescription>
+              Manage Claude session tracking and handle orphaned sessions
+            </CardDescription>
+          </CardHeader>
+        <CardContent className="space-y-4">
+          {/* Session Status */}
+          <div className="p-4 border rounded-lg bg-secondary/20">
+            {sessionStatus ? (
+              <div className="grid gap-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-medium">Local Activity Tracked</span>
+                  <span className={`text-sm font-semibold ${sessionStatus.hasLocalActivity ? 'text-green-600' : 'text-gray-500'}`}>
+                    {sessionStatus.hasLocalActivity ? 'Yes' : 'No'}
+                  </span>
+                </div>
+                
+                {sessionStatus.lastActivityTime && (
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium">Last Activity</span>
+                    <span className="text-sm text-muted-foreground">
+                      {new Date(sessionStatus.lastActivityTime).toLocaleString()}
+                    </span>
+                  </div>
+                )}
+                
+                {sessionStatus.timeSinceActivity && (
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium">Time Since Activity</span>
+                    <span className="text-sm text-muted-foreground">
+                      {Math.round(sessionStatus.timeSinceActivity / 60)} minutes ago
+                    </span>
+                  </div>
+                )}
+                
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-medium">Session Files</span>
+                  <span className="text-sm text-muted-foreground">
+                    {sessionStatus.sessionFiles?.length || 0} files
+                  </span>
+                </div>
+                
+                {sessionStatus.orphanedSession && (
+                  <div className="flex items-center space-x-2 p-2 bg-orange-100 dark:bg-orange-900/30 rounded-lg">
+                    <AlertTriangle className="h-4 w-4 text-orange-600" />
+                    <span className="text-sm text-orange-800 dark:text-orange-200 font-medium">
+                      Potential orphaned session detected
+                    </span>
+                  </div>
+                )}
+              </div>
+            ) : sessionStatus === null ? (
+              <div className="flex items-center space-x-2 text-muted-foreground">
+                <AlertCircle className="h-4 w-4 text-orange-500" />
+                <span className="text-sm">Failed to load session status</span>
+              </div>
+            ) : (
+              <div className="flex items-center space-x-2 text-muted-foreground">
+                <RefreshCw className="h-4 w-4 animate-spin" />
+                <span className="text-sm">Loading session status...</span>
+              </div>
+            )}
+          </div>
+
+          {/* Management Actions */}
+          <div className="space-y-3">
+            <div className="p-4 border rounded-lg">
+              <div className="flex items-center justify-between">
+                <div className="flex-1">
+                  <h4 className="text-sm font-medium mb-1">Reset Session Tracking</h4>
+                  <p className="text-xs text-muted-foreground">
+                    Clear all session tracking files. Use when sessions are out of sync with Claude.
+                  </p>
+                </div>
+                <Button
+                  onClick={handleResetSessionTracking}
+                  disabled={isSessionLoading}
+                  variant="outline"
+                  size="sm"
+                  className="ml-3"
+                >
+                  {isSessionLoading ? (
+                    <RefreshCw className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <>
+                      <Trash2 className="h-4 w-4 mr-2" />
+                      Reset
+                    </>
+                  )}
+                </Button>
+              </div>
+            </div>
+
+            <div className="p-4 border rounded-lg">
+              <div className="flex items-center justify-between">
+                <div className="flex-1">
+                  <h4 className="text-sm font-medium mb-1">Force New Session</h4>
+                  <p className="text-xs text-muted-foreground">
+                    Reset tracking and start a fresh Claude session immediately.
+                  </p>
+                </div>
+                <Button
+                  onClick={handleForceNewSession}
+                  disabled={isSessionLoading}
+                  variant="outline"
+                  size="sm"
+                  className="ml-3"
+                >
+                  {isSessionLoading ? (
+                    <RefreshCw className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <>
+                      <RotateCcw className="h-4 w-4 mr-2" />
+                      Start New
+                    </>
+                  )}
+                </Button>
+              </div>
+            </div>
+          </div>
+
+          {/* Block History Viewer */}
+          <div className="p-4 border rounded-lg">
+            <div className="flex items-center justify-between">
+              <div className="flex-1">
+                <h4 className="text-sm font-medium mb-1">View Block History</h4>
+                <p className="text-xs text-muted-foreground">
+                  See all detected usage blocks and debug session tracking issues.
+                </p>
+              </div>
+              <Dialog>
+                <DialogTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={loadBlocksData}
+                  >
+                    <Eye className="h-4 w-4 mr-2" />
+                    View Blocks
+                  </Button>
+                </DialogTrigger>
+                <DialogContent className="max-w-4xl max-h-[80vh] overflow-y-auto">
+                  <DialogHeader>
+                    <DialogTitle className="flex items-center space-x-2">
+                      <Activity className="h-5 w-5" />
+                      <span>Block History</span>
+                    </DialogTitle>
+                    <DialogDescription>
+                      View detected usage blocks and session tracking information
+                    </DialogDescription>
+                  </DialogHeader>
+                  
+                  <div className="space-y-4">
+                    {isBlocksLoading ? (
+                      <div className="text-center p-8">
+                        <RefreshCw className="h-8 w-8 animate-spin mx-auto mb-2" />
+                        <p className="text-sm text-muted-foreground">Loading blocks...</p>
+                      </div>
+                    ) : blocksData ? (
+                      <div className="space-y-4">
+                        {blocksData.dailyBlocks && blocksData.dailyBlocks.length > 0 ? (
+                          <div>
+                            <h3 className="font-medium mb-2">Recent Blocks</h3>
+                            <div className="space-y-2">
+                              {blocksData.dailyBlocks.slice(0, 10).map((block: any, index: number) => (
+                                <div key={index} className="p-3 border rounded-lg">
+                                  <div className="flex items-center justify-between">
+                                    <div className="flex items-center space-x-2">
+                                      {block.isActive ? (
+                                        <CheckCircle className="h-4 w-4 text-green-500" />
+                                      ) : (
+                                        <Clock className="h-4 w-4 text-gray-400" />
+                                      )}
+                                      <span className="text-sm font-medium">
+                                        Block {block.blockId?.slice(0, 8) || 'Unknown'}
+                                      </span>
+                                    </div>
+                                    <span className="text-xs text-muted-foreground">
+                                      {block.usage || 0} usage
+                                    </span>
+                                  </div>
+                                  <div className="mt-1 text-xs text-muted-foreground">
+                                    Started: {block.blockStart ? new Date(block.blockStart).toLocaleString() : 'Unknown'}
+                                  </div>
+                                  {block.blockEnd && (
+                                    <div className="text-xs text-muted-foreground">
+                                      Ended: {new Date(block.blockEnd).toLocaleString()}
+                                    </div>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="text-center p-8">
+                            <AlertCircle className="h-8 w-8 text-muted-foreground mx-auto mb-2" />
+                            <p className="text-sm text-muted-foreground">No blocks found</p>
+                          </div>
+                        )}
+                        
+                        {blocksData.blockEvents && blocksData.blockEvents.length > 0 && (
+                          <div>
+                            <h3 className="font-medium mb-2">Recent Events</h3>
+                            <div className="space-y-1 max-h-40 overflow-y-auto">
+                              {blocksData.blockEvents.slice(0, 20).map((event: any, index: number) => (
+                                <div key={index} className="p-2 bg-secondary/20 rounded text-xs">
+                                  <span className="font-medium">{event.eventType}</span> - {event.timestamp ? new Date(event.timestamp).toLocaleString() : 'Unknown time'}
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="text-center p-8">
+                        <AlertCircle className="h-8 w-8 text-orange-500 mx-auto mb-2" />
+                        <p className="text-sm text-muted-foreground">Failed to load block history</p>
+                        <Button 
+                          variant="outline" 
+                          size="sm" 
+                          onClick={loadBlocksData}
+                          className="mt-2"
+                        >
+                          <RefreshCw className="h-4 w-4 mr-2" />
+                          Retry
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                </DialogContent>
+              </Dialog>
+            </div>
+          </div>
+
+          {/* Info Box */}
+          <div className="p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg">
+            <div className="flex items-start space-x-2">
+              <Info className="h-4 w-4 text-blue-600 mt-0.5 flex-shrink-0" />
+              <div className="text-xs text-blue-800 dark:text-blue-200">
+                <p className="font-medium mb-1">When to use these tools:</p>
+                <ul className="space-y-1 text-xs">
+                  <li>• <strong>Reset Tracking:</strong> If auto-renewal isn't working correctly</li>
+                  <li>• <strong>Force New Session:</strong> If Claude has an old session that doesn't match local tracking</li>
+                  <li>• <strong>Orphaned Sessions:</strong> When you see the orange warning above</li>
+                  <li>• <strong>View Blocks:</strong> See all usage blocks to debug timing issues</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
       {/* Help Section */}
       <Card className="glass-card">
         <CardHeader>
@@ -590,10 +1001,10 @@ export function AutoRenewal() {
                 <div className="w-8 h-8 bg-green-100 dark:bg-green-900/30 rounded-full flex items-center justify-center">
                   <span className="text-green-600 font-semibold">2</span>
                 </div>
-                <h4 className="font-semibold">Detect</h4>
+                <h4 className="font-semibold">Wait</h4>
               </div>
               <p className="text-sm text-muted-foreground">
-                When your current usage block is about to expire (usually within 2-5 minutes), auto-renewal triggers.
+                Auto-renewal waits for your 5-hour session to completely expire. It respects scheduled times and won't renew prematurely.
               </p>
             </div>
 
@@ -605,7 +1016,7 @@ export function AutoRenewal() {
                 <h4 className="font-semibold">Renew</h4>
               </div>
               <p className="text-sm text-muted-foreground">
-                A new Claude session is automatically started, maintaining your usage block without interruption.
+                After 5 hours have passed or at your scheduled time, a new Claude session is started to begin the next usage block.
               </p>
             </div>
           </div>

@@ -1,5 +1,8 @@
 import { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, Notification } from 'electron'
 import { join } from 'path'
+import * as fs from 'fs'
+import * as path from 'path'
+import * as os from 'os'
 import { isDev } from './utils'
 import { loadUsageData, getRecentUsage, getCurrentBlockInfo } from './services/ccusage-service'
 import { 
@@ -90,13 +93,14 @@ const createWindow = () => {
     }
   })
 
-  // Handle minimize to system tray and show floating window
+  // Handle minimize and show floating window
   mainWindow.on('minimize', (event: Electron.Event) => {
     // Show floating window when main window is minimized
     createFloatingWindow()
     
     if (process.platform === 'darwin') {
-      // On macOS, hide to dock
+      // On macOS, ensure Dock icon remains visible
+      try { if (app.dock) app.dock.show() } catch {}
       return
     }
     // On Windows/Linux, hide to system tray
@@ -170,6 +174,7 @@ const createFloatingWindow = () => {
   // Set window level for macOS to ensure it stays on top
   if (process.platform === 'darwin') {
     floatingWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+  try { if (app.dock) app.dock.show() } catch {}
   }
 
   return floatingWindow
@@ -247,10 +252,21 @@ const createTray = () => {
 app.whenReady().then(() => {
   createWindow()
   createTray()
-  // Set Dock icon on macOS to match the sidebar logo (colored variant)
+  // Ensure Dock icon is explicitly set and shown on macOS
   if (process.platform === 'darwin' && app.dock) {
-    const dockIcon = createActivityIcon({ size: 256, color: '#3b82f6' })
-    app.dock.setIcon(dockIcon)
+    try {
+      const icnsPath = path.join(process.resourcesPath, 'icon.icns')
+      if (fs.existsSync(icnsPath)) {
+        app.dock.setIcon(icnsPath)
+      } else {
+        // Fallback to generated colored icon
+        const dockIcon = createActivityIcon({ size: 256, color: '#3b82f6' })
+        app.dock.setIcon(dockIcon)
+      }
+      app.dock.show()
+    } catch {
+      // Best-effort; ignore failures
+    }
   }
   try {
     const cfg = loadConfig()
@@ -284,87 +300,143 @@ app.on('before-quit', () => {
 })
 
 
-// Auto-renewal monitoring interval
-let renewalInterval: NodeJS.Timeout | null = null
-let scheduleCheckInterval: NodeJS.Timeout | null = null
-let scheduledStartReached = false
+// Timer-based renewal scheduling
+let renewalTimer: NodeJS.Timeout | null = null
+
+// Configuration for grace periods
+const RENEWAL_CONFIG = {
+  gracePeriod: {
+    min: 30,  // seconds
+    max: 60   // seconds
+  },
+  fallbackCheckInterval: 5 * 60 * 1000, // 5 minutes in ms for fallback polling
+}
+
+// Helper to add grace period to any time
+const addGracePeriod = (targetTime: Date) => {
+  const gracePeriodMs = (RENEWAL_CONFIG.gracePeriod.min + Math.random() * (RENEWAL_CONFIG.gracePeriod.max - RENEWAL_CONFIG.gracePeriod.min)) * 1000
+  return {
+    renewalTime: new Date(targetTime.getTime() + gracePeriodMs),
+    gracePeriodSeconds: Math.round(gracePeriodMs / 1000)
+  }
+}
+
+// Smart timer-based renewal scheduling
+const scheduleNextRenewal = () => {
+  // Clear any existing timer
+  if (renewalTimer) {
+    clearTimeout(renewalTimer)
+    renewalTimer = null
+  }
+
+  try {
+    const status = getRenewalStatus()
+    
+    // Only schedule if auto-renewal is enabled
+    if (!status.enabled || !status.running) {
+      renewalLogger.info('Auto-renewal disabled, not scheduling next renewal', 'service')
+      return
+    }
+
+    const now = new Date()
+    let targetTime: Date | null = null
+    let reason = ''
+
+    // Priority 1: User scheduled time (always takes precedence if set)
+    if (status.scheduledStartTime && new Date(status.scheduledStartTime) > now) {
+      targetTime = new Date(status.scheduledStartTime)
+      reason = 'scheduled start'
+      renewalLogger.info(`User scheduled time found: ${targetTime.toISOString()} - ignoring block expiration`, 'schedule')
+    }
+    // Priority 2: Block expiration (only if no scheduled time)
+    else if (status.currentBlock?.endTime && new Date(status.currentBlock.endTime) > now) {
+      targetTime = new Date(status.currentBlock.endTime)
+      reason = 'block expiration'
+    }
+    // Priority 3: Next renewal time (fallback calculation)
+    else if (status.nextRenewal && status.nextRenewal > now) {
+      targetTime = status.nextRenewal
+      reason = 'calculated renewal'
+    }
+
+    if (targetTime && targetTime > now) {
+      const { renewalTime, gracePeriodSeconds } = addGracePeriod(targetTime)
+      const delay = renewalTime.getTime() - now.getTime()
+
+      if (delay > 0) {
+        renewalTimer = setTimeout(() => {
+          try {
+            renewalLogger.info(`Executing scheduled renewal (${reason})`, 'renewal')
+            const result = performRenewalCheck()
+            
+            // Send status updates
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
+            }
+            if (result.success && result.action && tray) {
+              updateTrayMenu()
+            }
+            
+            // Schedule next renewal
+            setTimeout(() => scheduleNextRenewal(), 2000) // Brief delay before rescheduling
+          } catch (error) {
+            renewalLogger.error(`Error in scheduled renewal: ${error instanceof Error ? error.message : String(error)}`, 'renewal')
+            // Retry scheduling in 1 minute
+            renewalTimer = setTimeout(() => scheduleNextRenewal(), 60000)
+          }
+        }, delay)
+
+        renewalLogger.info(`Next ${reason} at ${targetTime.toISOString()}, renewal scheduled for ${renewalTime.toISOString()} (${gracePeriodSeconds}s grace period)`, 'schedule')
+      } else {
+        renewalLogger.warn(`Target time ${targetTime.toISOString()} is in the past, checking immediately`, 'schedule')
+        // Schedule immediate check
+        renewalTimer = setTimeout(() => {
+          performRenewalCheck()
+          scheduleNextRenewal()
+        }, 1000)
+      }
+    } else {
+      // No valid target time - use fallback polling
+      renewalLogger.info(`No specific renewal time available, using fallback check in ${RENEWAL_CONFIG.fallbackCheckInterval / 60000} minutes`, 'schedule')
+      renewalTimer = setTimeout(() => {
+        try {
+          const currentStatus = getRenewalStatus()
+          if (currentStatus.enabled && currentStatus.running) {
+            performRenewalCheck()
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
+            }
+          }
+        } catch (error) {
+          renewalLogger.error(`Error in fallback renewal check: ${error instanceof Error ? error.message : String(error)}`, 'renewal')
+        }
+        scheduleNextRenewal() // Reschedule
+      }, RENEWAL_CONFIG.fallbackCheckInterval)
+    }
+  } catch (error) {
+    renewalLogger.error(`Error scheduling next renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+    // Retry in 1 minute
+    renewalTimer = setTimeout(() => scheduleNextRenewal(), 60000)
+  }
+}
 
 // Start renewal monitoring when app starts
 const startRenewalMonitoring = () => {
-  if (renewalInterval) return
-
-  // Determine if scheduled start time already passed
-  const statusAtStart = getRenewalStatus()
-  if (statusAtStart.scheduledStartTime) {
-    scheduledStartReached = new Date(statusAtStart.scheduledStartTime) <= new Date()
-  } else {
-    scheduledStartReached = true
+  if (renewalTimer) {
+    renewalLogger.info('Renewal monitoring already active', 'service')
+    return
   }
 
-  if (!scheduledStartReached && !scheduleCheckInterval) {
-    scheduleCheckInterval = setInterval(() => {
-      const s = getRenewalStatus()
-      if (!s.scheduledStartTime || new Date(s.scheduledStartTime) <= new Date()) {
-        scheduledStartReached = true
-    renewalLogger.info('Scheduled start time reached; enabling renewal checks', 'schedule')
-        if (scheduleCheckInterval) {
-          clearInterval(scheduleCheckInterval)
-          scheduleCheckInterval = null
-        }
-        // Fire an immediate renewal check once gate opens
-        try {
-          const result = performRenewalCheck()
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
-          }
-          if (result.success && result.action) updateTrayMenu()
-        } catch (e) {
-          console.error('Immediate scheduled-start renewal check failed:', e)
-        }
-      }
-    }, 15000)
-  renewalLogger.info('Waiting for scheduled start time before beginning renewal checks', 'schedule')
-  }
-
-  renewalInterval = setInterval(() => {
-    try {
-      const status = getRenewalStatus()
-      if (status.scheduledStartTime && !scheduledStartReached) return
-      if (status.enabled && status.running) {
-        setImmediate(() => {
-          try {
-            const result = performRenewalCheck()
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              setImmediate(() => {
-                mainWindow?.webContents.send('renewal-status-update', getRenewalStatus())
-              })
-            }
-            if (result.success && result.action && tray) {
-              setImmediate(() => updateTrayMenu())
-            }
-          } catch (error) {
-            console.error('Error in async renewal check:', error)
-          }
-        })
-      }
-    } catch (error) {
-      console.error('Error in renewal monitoring:', error)
-    }
-  }, 60000)
-  renewalLogger.info('Renewal monitoring loop started', 'service')
+  renewalLogger.info('Starting timer-based renewal monitoring', 'service')
+  scheduleNextRenewal()
 }
 
 const stopRenewalMonitoring = () => {
-  if (renewalInterval) {
-    clearInterval(renewalInterval)
-    renewalInterval = null
+  if (renewalTimer) {
+    clearTimeout(renewalTimer)
+    renewalTimer = null
   }
-  if (scheduleCheckInterval) {
-    clearInterval(scheduleCheckInterval)
-    scheduleCheckInterval = null
-  }
-  scheduledStartReached = false
-  renewalLogger.info('Renewal monitoring loop stopped', 'service')
+  renewalLogger.info('Renewal monitoring stopped', 'service')
 }
 
 const updateTrayMenu = () => {
@@ -488,7 +560,7 @@ ipcMain.handle('toggle-auto-renewal', async (_, enabled: boolean, scheduledTime?
     
     if (enabled) {
       result = startRenewalService()
-  if (scheduledTime) setScheduledStartTime(scheduledTime)
+      if (scheduledTime) setScheduledStartTime(scheduledTime)
       if (result.success) {
         startRenewalMonitoring()
       }
@@ -517,8 +589,12 @@ ipcMain.handle('set-scheduled-start-time', async (_, isoTime: string | null) => 
   try {
     const result = setScheduledStartTime(isoTime)
     if (result.success) {
-      scheduledStartReached = !isoTime || new Date(isoTime) <= new Date()
-      if (!scheduledStartReached) startRenewalMonitoring()
+      // Reschedule with new time
+      const status = getRenewalStatus()
+      if (status.enabled && status.running) {
+        renewalLogger.info('Scheduled time changed, rescheduling renewal', 'schedule')
+        scheduleNextRenewal()
+      }
     }
     return result
   } catch (error) {
@@ -528,7 +604,15 @@ ipcMain.handle('set-scheduled-start-time', async (_, isoTime: string | null) => 
 
 ipcMain.handle('minimize-to-tray', () => {
   if (mainWindow) {
-    mainWindow.hide()
+    if (process.platform === 'darwin') {
+      // Minimize (keeps Dock icon), floating window will be created by the 'minimize' handler
+      try { if (app.dock) app.dock.show() } catch {}
+      mainWindow.minimize()
+    } else {
+      // Hide to system tray on Windows/Linux
+      mainWindow.hide()
+      createFloatingWindow()
+    }
   }
 })
 
@@ -585,6 +669,12 @@ ipcMain.handle('perform-renewal-check', async () => {
         // Update tray menu if needed
         if (result.success && result.action && tray) {
           updateTrayMenu()
+        }
+        
+        // Reschedule next renewal after manual check (in case block state changed)
+        const status = getRenewalStatus()
+        if (status.enabled && status.running) {
+          setTimeout(() => scheduleNextRenewal(), 2000)
         }
       } catch (error) {
         console.error('Error in manual renewal check:', error)
@@ -660,6 +750,121 @@ ipcMain.handle('get-logs-path', async () => {
   } catch (error) {
     console.error('Error getting logs path:', error)
     return null
+  }
+})
+
+// Session tracking reset handler
+ipcMain.handle('reset-session-tracking', async () => {
+  try {
+    const { resetSessionTracking } = await import('./services/renewal-service')
+    const result = resetSessionTracking()
+    return result
+  } catch (error) {
+    console.error('Error resetting session tracking:', error)
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+})
+
+// Session files management IPC
+ipcMain.handle('get-session-files', async () => {
+  try {
+    const fs = require('fs')
+    const path = require('path')
+    const os = require('os')
+    const home = os.homedir()
+
+    // Known session/tracking files used by the app
+    const candidates: string[] = [
+      path.join(home, '.claude-sentinel-renewal.pid'),
+      path.join(home, '.claude-sentinel-config.json'),
+      path.join(home, '.claude-last-activity'),
+      path.join(home, '.claude-auto-renew-start-time'),
+      path.join(home, '.claude-last-block-state'),
+      path.join(home, '.claude-sentinel-renewal-lock'),
+      path.join(home, '.claude-last-renewal-check'),
+      path.join(home, '.claude-sentinel-block-log.jsonl'),
+      path.join(home, '.claude-sentinel-block-snapshot.json'),
+    ]
+
+    const MAX_PREVIEW = 64 * 1024 // 64KB preview cap
+
+    const files = candidates
+      .filter((p) => {
+        try { return fs.existsSync(p) } catch { return false }
+      })
+      .map((p) => {
+        try {
+          const stat = fs.statSync(p)
+          let content: string | undefined
+          try {
+            if (stat.size <= MAX_PREVIEW) {
+              content = fs.readFileSync(p, 'utf8')
+            } else {
+              const fd = fs.openSync(p, 'r')
+              const buf = Buffer.allocUnsafe(MAX_PREVIEW)
+              fs.readSync(fd, buf, 0, MAX_PREVIEW, 0)
+              fs.closeSync(fd)
+              content = buf.toString('utf8') + `\n... (truncated, file size ${stat.size} bytes)`
+            }
+          } catch {
+            content = undefined
+          }
+          return {
+            name: path.basename(p),
+            path: p,
+            size: stat.size,
+            modified: stat.mtime.toISOString(),
+            content,
+          }
+        } catch (e) {
+          return null
+        }
+      })
+      .filter(Boolean)
+      .sort((a: any, b: any) => new Date(b!.modified).getTime() - new Date(a!.modified).getTime())
+
+    return files
+  } catch (error) {
+    console.error('Error getting session files:', error)
+    return []
+  }
+})
+
+ipcMain.handle('delete-session-file', async (_evt, filePath: string) => {
+  try {
+    const fs = require('fs')
+    const path = require('path')
+    const os = require('os')
+    const home = os.homedir()
+
+    // Whitelist only known files to prevent arbitrary deletion
+    const allowed = new Set([
+      '.claude-sentinel-renewal.pid',
+      '.claude-sentinel-config.json',
+      '.claude-last-activity',
+      '.claude-auto-renew-start-time',
+      '.claude-last-block-state',
+      '.claude-sentinel-renewal-lock',
+      '.claude-last-renewal-check',
+      '.claude-sentinel-block-log.jsonl',
+      '.claude-sentinel-block-snapshot.json',
+    ])
+
+    const base = path.dirname(filePath)
+    const name = path.basename(filePath)
+    if (base !== home || !allowed.has(name)) {
+      return { success: false, error: 'Not allowed to delete this file' }
+    }
+
+    if (!fs.existsSync(filePath)) {
+      return { success: false, error: 'File does not exist' }
+    }
+
+    fs.unlinkSync(filePath)
+    return { success: true }
+  } catch (error) {
+    console.error('Error deleting session file:', error)
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
   }
 })
 
@@ -808,7 +1013,7 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
     if (!entries.length) return { success: false, error: 'Empty archive' }
     
     // Log entry names for debugging
-    entries.forEach(entry => {
+  entries.forEach((entry: any) => {
       console.log('Entry:', entry.entryName, 'isDirectory:', entry.isDirectory)
     })
 
@@ -819,7 +1024,7 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
       
       try {
         const content = fs.readFileSync(filePath, 'utf8')
-        const lines = content.trim().split('\n').filter(line => line.trim())
+  const lines = content.trim().split('\n').filter((line: string) => line.trim())
         
         for (const line of lines) {
           try {
@@ -890,7 +1095,7 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
     fs.mkdirSync(importRoot, { recursive: true })
 
     // Count total files to import for progress tracking
-    const totalFiles = entries.filter(entry => !entry.isDirectory && entry.entryName.endsWith('.jsonl')).length
+  const totalFiles = entries.filter((entry: any) => !entry.isDirectory && entry.entryName.endsWith('.jsonl')).length
     let importedFiles = 0
     
     // Send initial progress
@@ -954,7 +1159,7 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
         if (existingSessionIds.size > 0) {
           // Parse the new content and filter out duplicate sessions
           const newContent = entry.getData().toString('utf8')
-          const newLines = newContent.trim().split('\n').filter(line => line.trim())
+          const newLines = newContent.trim().split('\n').filter((line: string) => line.trim())
           const uniqueNewLines: string[] = []
           
           for (const line of newLines) {
@@ -1140,6 +1345,69 @@ ipcMain.handle('show-notification', async (_, message: string) => {
 })
 
 // Clear Claude usage data with user-configurable time range
+// Session status and management IPC handlers
+ipcMain.handle('get-session-status', async () => {
+  try {
+    const { getSessionStatus } = await import('../src/lib/auto-renewal-integration')
+    return getSessionStatus()
+  } catch (error) {
+    console.error('Error getting session status:', error)
+    return { error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+})
+
+ipcMain.handle('force-start-new-session', async () => {
+  try {
+    const { forceStartNewSession } = await import('../src/lib/auto-renewal-integration')
+    const result = forceStartNewSession()
+    
+    // Send status update to renderer after forcing new session
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      const { getSessionStatus } = await import('../src/lib/auto-renewal-integration')
+      mainWindow.webContents.send('session-status-update', getSessionStatus())
+    }
+    
+    return result
+  } catch (error) {
+    console.error('Error forcing new session:', error)
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+})
+
+// Block tracking IPC handlers
+ipcMain.handle('get-block-events', async (_, hours: number = 24) => {
+  try {
+    const { getRecentBlockEvents } = await import('../src/lib/block-tracker')
+    return getRecentBlockEvents(hours)
+  } catch (error) {
+    console.error('Error getting block events:', error)
+    return []
+  }
+})
+
+ipcMain.handle('get-block-snapshot', async () => {
+  try {
+    const { loadBlockSnapshot } = await import('../src/lib/block-tracker')
+    return loadBlockSnapshot()
+  } catch (error) {
+    console.error('Error getting block snapshot:', error)
+    return null
+  }
+})
+
+ipcMain.handle('get-daily-blocks', async (_, date?: string) => {
+  try {
+    const { getCurrentBlockInfo } = await import('./services/ccusage-service')
+    const blockInfo = getCurrentBlockInfo()
+    
+    // For now, return current block info. This could be enhanced to filter by date
+    return blockInfo ? [blockInfo] : []
+  } catch (error) {
+    console.error('Error getting daily blocks:', error)
+    return []
+  }
+})
+
 ipcMain.handle('clear-claude-usage-data', async (_, daysToKeep: number = 0) => {
   try {
     const { dialog } = require('electron')
