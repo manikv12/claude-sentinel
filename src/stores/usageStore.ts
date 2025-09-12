@@ -21,6 +21,13 @@ export interface CurrentBlock {
   cost?: number
 }
 
+export interface UsagePrediction {
+  tokensPerMinute: number
+  estimatedLimitReached: Date | null
+  minutesUntilLimit: number | null
+  warningLevel: 'none' | 'moderate' | 'high' | 'critical'
+}
+
 export interface UsageSummary {
   totalCost: number
   totalTokens: number

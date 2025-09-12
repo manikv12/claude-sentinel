@@ -627,25 +627,16 @@ export function AutoRenewal() {
               </select>
             </div>
 
-            <div className="flex items-center justify-between">
-              <div>
-                <label className="text-sm font-medium">Session Delay</label>
-                <p className="text-xs text-muted-foreground">
-                  Wait time before starting new session
-                </p>
+            <div className="p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700 rounded-lg">
+              <div className="flex items-center space-x-2 mb-1">
+                <Timer className="h-4 w-4 text-blue-600" />
+                <span className="text-sm font-semibold text-blue-800 dark:text-blue-200">
+                  Random Session Delay
+                </span>
               </div>
-              <select
-                value={settings.waitTimeBeforeSession}
-                onChange={(e) => updateSettings({
-                  waitTimeBeforeSession: parseInt(e.target.value)
-                })}
-                className="px-3 py-1 border rounded-md text-sm bg-background focus:outline-none focus:ring-2 focus:ring-primary"
-              >
-                <option value={30}>30s</option>
-                <option value={60}>1m</option>
-                <option value={120}>2m</option>
-                <option value={300}>5m</option>
-              </select>
+              <p className="text-xs text-blue-800 dark:text-blue-200">
+                All renewals use a random 1-5 minute delay before starting new Claude sessions to ensure natural timing and prevent conflicts.
+              </p>
             </div>
 
             <div className="flex items-center justify-between">
@@ -1016,7 +1007,7 @@ export function AutoRenewal() {
                 <h4 className="font-semibold">Renew</h4>
               </div>
               <p className="text-sm text-muted-foreground">
-                After 5 hours have passed or at your scheduled time, a new Claude session is started to begin the next usage block.
+                After 5 hours have passed or at your scheduled time, a random 1-5 minute delay is applied before starting a new Claude session to begin the next usage block.
               </p>
             </div>
           </div>

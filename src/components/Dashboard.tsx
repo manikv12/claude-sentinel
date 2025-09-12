@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card'
 import { Button } from './ui/button'
 import { Switch } from './ui/switch'
-import { useUsageStore } from '@/stores/usageStore'
+import { useUsageStore, UsagePrediction } from '@/stores/usageStore'
 import { useRenewalStore } from '@/stores/renewalStore'
 import { formatCurrency, formatTokens, formatTimeRemaining, getTimeAgo } from '@/lib/utils'
 import { 
@@ -17,7 +17,11 @@ import {
   AlertCircle,
   CheckCircle,
   PlayCircle,
-  PauseCircle
+  PauseCircle,
+  Info,
+  MessageCircle,
+  ChevronDown,
+  ChevronRight
 } from 'lucide-react'
 import { Skeleton } from './ui/skeleton'
 
@@ -85,7 +89,9 @@ export function Dashboard() {
   const [autoRefreshInterval, setAutoRefreshInterval] = useState(60) // Align with cache window
   const [isInitialLoad, setIsInitialLoad] = useState(true)
   const [isRefreshing, setIsRefreshing] = useState(false)
+  const [showUsageDetails, setShowUsageDetails] = useState(false)
   const [isWindowFocused, setIsWindowFocused] = useState(true)
+  const [userPlan, setUserPlan] = useState<'pro' | 'max-5x' | 'max-20x' | 'auto'>('auto')
 
   // Track window focus to pause auto-refresh when not visible
   useEffect(() => {
@@ -99,6 +105,21 @@ export function Dashboard() {
       window.removeEventListener('focus', handleFocus)
       window.removeEventListener('blur', handleBlur)
     }
+  }, [])
+
+  // Load user's plan setting
+  useEffect(() => {
+    const loadUserPlan = async () => {
+      try {
+        const settings = await window.electronAPI.getSettings?.()
+        if (settings?.claudePlan) {
+          setUserPlan(settings.claudePlan)
+        }
+      } catch (error) {
+        console.error('Failed to load user plan setting:', error)
+      }
+    }
+    loadUserPlan()
   }, [])
 
   // Load data when Dashboard component mounts
@@ -144,6 +165,43 @@ export function Dashboard() {
     } catch (error) {
       console.error('Failed to toggle auto-renewal:', error)
     }
+  }
+
+  // Estimate number of prompts based on user's Claude plan and usage patterns (2024 data)
+  const getEstimatedPromptCount = (usage: number) => {
+    // Plan-specific usage patterns from Anthropic's official data:
+    const planPatterns = {
+      'pro': {
+        tokensPerWindow: 44000,
+        promptsPerWindow: [10, 40], // 10-40 prompts
+        avgTokensPerPrompt: 1100 // Conservative estimate: 44K / 40 prompts
+      },
+      'max-5x': {
+        tokensPerWindow: 88000,
+        promptsPerWindow: [50, 225], // Based on 5x usage
+        avgTokensPerPrompt: 900 // 88K / ~100 average prompts
+      },
+      'max-20x': {
+        tokensPerWindow: 220000,
+        promptsPerWindow: [200, 900], // Based on 20x usage
+        avgTokensPerPrompt: 400 // 220K / ~550 average prompts
+      }
+    }
+
+    let avgTokensPerPrompt = 2000 // Default fallback
+
+    if (userPlan !== 'auto' && planPatterns[userPlan]) {
+      avgTokensPerPrompt = planPatterns[userPlan].avgTokensPerPrompt
+    } else {
+      // Auto-detect mode: use current block limit to infer plan
+      if (currentBlock?.limit) {
+        if (currentBlock.limit >= 200000000) avgTokensPerPrompt = planPatterns['max-20x'].avgTokensPerPrompt
+        else if (currentBlock.limit >= 80000000) avgTokensPerPrompt = planPatterns['max-5x'].avgTokensPerPrompt
+        else avgTokensPerPrompt = planPatterns['pro'].avgTokensPerPrompt
+      }
+    }
+
+    return Math.max(1, Math.round(usage / avgTokensPerPrompt))
   }
 
 
@@ -443,6 +501,28 @@ export function Dashboard() {
                     </span>
                   </div>
                 </div>
+                
+                {/* Collapsible Usage Details */}
+                <div className="space-y-2">
+                  <button
+                    onClick={() => setShowUsageDetails(!showUsageDetails)}
+                    className="w-full flex items-center justify-between text-xs text-muted-foreground hover:text-foreground transition-colors p-2 rounded-md hover:bg-muted/20"
+                  >
+                    <div className="flex items-center space-x-2">
+                      <Info className="h-3 w-3" />
+                      <span>Block Usage Summary</span>
+                    </div>
+                    {showUsageDetails ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                  </button>
+                  {showUsageDetails && (
+                    <div className="px-2 pb-2 text-xs text-muted-foreground space-y-1">
+                      <div>• ~{getEstimatedPromptCount(currentBlock.usage)} prompts estimated</div>
+                      <div>• ~{Math.round(currentBlock.usage / getEstimatedPromptCount(currentBlock.usage)).toLocaleString()} tokens/prompt average</div>
+                      <div>• Since {new Date(currentBlock.startTime).toLocaleTimeString()}</div>
+                    </div>
+                  )}
+                </div>
+
                 
                 {/* Block Information Grid */}
                 <div className="grid grid-cols-2 gap-4 pt-2">

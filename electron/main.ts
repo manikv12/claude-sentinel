@@ -343,10 +343,45 @@ const scheduleNextRenewal = () => {
     let reason = ''
 
     // Priority 1: User scheduled time (always takes precedence if set)
-    if (status.scheduledStartTime && new Date(status.scheduledStartTime) > now) {
-      targetTime = new Date(status.scheduledStartTime)
-      reason = 'scheduled start'
-      renewalLogger.info(`User scheduled time found: ${targetTime.toISOString()} - ignoring block expiration`, 'schedule')
+    if (status.scheduledStartTime) {
+      const scheduledTime = new Date(status.scheduledStartTime)
+      
+      if (scheduledTime > now) {
+        targetTime = scheduledTime
+        reason = 'scheduled start'
+        renewalLogger.info(`User scheduled time found: ${targetTime.toISOString()} - ignoring block expiration`, 'schedule')
+      } else {
+        // Scheduled time has just passed (within last 5 minutes) - trigger immediate renewal
+        const timeSinceScheduled = now.getTime() - scheduledTime.getTime()
+        const fiveMinutesInMs = 5 * 60 * 1000
+        
+        if (timeSinceScheduled <= fiveMinutesInMs) {
+          renewalLogger.info(`Scheduled time recently passed (${Math.round(timeSinceScheduled / 1000)}s ago), triggering immediate renewal`, 'schedule')
+          
+          // Trigger immediate renewal
+          setTimeout(() => {
+            try {
+              renewalLogger.info('Executing immediate scheduled renewal', 'renewal')
+              const result = performRenewalCheck()
+              
+              // Send status updates
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
+              }
+              if (result.success && result.action && tray) {
+                updateTrayMenu()
+              }
+              
+              // Schedule next renewal after immediate execution
+              setTimeout(() => scheduleNextRenewal(), 2000)
+            } catch (error) {
+              renewalLogger.error(`Error in immediate scheduled renewal: ${error instanceof Error ? error.message : String(error)}`, 'renewal')
+            }
+          }, 1000) // Small delay to ensure proper execution
+          
+          return // Exit early after scheduling immediate renewal
+        }
+      }
     }
     // Priority 2: Block expiration (only if no scheduled time)
     else if (status.currentBlock?.endTime && new Date(status.currentBlock.endTime) > now) {
@@ -563,6 +598,25 @@ ipcMain.handle('toggle-auto-renewal', async (_, enabled: boolean, scheduledTime?
       if (scheduledTime) setScheduledStartTime(scheduledTime)
       if (result.success) {
         startRenewalMonitoring()
+        
+        // When auto-renewal is first turned on, perform immediate check with random delay
+        // This ensures we start a session if needed without waiting for the next scheduled check
+        renewalLogger.info('🚀 AUTO-RENEWAL ENABLED: Performing immediate renewal check with delay', 'service')
+        setTimeout(() => {
+          try {
+            const renewalResult = performRenewalCheck()
+            if (renewalResult.success && renewalResult.action) {
+              renewalLogger.info(`✅ Initial renewal check completed: ${renewalResult.action}`, 'service')
+            }
+            
+            // Update status after initial check
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
+            }
+          } catch (error) {
+            renewalLogger.error(`❌ Error in initial renewal check: ${error instanceof Error ? error.message : String(error)}`, 'service')
+          }
+        }, 5000) // 5 second delay to let the UI update and avoid immediate execution
       }
     } else {
       result = stopRenewalService()
@@ -1289,8 +1343,7 @@ ipcMain.handle('get-settings', async () => {
         enabled: false,
         checkInterval: 5,
         enableLogging: true,
-        notifyOnRenewal: true,
-        waitTimeBeforeSession: 60
+        notifyOnRenewal: true
       }
     }
   } catch (error) {
@@ -1301,7 +1354,33 @@ ipcMain.handle('get-settings', async () => {
 
 ipcMain.handle('save-settings', async (_, settings: any) => {
   try {
-    // For now, just return success - could be enhanced to save to storage
+    // Save renewal settings to the config file that the backend reads from
+    if (settings.autoRenewal) {
+      const configFile = path.join(os.homedir(), '.claude-sentinel-config.json')
+      let currentConfig: any = { enabled: false }
+      
+      try {
+        if (fs.existsSync(configFile)) {
+          currentConfig = JSON.parse(fs.readFileSync(configFile, 'utf8'))
+        }
+      } catch (error) {
+        console.warn('Could not read existing config, starting fresh:', error)
+      }
+      
+      // Update config with new settings
+      currentConfig.checkInterval = settings.autoRenewal.checkInterval
+      currentConfig.enableLogging = settings.autoRenewal.enableLogging
+      currentConfig.notifyOnRenewal = settings.autoRenewal.notifyOnRenewal
+      
+      // Preserve the enabled state
+      if (currentConfig.enabled === undefined) {
+        currentConfig.enabled = settings.autoRenewal.enabled || false
+      }
+      
+      fs.writeFileSync(configFile, JSON.stringify(currentConfig, null, 2))
+      renewalLogger.info(`Settings saved: checkInterval=${currentConfig.checkInterval}min, enableLogging=${currentConfig.enableLogging}`, 'service')
+    }
+    
     console.log('Settings saved:', settings)
     return { success: true }
   } catch (error) {

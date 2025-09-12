@@ -14,8 +14,8 @@ import {
   detectBlockChanges
 } from './block-tracker'
 
-// Toggle verbose logging via env var
-const DEBUG = process.env.SENTINEL_DEBUG === '1'
+// Toggle verbose logging via env var (temporarily enabled for debugging)
+const DEBUG = process.env.SENTINEL_DEBUG === '1' || true
 
 // Cache for loaded data to prevent repeated file I/O
 let cachedData: SentinelUsageEntry[] | null = null
@@ -398,13 +398,26 @@ function identifyBillingBlocks(entries: SentinelUsageEntry[]): SentinelBillingBl
   const usage = activeBlock.usage
   const cost = currentBlockEntries.reduce((sum, e) => sum + (e.costUSD || 0), 0)
   
-  // Debug: Show some sample token values
-  const sampleEntries = currentBlockEntries.slice(0, 5)
+  // Debug: Show detailed token breakdown for current block
   if (DEBUG) {
-    console.log(`Sentinel: Sample token values from first 5 entries:`)
+    console.log(`\n=== CURRENT BLOCK TOKEN BREAKDOWN ===`)
+    console.log(`Block start: ${blockStart.toLocaleString()}`)
+    console.log(`Block end: ${blockEnd.toLocaleString()}`)
+    console.log(`Total entries in block: ${currentBlockEntries.length}`)
+    console.log(`Total tokens: ${usage.toLocaleString()}`)
+    console.log(`Average tokens per entry: ${Math.round(usage / currentBlockEntries.length)}`)
+    
+    console.log(`\nFirst 10 entries breakdown:`)
+    const sampleEntries = currentBlockEntries.slice(0, 10)
     sampleEntries.forEach((entry, idx) => {
-      console.log(`  Entry ${idx + 1}: ${entry.totalTokens} tokens (input: ${entry.inputTokens}, output: ${entry.outputTokens})`)
+      const entryTime = new Date(entry.timestamp).toLocaleTimeString()
+      console.log(`  ${idx + 1}. [${entryTime}] ${entry.totalTokens.toLocaleString()} tokens (in: ${entry.inputTokens.toLocaleString()}, out: ${entry.outputTokens.toLocaleString()}) - ${entry.model}`)
     })
+    
+    if (currentBlockEntries.length > 10) {
+      console.log(`  ... and ${currentBlockEntries.length - 10} more entries`)
+    }
+    console.log(`=====================================\n`)
   }
   
   // Check for unusually large entries

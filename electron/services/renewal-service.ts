@@ -24,15 +24,24 @@ const START_TIME_FILE = join(HOME, '.claude-auto-renew-start-time')
 const LAST_BLOCK_STATE_FILE = join(HOME, '.claude-last-block-state')
 const RENEWAL_LOCK_FILE = join(HOME, '.claude-sentinel-renewal-lock')
 const LAST_RENEWAL_CHECK_FILE = join(HOME, '.claude-last-renewal-check')
+const SCHEDULED_RENEWAL_STATE_FILE = join(HOME, '.claude-scheduled-renewal-state')
 
-type SimpleConfig = { enabled: boolean; checkInterval?: number; enableLogging?: boolean }
+type SimpleConfig = { 
+  enabled: boolean; 
+  checkInterval?: number; 
+  enableLogging?: boolean;
+}
 
 // Exported so the main process can auto-start monitoring on launch
 export function loadConfig(): SimpleConfig {
   try {
     if (existsSync(CONFIG_FILE)) {
       const cfg = JSON.parse(readFileSync(CONFIG_FILE, 'utf8'))
-      return { enabled: !!cfg.enabled, checkInterval: cfg.checkInterval, enableLogging: cfg.enableLogging }
+      return { 
+        enabled: !!cfg.enabled, 
+        checkInterval: cfg.checkInterval, 
+        enableLogging: cfg.enableLogging
+      }
     }
   } catch {}
   return { enabled: false }
@@ -138,7 +147,8 @@ function acquireLock(): boolean {
   try {
     if (existsSync(RENEWAL_LOCK_FILE)) {
       // Check if lock is stale (older than 5 minutes)
-      const lockAge = Date.now() - readFileSync(RENEWAL_LOCK_FILE, 'utf8').trim()
+      const lockTimestamp = parseInt(readFileSync(RENEWAL_LOCK_FILE, 'utf8').trim(), 10)
+      const lockAge = Date.now() - lockTimestamp
       if (lockAge < 300000) { // 5 minutes
         return false // Lock is held by another process
       } else {
@@ -186,6 +196,44 @@ function recordRenewalCheck() {
     writeFileSync(LAST_RENEWAL_CHECK_FILE, Math.floor(Date.now() / 1000).toString())
   } catch (error) {
     renewalLogger.warn(`Failed to record renewal check time: ${error instanceof Error ? error.message : String(error)}`, 'service')
+  }
+}
+
+// Generate random delay between 1-5 minutes (60-300 seconds)
+function getRandomRenewalDelay(): number {
+  const minSeconds = 60   // 1 minute
+  const maxSeconds = 300  // 5 minutes
+  const randomDelay = Math.floor(Math.random() * (maxSeconds - minSeconds + 1)) + minSeconds
+  renewalLogger.info(`Generated random renewal delay: ${randomDelay}s (${(randomDelay / 60).toFixed(1)} minutes)`, 'renewal')
+  return randomDelay
+}
+
+// Track scheduled renewal execution to prevent duplicates
+function markScheduledRenewalExecuted(scheduledTime: string) {
+  try {
+    const state = {
+      executedAt: new Date().toISOString(),
+      scheduledTime: scheduledTime,
+      timestamp: Math.floor(Date.now() / 1000)
+    }
+    writeFileSync(SCHEDULED_RENEWAL_STATE_FILE, JSON.stringify(state))
+    renewalLogger.info(`Marked scheduled renewal as executed: ${scheduledTime}`, 'schedule')
+  } catch (error) {
+    renewalLogger.warn(`Failed to mark scheduled renewal as executed: ${error instanceof Error ? error.message : String(error)}`, 'service')
+  }
+}
+
+function wasScheduledRenewalExecuted(scheduledTime: string): boolean {
+  try {
+    if (!existsSync(SCHEDULED_RENEWAL_STATE_FILE)) return false
+    
+    const state = JSON.parse(readFileSync(SCHEDULED_RENEWAL_STATE_FILE, 'utf8'))
+    const stateAge = Math.floor(Date.now() / 1000) - state.timestamp
+    
+    // Consider executed if same scheduled time and within last hour
+    return state.scheduledTime === scheduledTime && stateAge < 3600
+  } catch (error) {
+    return false
   }
 }
 
@@ -308,9 +356,47 @@ export function performRenewalCheck(): { success: boolean; action?: string; erro
           renewalLogger.info(`⏰ SCHEDULED RENEWAL: Waiting for scheduled time in ${hoursUntilScheduled.toFixed(1)} hours`, 'renewal')
           return { success: true }
         } else {
-          // Scheduled time has passed - clear schedule and proceed with renewal check
-          renewalLogger.info(`⏰ SCHEDULED TIME REACHED: Clearing schedule and checking for renewal`, 'renewal')
-          setScheduledStartTime(null)
+          // Check if this scheduled renewal was already executed
+          if (wasScheduledRenewalExecuted(scheduledStartTime)) {
+            renewalLogger.info(`⏰ SCHEDULED RENEWAL: Already executed for time ${scheduledStartTime}, skipping`, 'renewal')
+            setScheduledStartTime(null) // Clear the schedule
+            // Continue with normal block-based renewal logic
+          } else {
+            // Scheduled time has passed - clear schedule and FORCE renewal with random delay
+            renewalLogger.info(`⏰ SCHEDULED TIME REACHED: Scheduling renewal with random delay for ${scheduledStartTime}`, 'renewal')
+            
+            // Mark as executed before clearing schedule
+            markScheduledRenewalExecuted(scheduledStartTime)
+            setScheduledStartTime(null)
+            
+            // Use random delay between 1-5 minutes
+            const delaySeconds = getRandomRenewalDelay()
+            
+            // Force renewal regardless of block state when scheduled time is reached
+            shouldRenew = true
+            reason = `Scheduled time has been reached - starting renewal in ${(delaySeconds / 60).toFixed(1)} minutes`
+            renewalLogger.info(`🚀 SCHEDULED SESSION START FORCED: ${reason}`, 'renewal')
+            renewalLogger.info(`⏰ Applying random ${delaySeconds}s (${(delaySeconds / 60).toFixed(1)} min) delay before starting Claude session...`, 'renewal')
+            
+            // Start session with random delay (non-blocking)
+            setTimeout(() => {
+              try { 
+                renewalLogger.info(`⏳ Random delay complete - calling startClaudeSession() now`, 'renewal')
+                renewalLogger.info('📞 CALLING startClaudeSession() NOW', 'session')
+                const result = startClaudeSession()
+                renewalLogger.info(`✅ SESSION START RESULT: ${result}`, 'session')
+                if (result) {
+                  renewalLogger.info('🎯 NEW CLAUDE SESSION STARTED SUCCESSFULLY (SCHEDULED)', 'session')
+                } else {
+                  renewalLogger.error('❌ SCHEDULED SESSION START FAILED', 'session')
+                }
+              } catch (sessionError) {
+                renewalLogger.error(`💥 Error in delayed callback: ${sessionError instanceof Error ? sessionError.message : String(sessionError)}`, 'renewal')
+              }
+            }, delaySeconds * 1000) // Convert seconds to milliseconds
+            
+            return { success: true, action: reason }
+          }
         }
       }
 
@@ -335,13 +421,16 @@ export function performRenewalCheck(): { success: boolean; action?: string; erro
       }
 
       if (shouldRenew) {
-        renewalLogger.info(`🚀 SESSION START TRIGGERED: ${reason}`, 'renewal')
-        renewalLogger.info('Starting Claude session via setTimeout...', 'renewal')
+        // Use random delay between 1-5 minutes for all renewals
+        const delaySeconds = getRandomRenewalDelay()
         
-        // Start session asynchronously (non-blocking)
-        setImmediate(() => {
+        renewalLogger.info(`🚀 SESSION START TRIGGERED: ${reason}`, 'renewal')
+        renewalLogger.info(`⏰ Applying random ${delaySeconds}s (${(delaySeconds / 60).toFixed(1)} min) delay before starting Claude session...`, 'renewal')
+        
+        // Start session with random delay (non-blocking)
+        setTimeout(() => {
           try { 
-            renewalLogger.info('setImmediate callback executing - calling startClaudeSession()', 'renewal')
+            renewalLogger.info(`⏳ Random delay complete - calling startClaudeSession() now`, 'renewal')
             renewalLogger.info('📞 CALLING startClaudeSession() NOW', 'session')
             const result = startClaudeSession()
             renewalLogger.info(`✅ SESSION START RESULT: ${result}`, 'session')
@@ -351,9 +440,10 @@ export function performRenewalCheck(): { success: boolean; action?: string; erro
               renewalLogger.error('❌ SESSION START FAILED', 'session')
             }
           } catch (sessionError) {
-            renewalLogger.error(`💥 Error in setImmediate callback: ${sessionError instanceof Error ? sessionError.message : String(sessionError)}`, 'renewal')
+            renewalLogger.error(`💥 Error in delayed callback: ${sessionError instanceof Error ? sessionError.message : String(sessionError)}`, 'renewal')
           }
-        })
+        }, delaySeconds * 1000) // Convert seconds to milliseconds
+        
         return { success: true, action: reason }
       } else {
         renewalLogger.info('✋ NO SESSION STARTED - conditions not met', 'renewal')
@@ -380,7 +470,8 @@ export function resetSessionTracking(): { success: boolean; error?: string } {
       START_TIME_FILE,
       LAST_BLOCK_STATE_FILE,
       RENEWAL_LOCK_FILE,
-      LAST_RENEWAL_CHECK_FILE
+      LAST_RENEWAL_CHECK_FILE,
+      SCHEDULED_RENEWAL_STATE_FILE
     ]
     const resetFiles: string[] = []
     

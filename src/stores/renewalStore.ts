@@ -22,14 +22,13 @@ interface RenewalStore {
     checkInterval: number
     enableLogging: boolean
     notifyOnRenewal: boolean
-    waitTimeBeforeSession: number
     autoRefresh: boolean
     autoRefreshInterval: number
   }
   
   setRenewalStatus: (status: any) => void
   toggleAutoRenewal: (enabled: boolean, scheduledTime?: string) => Promise<void>
-  updateSettings: (settings: Partial<RenewalStore['settings']>) => void
+  updateSettings: (settings: Partial<RenewalStore['settings']>) => Promise<void>
   setScheduledStartTime: (time: string | null) => Promise<void>
   setLoading: (loading: boolean) => void
   setError: (error: string | null) => void
@@ -51,7 +50,6 @@ export const useRenewalStore = create<RenewalStore>((set, get) => ({
     checkInterval: 5,
     enableLogging: true,
     notifyOnRenewal: true,
-    waitTimeBeforeSession: 60,
     autoRefresh: false,
     autoRefreshInterval: 120
   },
@@ -106,10 +104,21 @@ export const useRenewalStore = create<RenewalStore>((set, get) => ({
     }
   },
 
-  updateSettings: (newSettings) => {
+  updateSettings: async (newSettings) => {
     set(state => ({
       settings: { ...state.settings, ...newSettings }
     }))
+    
+    // Persist settings to backend
+    try {
+      const state = get()
+      const settingsToSave = {
+        autoRenewal: state.settings
+      }
+      await window.electronAPI.saveSettings?.(settingsToSave)
+    } catch (error) {
+      console.warn('Failed to persist settings:', error)
+    }
   },
 
   setScheduledStartTime: async (time) => {
