@@ -21,244 +21,7 @@ let mainWindow: BrowserWindow | null = null
 let floatingWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let trayUsageInterval: NodeJS.Timeout | null = null
-let tooltipWindow: BrowserWindow | null = null
 
-// Create modern glass-style tooltip window
-const createTooltipWindow = (tooltipData: any) => {
-  if (tooltipWindow && !tooltipWindow.isDestroyed()) {
-    tooltipWindow.close()
-  }
-
-  const { screen } = require('electron')
-  const cursor = screen.getCursorScreenPoint()
-  const primaryDisplay = screen.getPrimaryDisplay()
-
-  tooltipWindow = new BrowserWindow({
-    width: 280,
-    height: 'auto' as any,
-    x: cursor.x + 10,
-    y: cursor.y - 120,
-    frame: false,
-    transparent: true,
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    resizable: false,
-    movable: false,
-    minimizable: false,
-    maximizable: false,
-    show: false,
-    webPreferences: {
-      nodeIntegration: false,
-      contextIsolation: true
-    }
-  })
-
-  // Create HTML content with native macOS tooltip styling
-  const htmlContent = `
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta charset="UTF-8">
-      <style>
-        body {
-          margin: 0;
-          padding: 0;
-          font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif;
-          background: transparent;
-          overflow: hidden;
-          -webkit-font-smoothing: antialiased;
-          text-rendering: optimizeLegibility;
-        }
-
-        .tooltip {
-          background: rgba(35, 35, 37, 0.96);
-          backdrop-filter: blur(30px);
-          -webkit-backdrop-filter: blur(30px);
-          border-radius: 10px;
-          border: 0.5px solid rgba(255, 255, 255, 0.12);
-          padding: 14px 16px;
-          box-shadow:
-            0 10px 40px rgba(0, 0, 0, 0.5),
-            0 2px 8px rgba(0, 0, 0, 0.3),
-            inset 0 1px 0 rgba(255, 255, 255, 0.08);
-          color: #F2F2F7;
-          min-width: 220px;
-          max-width: 300px;
-          cursor: pointer;
-        }
-
-        .header {
-          font-size: 13px;
-          font-weight: 600;
-          margin-bottom: 12px;
-          color: #F2F2F7;
-          display: flex;
-          align-items: center;
-          gap: 8px;
-          letter-spacing: -0.02em;
-        }
-
-        .icon {
-          width: 14px;
-          height: 14px;
-          background: linear-gradient(135deg, #007AFF, #5AC8FA);
-          border-radius: 3px;
-          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
-        }
-
-        .row {
-          display: flex;
-          justify-content: space-between;
-          align-items: baseline;
-          margin-bottom: 7px;
-          font-size: 11px;
-        }
-
-        .row:last-child {
-          margin-bottom: 0;
-        }
-
-        .label {
-          color: #8E8E93;
-          font-weight: 400;
-          letter-spacing: -0.01em;
-        }
-
-        .value {
-          color: #F2F2F7;
-          font-weight: 500;
-          text-align: right;
-          letter-spacing: -0.01em;
-        }
-
-        .usage-row {
-          margin-bottom: 8px;
-        }
-
-        .usage-bar {
-          width: 100%;
-          height: 3px;
-          background: rgba(142, 142, 147, 0.3);
-          border-radius: 1.5px;
-          overflow: hidden;
-          margin-top: 5px;
-        }
-
-        .usage-fill {
-          height: 100%;
-          background: linear-gradient(90deg, #30D158 0%, #FF9F0A 70%, #FF453A 100%);
-          border-radius: 1.5px;
-          transition: width 0.2s ease;
-        }
-
-        .status-row {
-          display: flex;
-          align-items: center;
-          font-size: 11px;
-          margin-bottom: 7px;
-        }
-
-        .status-indicator {
-          width: 6px;
-          height: 6px;
-          border-radius: 50%;
-          margin-right: 7px;
-          flex-shrink: 0;
-        }
-
-        .status-on {
-          background: #30D158;
-          box-shadow: 0 0 6px rgba(48, 209, 88, 0.4);
-        }
-
-        .status-off {
-          background: #FF453A;
-          box-shadow: 0 0 6px rgba(255, 69, 58, 0.4);
-        }
-
-        .separator {
-          height: 0.5px;
-          background: rgba(142, 142, 147, 0.2);
-          margin: 10px 0;
-        }
-      </style>
-    </head>
-    <body>
-      <div class="tooltip" onclick="window.close()">
-        <div class="header">
-          <div class="icon"></div>
-          ${tooltipData.title}
-        </div>
-
-        ${tooltipData.usage ? `
-        <div class="row usage-row">
-          <span class="label">Usage</span>
-          <span class="value">${tooltipData.usage}</span>
-        </div>
-        <div class="usage-bar">
-          <div class="usage-fill" style="width: ${tooltipData.usage}"></div>
-        </div>
-        ` : ''}
-
-        <div class="row">
-          <span class="label">Tokens</span>
-          <span class="value">${tooltipData.tokens}</span>
-        </div>
-
-        ${tooltipData.timeRemaining ? `
-        <div class="row">
-          <span class="label">Time Remaining</span>
-          <span class="value">${tooltipData.timeRemaining}</span>
-        </div>
-        ` : ''}
-
-        <div class="separator"></div>
-
-        <div class="status-row">
-          <span class="status-indicator ${tooltipData.renewalStatus.includes('ON') ? 'status-on' : 'status-off'}"></span>
-          <span class="label">Auto-renewal ${tooltipData.renewalStatus}</span>
-        </div>
-
-        ${tooltipData.nextSession ? `
-        <div class="row">
-          <span class="label">Next Session</span>
-          <span class="value">${tooltipData.nextSession}</span>
-        </div>
-        ` : ''}
-      </div>
-
-      <script>
-        // Close tooltip on click or escape key
-        document.addEventListener('click', () => window.close());
-        document.addEventListener('keydown', (e) => {
-          if (e.key === 'Escape') window.close();
-        });
-
-        // Prevent event bubbling
-        document.querySelector('.tooltip').addEventListener('click', (e) => {
-          e.stopPropagation();
-          window.close();
-        });
-      </script>
-    </body>
-    </html>
-  `
-
-  tooltipWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(htmlContent)}`)
-
-  tooltipWindow.once('ready-to-show', () => {
-    if (tooltipWindow && !tooltipWindow.isDestroyed()) {
-      tooltipWindow.show()
-
-      // Auto-hide after 3 seconds
-      setTimeout(() => {
-        if (tooltipWindow && !tooltipWindow.isDestroyed()) {
-          tooltipWindow.close()
-        }
-      }, 3000)
-    }
-  })
-}
 
 // Create a high-quality PNG battery icon for macOS menu bar
 const createBatteryIcon = (options?: { size?: number; percentage?: number }) => {
@@ -634,7 +397,73 @@ const updateTrayUsage = () => {
     nextSession: renewalInfo.includes('Next session:') ? renewalInfo.split('Next session: ')[1] : null
   }
 
-  // No system tooltip - we use custom glass tooltip on hover only
+  // Set comprehensive tooltip with usage data
+  const tooltipLines = []
+  tooltipLines.push('Claude Sentinel')
+
+  if (percent !== null) {
+    tooltipLines.push(`Usage: ${percent}% used`)
+    tooltipLines.push(`Remaining: ${100 - percent}%`)
+  } else {
+    tooltipLines.push('Usage: Unknown')
+  }
+
+  tooltipLines.push(usageText)
+
+  if (timeLeft !== null) {
+    tooltipLines.push(`Time left: ${formatMinutes(timeLeft)}`)
+  }
+
+  // Add renewal status info
+  try {
+    const renewalStatus = getRenewalStatus()
+    if (renewalStatus.enabled) {
+      tooltipLines.push('')
+      tooltipLines.push('Auto-renewal: ON')
+
+      if (renewalStatus.nextRenewal) {
+        const nextRenewalTime = new Date(renewalStatus.nextRenewal)
+        const now = new Date()
+        const isToday = nextRenewalTime.toDateString() === now.toDateString()
+        const isTomorrow = nextRenewalTime.toDateString() === new Date(now.getTime() + 24*60*60*1000).toDateString()
+
+        const timeOptions: Intl.DateTimeFormatOptions = {
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: true
+        }
+
+        const dateOptions: Intl.DateTimeFormatOptions = {
+          month: 'short',
+          day: 'numeric'
+        }
+
+        let timeStr
+        if (isToday) {
+          timeStr = `Today at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
+        } else if (isTomorrow) {
+          timeStr = `Tomorrow at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
+        } else {
+          timeStr = `${nextRenewalTime.toLocaleDateString('en-US', dateOptions)} at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
+        }
+
+        tooltipLines.push(`Next session: ${timeStr}`)
+      } else if (renewalStatus.timeRemaining) {
+        tooltipLines.push(`Time remaining: ${renewalStatus.timeRemaining}`)
+      } else {
+        tooltipLines.push('Next session: TBD')
+      }
+    } else {
+      tooltipLines.push('')
+      tooltipLines.push('Auto-renewal: OFF')
+    }
+  } catch (configError) {
+    tooltipLines.push('')
+    tooltipLines.push('Auto-renewal: Status unknown')
+  }
+
+  // Set the tooltip
+  tray.setToolTip(tooltipLines.join('\n'))
 
   // Refresh tray context menu to reflect latest usage
   try { updateTrayMenu() } catch {}
@@ -686,7 +515,23 @@ const createWindow = () => {
     mainWindow.webContents.openDevTools()
   }
 
-  // Handle window closed
+  // Handle window close button - hide to menu bar instead of closing
+  mainWindow.on('close', (event) => {
+    if (process.platform === 'darwin') {
+      // On macOS, hide window and dock icon instead of closing
+      event.preventDefault()
+      mainWindow?.hide()
+
+      // Hide dock icon when window is hidden to menu bar
+      try { if (app.dock) app.dock.hide() } catch {}
+    } else {
+      // On Windows/Linux, hide to system tray
+      event.preventDefault()
+      mainWindow?.hide()
+    }
+  })
+
+  // Handle window closed (for cleanup when app actually quits)
   mainWindow.on('closed', () => {
     mainWindow = null
   })
@@ -902,55 +747,9 @@ const createTray = () => {
     }
   ])
 
-  // Disable system tooltip since we're using custom glass tooltip
-  tray.setToolTip('')
+  // Set initial basic tooltip and context menu
+  tray.setToolTip('Claude Sentinel - Loading...')
   tray.setContextMenu(contextMenu)
-
-  // Handle tray hover for modern glass tooltip
-  tray.on('mouse-enter', () => {
-    // Get current usage data for tooltip
-    const { percent, block } = getUsagePercent()
-    const timeLeft = block?.timeRemaining ?? null
-    const usageText = block ? `${formatTokens(block.usage)} / ${formatTokens(block.limit || 0)} tokens` : 'Usage unavailable'
-
-    // Get renewal info
-    let renewalStatus = 'OFF'
-    let nextSession = null
-    try {
-      const status = getRenewalStatus()
-      renewalStatus = status.enabled ? 'ON' : 'OFF'
-      if (status.nextRenewal) {
-        const nextRenewalTime = new Date(status.nextRenewal)
-        const now = new Date()
-        const isToday = nextRenewalTime.toDateString() === now.toDateString()
-        const isTomorrow = nextRenewalTime.toDateString() === new Date(now.getTime() + 24*60*60*1000).toDateString()
-
-        if (isToday) {
-          nextSession = `Today at ${nextRenewalTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })}`
-        } else if (isTomorrow) {
-          nextSession = `Tomorrow at ${nextRenewalTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })}`
-        } else {
-          nextSession = `${nextRenewalTime.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} at ${nextRenewalTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })}`
-        }
-      }
-    } catch {}
-
-    const tooltipData = {
-      title: 'Claude Sentinel',
-      usage: percent !== null ? `${percent}%` : null,
-      tokens: usageText,
-      timeRemaining: timeLeft !== null ? formatMinutes(timeLeft) : null,
-      renewalStatus,
-      nextSession
-    }
-
-    createTooltipWindow(tooltipData)
-  })
-
-  // Hide tooltip on mouse leave (optional - tooltip auto-hides anyway)
-  tray.on('mouse-leave', () => {
-    // Tooltip will auto-hide, but we could force close here if needed
-  })
 
   // Handle tray click - show context menu only (no direct app opening)
   // Note: The context menu will be shown automatically on click, we don't need to handle direct clicks
@@ -995,12 +794,9 @@ app.on('activate', () => {
 })
 
 app.on('window-all-closed', () => {
-  // Keep app running in system tray
-  if (process.platform !== 'darwin') {
-    // On Windows/Linux, keep running for system tray
-    return
-  }
-  app.quit()
+  // Keep app running in menu bar/system tray on all platforms
+  // The app should only quit when explicitly requested from the tray menu
+  return
 })
 
 app.on('before-quit', () => {
@@ -1983,12 +1779,12 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
         
         // Look for pattern like "-Users-currentuser-"
         const userPatterns = existingProjects
-          .filter(name => name.startsWith('-Users-'))
-          .map(name => {
+          .filter((name: string) => name.startsWith('-Users-'))
+          .map((name: string) => {
             const match = name.match(/^(-Users-[^-]+-)/)
             return match ? match[1] : null
           })
-          .filter(Boolean)
+          .filter((pattern): pattern is string => Boolean(pattern))
         
         if (userPatterns.length > 0) {
           const currentPattern = userPatterns[0]

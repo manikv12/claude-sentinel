@@ -301,7 +301,7 @@ function findAllHistoricalBlocks(entries: SentinelUsageEntry[]): HistoricalBlock
         usage: blockUsage,
         isActive,
         entryCount: blockEntries.length,
-        source: 'unified_analysis',
+        source: 'ccusage_analysis',
         details: `Block ${isActive ? 'active' : 'ended'} with ${blockEntries.length} entries`
       })
     }
@@ -385,7 +385,7 @@ function identifyBillingBlocks(entries: SentinelUsageEntry[]): SentinelBillingBl
   
   let stableLimit: number
   
-  if (userPlan !== 'auto') {
+  if (userPlan === 'pro' || userPlan === 'max-5x' || userPlan === 'max-20x') {
     // User explicitly set their plan - use that limit
     stableLimit = Math.max(PLAN_LIMITS[userPlan], usage * 1.05)
     if (DEBUG) console.log(`Sentinel: Using user-configured ${userPlan} plan limit: ${stableLimit.toLocaleString()} tokens`)

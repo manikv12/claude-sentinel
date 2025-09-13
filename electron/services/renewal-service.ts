@@ -155,8 +155,21 @@ function acquireLock(): boolean {
       
       if (lockAge < 600000) { // 10 minutes
         const lockAgeMinutes = (lockAge / 60000).toFixed(1)
-        renewalLogger.info(`🔒 Lock held by PID ${lockInfo.pid || 'unknown'} (${lockAgeMinutes} min ago)`, 'service')
-        return false // Lock is held by another process
+        // Additional check: verify if the PID actually exists
+        if (lockInfo.pid) {
+          try {
+            process.kill(lockInfo.pid, 0) // Check if process exists
+            renewalLogger.info(`🔒 Lock held by active PID ${lockInfo.pid} (${lockAgeMinutes} min ago)`, 'service')
+            return false // Lock is held by active process
+          } catch (e) {
+            // Process doesn't exist, remove stale lock
+            renewalLogger.warn(`🔓 Removing lock from dead process PID ${lockInfo.pid} (${lockAgeMinutes} min ago)`, 'service')
+            unlinkSync(RENEWAL_LOCK_FILE)
+          }
+        } else {
+          renewalLogger.info(`🔒 Lock held by unknown PID (${lockAgeMinutes} min ago)`, 'service')
+          return false // Lock is held by another process
+        }
       } else {
         // Stale lock, remove it
         renewalLogger.warn(`🔓 Removing stale lock (${(lockAge / 60000).toFixed(1)} min old)`, 'service')
@@ -427,44 +440,66 @@ export function performRenewalCheck(): { success: boolean; action?: string; erro
         } else {
           // Check if this scheduled renewal was already executed
           if (wasScheduledRenewalExecuted(scheduledStartTime)) {
-            renewalLogger.info(`⏰ SCHEDULED RENEWAL: Already executed for time ${scheduledStartTime}, skipping`, 'renewal')
+            renewalLogger.info(`⏰ SCHEDULED RENEWAL: Already executed for time ${scheduledStartTime}, clearing schedule`, 'renewal')
             setScheduledStartTime(null) // Clear the schedule
-            // Continue with normal block-based renewal logic
+            renewalLogger.info(`⏰ SCHEDULED RENEWAL: Proceeding to block-based renewal check`, 'renewal')
+            // Continue with normal block-based renewal logic below
           } else {
-            // Scheduled time has passed - clear schedule and FORCE renewal with random delay
-            renewalLogger.info(`⏰ SCHEDULED TIME REACHED: Scheduling renewal with random delay for ${scheduledStartTime}`, 'renewal')
-            
-            // Mark as executed before clearing schedule
-            markScheduledRenewalExecuted(scheduledStartTime)
+            // Scheduled time has passed - IMMEDIATELY clear schedule to prevent duplicates
+            renewalLogger.info(`⏰ SCHEDULED TIME REACHED: Processing renewal for ${scheduledStartTime}`, 'renewal')
+
+            // Clear scheduled time IMMEDIATELY to prevent duplicate executions
             setScheduledStartTime(null)
-            
+            markScheduledRenewalExecuted(scheduledStartTime)
+
             // Use random delay between 1-5 minutes
             const delaySeconds = getRandomRenewalDelay()
-            
+
             // Force renewal regardless of block state when scheduled time is reached
             shouldRenew = true
             reason = `Scheduled time has been reached - starting renewal in ${(delaySeconds / 60).toFixed(1)} minutes`
             renewalLogger.info(`🚀 SCHEDULED SESSION START FORCED: ${reason}`, 'renewal')
             renewalLogger.info(`⏰ Applying random ${delaySeconds}s (${(delaySeconds / 60).toFixed(1)} min) delay before starting Claude session...`, 'renewal')
-            
-            // Start session with random delay (non-blocking)
-            setTimeout(() => {
-              try { 
-                renewalLogger.info(`⏳ Random delay complete - calling startClaudeSession() now`, 'renewal')
-                renewalLogger.info('📞 CALLING startClaudeSession() NOW', 'session')
-                const result = startClaudeSession()
-                renewalLogger.info(`✅ SESSION START RESULT: ${result}`, 'session')
-                if (result) {
-                  renewalLogger.info('🎯 NEW CLAUDE SESSION STARTED SUCCESSFULLY (SCHEDULED)', 'session')
-                  recordSuccessfulRenewal() // Record the successful renewal
-                } else {
-                  renewalLogger.error('❌ SCHEDULED SESSION START FAILED', 'session')
+
+            // Start session with random delay (non-blocking) and retry logic
+            setTimeout(async () => {
+              let retryCount = 0
+              const maxRetries = 2
+              let sessionSuccess = false
+
+              while (retryCount <= maxRetries && !sessionSuccess) {
+                try {
+                  if (retryCount > 0) {
+                    renewalLogger.info(`🔄 Scheduled renewal retry attempt ${retryCount}/${maxRetries}`, 'session')
+                    // Add exponential backoff for retries
+                    await new Promise(resolve => setTimeout(resolve, retryCount * 5000))
+                  }
+
+                  renewalLogger.info(`⏳ ${retryCount === 0 ? 'Random delay complete' : 'Retrying scheduled'} - calling startClaudeSession() now`, 'renewal')
+                  renewalLogger.info('📞 CALLING startClaudeSession() NOW (SCHEDULED)', 'session')
+                  const result = await startClaudeSession()
+                  renewalLogger.info(`✅ SCHEDULED SESSION START RESULT: ${result}`, 'session')
+
+                  if (result) {
+                    renewalLogger.info('🎯 NEW CLAUDE SESSION STARTED SUCCESSFULLY (SCHEDULED)', 'session')
+                    recordSuccessfulRenewal() // Record the successful renewal
+                    sessionSuccess = true
+                  } else {
+                    renewalLogger.error(`❌ SCHEDULED SESSION START FAILED (attempt ${retryCount + 1}/${maxRetries + 1})`, 'session')
+                    retryCount++
+                  }
+                } catch (sessionError) {
+                  renewalLogger.error(`💥 Error in scheduled session start attempt ${retryCount + 1}: ${sessionError instanceof Error ? sessionError.message : String(sessionError)}`, 'renewal')
+                  retryCount++
                 }
-              } catch (sessionError) {
-                renewalLogger.error(`💥 Error in delayed callback: ${sessionError instanceof Error ? sessionError.message : String(sessionError)}`, 'renewal')
+              }
+
+              if (!sessionSuccess) {
+                renewalLogger.error(`💥 ALL SCHEDULED SESSION START ATTEMPTS FAILED after ${maxRetries + 1} attempts`, 'session')
+                renewalLogger.warn(`🔧 Scheduled renewal failed, system will rely on block-based renewal`, 'renewal')
               }
             }, delaySeconds * 1000) // Convert seconds to milliseconds
-            
+
             return { success: true, action: reason }
           }
         }
@@ -493,28 +528,49 @@ export function performRenewalCheck(): { success: boolean; action?: string; erro
       if (shouldRenew) {
         // Use random delay between 1-5 minutes for all renewals
         const delaySeconds = getRandomRenewalDelay()
-        
+
         renewalLogger.info(`🚀 SESSION START TRIGGERED: ${reason}`, 'renewal')
         renewalLogger.info(`⏰ Applying random ${delaySeconds}s (${(delaySeconds / 60).toFixed(1)} min) delay before starting Claude session...`, 'renewal')
-        
-        // Start session with random delay (non-blocking)
-        setTimeout(() => {
-          try { 
-            renewalLogger.info(`⏳ Random delay complete - calling startClaudeSession() now`, 'renewal')
-            renewalLogger.info('📞 CALLING startClaudeSession() NOW', 'session')
-            const result = startClaudeSession()
-            renewalLogger.info(`✅ SESSION START RESULT: ${result}`, 'session')
-            if (result) {
-              renewalLogger.info('🎯 NEW CLAUDE SESSION STARTED SUCCESSFULLY', 'session')
-              recordSuccessfulRenewal() // Record the successful renewal
-            } else {
-              renewalLogger.error('❌ SESSION START FAILED', 'session')
+
+        // Start session with random delay (non-blocking) and retry logic
+        setTimeout(async () => {
+          let retryCount = 0
+          const maxRetries = 2
+          let sessionSuccess = false
+
+          while (retryCount <= maxRetries && !sessionSuccess) {
+            try {
+              if (retryCount > 0) {
+                renewalLogger.info(`🔄 Retry attempt ${retryCount}/${maxRetries} for Claude session start`, 'session')
+                // Add exponential backoff for retries
+                await new Promise(resolve => setTimeout(resolve, retryCount * 5000))
+              }
+
+              renewalLogger.info(`⏳ ${retryCount === 0 ? 'Random delay complete' : 'Retrying'} - calling startClaudeSession() now`, 'renewal')
+              renewalLogger.info('📞 CALLING startClaudeSession() NOW', 'session')
+              const result = await startClaudeSession()
+              renewalLogger.info(`✅ SESSION START RESULT: ${result}`, 'session')
+
+              if (result) {
+                renewalLogger.info('🎯 NEW CLAUDE SESSION STARTED SUCCESSFULLY', 'session')
+                recordSuccessfulRenewal() // Record the successful renewal
+                sessionSuccess = true
+              } else {
+                renewalLogger.error(`❌ SESSION START FAILED (attempt ${retryCount + 1}/${maxRetries + 1})`, 'session')
+                retryCount++
+              }
+            } catch (sessionError) {
+              renewalLogger.error(`💥 Error in session start attempt ${retryCount + 1}: ${sessionError instanceof Error ? sessionError.message : String(sessionError)}`, 'renewal')
+              retryCount++
             }
-          } catch (sessionError) {
-            renewalLogger.error(`💥 Error in delayed callback: ${sessionError instanceof Error ? sessionError.message : String(sessionError)}`, 'renewal')
+          }
+
+          if (!sessionSuccess) {
+            renewalLogger.error(`💥 ALL SESSION START ATTEMPTS FAILED after ${maxRetries + 1} attempts`, 'session')
+            renewalLogger.warn(`🔧 Consider checking Claude CLI installation and authentication`, 'session')
           }
         }, delaySeconds * 1000) // Convert seconds to milliseconds
-        
+
         return { success: true, action: reason }
       } else {
         renewalLogger.info('✋ NO SESSION STARTED - conditions not met', 'renewal')
