@@ -813,6 +813,7 @@ app.on('before-quit', () => {
 
 // Timer-based renewal scheduling
 let renewalTimer: NodeJS.Timeout | null = null
+let scheduledRenewalTimer: NodeJS.Timeout | null = null
 
 // Configuration for grace periods
 const RENEWAL_CONFIG = {
@@ -834,68 +835,115 @@ const addGracePeriod = (targetTime: Date) => {
 
 // Smart timer-based renewal scheduling
 const scheduleNextRenewal = () => {
-  // Clear any existing timer
+  // Clear block-based renewal timer
   if (renewalTimer) {
     clearTimeout(renewalTimer)
     renewalTimer = null
   }
 
+  // Only clear scheduled timer if we're about to set a new one
+  // This preserves running scheduled timers when just doing block-based scheduling
+  const status = getRenewalStatus()
+  const hasScheduledTime = !!status.scheduledStartTime
+
+  if (hasScheduledTime && scheduledRenewalTimer) {
+    // There's already a scheduled timer running - clear it to set new one
+    clearTimeout(scheduledRenewalTimer)
+    scheduledRenewalTimer = null
+  }
+
   try {
-    const status = getRenewalStatus()
-    
-    // Only schedule if auto-renewal is enabled
-    if (!status.enabled || !status.running) {
-      renewalLogger.info('Auto-renewal disabled, not scheduling next renewal', 'service')
-      return
-    }
-
     const now = new Date()
-    let targetTime: Date | null = null
-    let reason = ''
 
-    // Priority 1: User scheduled time (always takes precedence if set)
+    // Priority 1: Always check for user scheduled time FIRST (regardless of auto-renewal state)
     if (status.scheduledStartTime) {
       const scheduledTime = new Date(status.scheduledStartTime)
-      
+
       if (scheduledTime > now) {
-        targetTime = scheduledTime
-        reason = 'scheduled start'
-        renewalLogger.info(`User scheduled time found: ${targetTime.toISOString()} - ignoring block expiration`, 'schedule')
+        // Add 1-2 minute random delay to scheduled renewals
+        const baseDelay = scheduledTime.getTime() - now.getTime()
+        const randomDelayMs = (60 + Math.random() * 60) * 1000 // 1-2 minutes in milliseconds
+        const totalDelay = baseDelay + randomDelayMs
+        const actualTriggerTime = new Date(now.getTime() + totalDelay)
+
+        renewalLogger.info(`🕐 SCHEDULED RENEWAL SET: Will trigger at ${actualTriggerTime.toISOString()} (scheduled for ${scheduledTime.toISOString()} + ${(randomDelayMs / 60000).toFixed(1)} min delay)`, 'schedule')
+
+        scheduledRenewalTimer = setTimeout(() => {
+          try {
+            renewalLogger.info(`🚀 EXECUTING SCHEDULED RENEWAL at ${new Date().toISOString()}`, 'schedule')
+            const result = performRenewalCheck()
+
+            // Send status updates
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
+            }
+            if (result.success && result.action && tray) {
+              updateTrayMenu()
+              updateTrayUsage()
+            }
+
+            // Schedule next renewal after scheduled execution
+            setTimeout(() => scheduleNextRenewal(), 2000)
+          } catch (error) {
+            renewalLogger.error(`❌ Error in scheduled renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+            // Retry in 1 minute
+            setTimeout(() => scheduleNextRenewal(), 60000)
+          }
+        }, totalDelay)
+
+        return // Exit early - scheduled time takes absolute priority
       } else {
         // Scheduled time has just passed (within last 5 minutes) - trigger immediate renewal
         const timeSinceScheduled = now.getTime() - scheduledTime.getTime()
         const fiveMinutesInMs = 5 * 60 * 1000
-        
+
         if (timeSinceScheduled <= fiveMinutesInMs) {
-          renewalLogger.info(`Scheduled time recently passed (${Math.round(timeSinceScheduled / 1000)}s ago), triggering immediate renewal`, 'schedule')
-          
+          renewalLogger.info(`⚡ Scheduled time recently passed (${Math.round(timeSinceScheduled / 1000)}s ago), triggering immediate renewal`, 'schedule')
+
           // Trigger immediate renewal
           setTimeout(() => {
             try {
-              renewalLogger.info('Executing immediate scheduled renewal', 'renewal')
+              renewalLogger.info('🚀 EXECUTING LATE SCHEDULED RENEWAL', 'schedule')
               const result = performRenewalCheck()
-              
+
               // Send status updates
               if (mainWindow && !mainWindow.isDestroyed()) {
                 mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
               }
               if (result.success && result.action && tray) {
                 updateTrayMenu()
+                updateTrayUsage()
               }
-              
+
               // Schedule next renewal after immediate execution
               setTimeout(() => scheduleNextRenewal(), 2000)
             } catch (error) {
-              renewalLogger.error(`Error in immediate scheduled renewal: ${error instanceof Error ? error.message : String(error)}`, 'renewal')
+              renewalLogger.error(`❌ Error in late scheduled renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
             }
           }, 1000) // Small delay to ensure proper execution
-          
+
           return // Exit early after scheduling immediate renewal
         }
       }
     }
-    // Priority 2: Block expiration (only if no scheduled time)
-    else if (status.currentBlock?.endTime && new Date(status.currentBlock.endTime) > now) {
+
+    // Only proceed with block-based renewals if auto-renewal is enabled AND no scheduled time
+    if (!status.enabled || !status.running) {
+      renewalLogger.info('🔄 Auto-renewal disabled, not scheduling block-based renewals', 'service')
+      return
+    }
+
+    // If there's a scheduled time, skip all intermediate block-based renewals
+    if (status.scheduledStartTime) {
+      renewalLogger.info('📅 Scheduled renewal set - SKIPPING all intermediate block-based renewals', 'service')
+      return
+    }
+
+    let targetTime: Date | null = null
+    let reason = ''
+
+    // Priority 2: Block expiration (only if auto-renewal enabled and no scheduled time)
+    if (status.currentBlock?.endTime && new Date(status.currentBlock.endTime) > now) {
       targetTime = new Date(status.currentBlock.endTime)
       reason = 'block expiration'
     }
@@ -921,8 +969,9 @@ const scheduleNextRenewal = () => {
             }
             if (result.success && result.action && tray) {
               updateTrayMenu()
+              updateTrayUsage()
             }
-            
+
             // Schedule next renewal
             setTimeout(() => scheduleNextRenewal(), 2000) // Brief delay before rescheduling
           } catch (error) {
@@ -981,11 +1030,29 @@ const startRenewalMonitoring = () => {
 }
 
 const stopRenewalMonitoring = () => {
+  // Kill ALL timers immediately when auto-renewal is turned off
   if (renewalTimer) {
     clearTimeout(renewalTimer)
     renewalTimer = null
   }
-  renewalLogger.info('Renewal monitoring stopped', 'service')
+  if (scheduledRenewalTimer) {
+    clearTimeout(scheduledRenewalTimer)
+    scheduledRenewalTimer = null
+  }
+  renewalLogger.info('🛑 Renewal monitoring stopped - ALL timers cleared (including scheduled)', 'service')
+}
+
+// Force stop all timers (used when clearing scheduled time)
+const forceStopAllTimers = () => {
+  if (renewalTimer) {
+    clearTimeout(renewalTimer)
+    renewalTimer = null
+  }
+  if (scheduledRenewalTimer) {
+    clearTimeout(scheduledRenewalTimer)
+    scheduledRenewalTimer = null
+  }
+  renewalLogger.info('🛑 ALL timers force-stopped', 'service')
 }
 
 const updateTrayMenu = () => {
@@ -1364,6 +1431,7 @@ ipcMain.handle('perform-renewal-check', async () => {
         // Update tray menu if needed
         if (result.success && result.action && tray) {
           updateTrayMenu()
+          updateTrayUsage()
         }
         
         // Reschedule next renewal after manual check (in case block state changed)

@@ -79,7 +79,12 @@ interface BlockState {
   isActive: boolean
   startTime: string | null
   blockId?: string
+  lastLoggedAt?: number  // Add timestamp tracking for rate limiting
 }
+
+// Rate limiting for block change logs (prevent spam from frequent UI updates)
+let lastBlockLogTime = 0
+const BLOCK_LOG_COOLDOWN = 30000 // 30 seconds minimum between identical block change logs
 
 function readLastBlockState(): BlockState | null {
   try {
@@ -100,46 +105,104 @@ function writeBlockState(state: BlockState) {
   }
 }
 
+/**
+ * Normalize timestamp to floored hour format for consistent block ID comparison
+ * This matches Claude's actual 5-hour block behavior (blocks start at floored hours)
+ */
+function normalizeBlockTimestamp(timestamp: string | null): string | null {
+  if (!timestamp) return null
+  try {
+    const date = new Date(timestamp)
+    // Floor to the hour (same logic as ccusage-integration.ts)
+    date.setMinutes(0, 0, 0)
+    date.setMilliseconds(0)
+    return date.toISOString()
+  } catch {
+    return timestamp // Fallback to original if parsing fails
+  }
+}
+
+/**
+ * Check if enough time has passed since last log to avoid spam
+ */
+function shouldLogBlockChange(changeType: string): boolean {
+  const now = Date.now()
+  const timeSinceLastLog = now - lastBlockLogTime
+
+  // Allow immediate logging for state transitions (inactive -> active, active -> inactive)
+  // But rate limit repeated "replacing previous" logs which are usually false positives
+  if (changeType === 'replacing_previous' && timeSinceLastLog < BLOCK_LOG_COOLDOWN) {
+    return false
+  }
+
+  lastBlockLogTime = now
+  return true
+}
+
 function detectAndLogBlockChanges(currentBlock: any) {
   const lastState = readLastBlockState()
+
+  // Normalize current block timestamp for consistent comparison
+  const normalizedStartTime = normalizeBlockTimestamp(currentBlock?.startTime)
+
   const currentState: BlockState = {
     isActive: !!(currentBlock && currentBlock.isActive),
     startTime: currentBlock?.startTime || null,
-    blockId: currentBlock?.startTime || null // Use start time as block ID
+    blockId: normalizedStartTime, // Use normalized timestamp as block ID
+    lastLoggedAt: Date.now()
   }
 
   if (!lastState) {
     // First time running - just save current state
-    if (currentState.isActive) {
+    if (currentState.isActive && shouldLogBlockChange('initial')) {
       renewalLogger.info(`Initial block detected: started at ${currentState.startTime}`, 'renewal')
     }
     writeBlockState(currentState)
     return
   }
 
-  // Check for new block starting
+  // Normalize last state's blockId for consistent comparison
+  const normalizedLastBlockId = normalizeBlockTimestamp(lastState.blockId)
+
+  // Check for new block starting (inactive -> active)
   if (!lastState.isActive && currentState.isActive) {
-    renewalLogger.info(`New usage block started at ${currentState.startTime}`, 'renewal')
+    if (shouldLogBlockChange('new_start')) {
+      renewalLogger.info(`New usage block started at ${currentState.startTime}`, 'renewal')
+    }
     writeBlockState(currentState)
     return
   }
 
   // Check for block ID change (new block with different start time)
-  if (lastState.isActive && currentState.isActive && lastState.blockId !== currentState.blockId) {
-    renewalLogger.info(`New usage block started (replacing previous): started at ${currentState.startTime}`, 'renewal')
+  // Only log if the normalized timestamps are actually different
+  if (lastState.isActive && currentState.isActive &&
+      normalizedLastBlockId !== currentState.blockId &&
+      currentState.blockId && normalizedLastBlockId) {
+
+    if (shouldLogBlockChange('replacing_previous')) {
+      renewalLogger.info(`New usage block started (replacing previous): started at ${currentState.startTime}`, 'renewal')
+      renewalLogger.debug(`Block ID comparison: ${normalizedLastBlockId} -> ${currentState.blockId}`, 'renewal')
+    }
     writeBlockState(currentState)
     return
   }
 
-  // Check for block ending
+  // Check for block ending (active -> inactive)
   if (lastState.isActive && !currentState.isActive) {
-    renewalLogger.info(`Usage block ended. Previous block started at ${lastState.startTime}`, 'renewal')
+    if (shouldLogBlockChange('end')) {
+      renewalLogger.info(`Usage block ended. Previous block started at ${lastState.startTime}`, 'renewal')
+    }
     writeBlockState(currentState)
     return
   }
 
-  // No change in block state, but update the state file anyway
-  if (JSON.stringify(lastState) !== JSON.stringify(currentState)) {
+  // Only update state file if there's a meaningful change (not just timestamp formatting)
+  const meaningfulChange = (
+    lastState.isActive !== currentState.isActive ||
+    normalizedLastBlockId !== currentState.blockId
+  )
+
+  if (meaningfulChange) {
     writeBlockState(currentState)
   }
 }
@@ -507,16 +570,38 @@ export function performRenewalCheck(): { success: boolean; action?: string; erro
 
       // 2. Base renewal decision on block state instead of lastActivity
       if (!block) {
-        // No block data - start fresh session
-        shouldRenew = true
-        reason = 'No current block detected - starting fresh session'
-        renewalLogger.info(`✅ TRIGGER: No block data available`, 'renewal')
+        // No block data - check if we recently started a session
+        const lastRenewal = getLastSuccessfulRenewal()
+        const now = Math.floor(Date.now() / 1000)
+
+        if (lastRenewal) {
+          const hoursSinceLastRenewal = (now - lastRenewal) / 3600
+          if (hoursSinceLastRenewal < 0.5) { // Less than 30 minutes
+            renewalLogger.info(`⏳ WAITING: No block data but recently started session ${(hoursSinceLastRenewal * 60).toFixed(1)} minutes ago`, 'renewal')
+            shouldRenew = false
+          } else {
+            shouldRenew = true
+            reason = 'No current block detected and sufficient time passed - starting fresh session'
+            renewalLogger.info(`✅ TRIGGER: No block data and last renewal was ${hoursSinceLastRenewal.toFixed(1)} hours ago`, 'renewal')
+          }
+        } else {
+          shouldRenew = true
+          reason = 'No current block detected - starting first session'
+          renewalLogger.info(`✅ TRIGGER: No block data and no previous renewal recorded`, 'renewal')
+        }
       }
       else if (!block.isActive) {
-        // Block has expired - start new session
-        shouldRenew = true
-        reason = 'Current block has expired - starting new session'
-        renewalLogger.info(`✅ TRIGGER: Block expired`, 'renewal')
+        // Block has expired - check if we should start new session
+        const timeRemainingHours = (block.timeRemaining || 0) / 60
+        if (timeRemainingHours <= 0) {
+          shouldRenew = true
+          reason = 'Current block has expired - starting new session'
+          renewalLogger.info(`✅ TRIGGER: Block expired`, 'renewal')
+        } else {
+          // Block shows as inactive but has time remaining - wait
+          renewalLogger.info(`⏳ WAITING: Block inactive but has ${timeRemainingHours.toFixed(1)} hours remaining`, 'renewal')
+          shouldRenew = false
+        }
       }
       else {
         // Block is still active - wait for it to expire

@@ -156,17 +156,11 @@ export function Dashboard() {
 
   const handleRefresh = async () => {
     if (isRefreshing) return // Prevent concurrent refreshes
-    
+
     setIsRefreshing(true)
     try {
-      // Perform a hard refresh from main (reset cache + push new data),
-      // then update local renewal status
-      try {
-        await window.electronAPI.hardRefreshUsageData?.()
-      } catch (e) {
-        // Fallback to soft refresh if IPC not available
-        await refreshData()
-      }
+      // Always use hard refresh to ensure tray icon updates
+      await window.electronAPI.hardRefreshUsageData?.()
       await refreshStatus()
     } finally {
       setIsRefreshing(false)
@@ -532,7 +526,7 @@ export function Dashboard() {
                     <div className="px-2 pb-2 text-xs text-muted-foreground space-y-1">
                       <div>• ~{getEstimatedPromptCount(currentBlock.usage)} prompts estimated</div>
                       <div>• ~{Math.round(currentBlock.usage / getEstimatedPromptCount(currentBlock.usage)).toLocaleString()} tokens/prompt average</div>
-                      <div>• Since {new Date(currentBlock.startTime).toLocaleTimeString()}</div>
+                      {currentBlock.startTime && <div>• Since {new Date(currentBlock.startTime).toLocaleTimeString()}</div>}
                     </div>
                   )}
                 </div>
