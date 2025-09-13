@@ -1063,72 +1063,126 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
     const zipPath = openResult.filePaths[0]
     console.log('Importing from ZIP:', zipPath)
     
-    const zip = new AdmZip(zipPath)
-    const entries = zip.getEntries()
-    console.log('ZIP entries found:', entries.length)
+    let zip: any
+    let entries: any[]
     
-    if (!entries.length) return { success: false, error: 'Empty archive' }
+    try {
+      zip = new AdmZip(zipPath)
+      entries = zip.getEntries()
+      console.log(`[Import] ZIP entries found: ${entries.length}`)
+      
+      if (!entries.length) {
+        return { success: false, error: 'Empty archive - no files found in ZIP' }
+      }
+    } catch (error) {
+      console.error(`[Import] Failed to read ZIP file: ${zipPath}`, error)
+      return { success: false, error: `Invalid ZIP file: ${error instanceof Error ? error.message : 'Unknown error'}` }
+    }
+    
+    // Validate that we have some JSONL files
+    const jsonlEntries = entries.filter((entry: any) => !entry.isDirectory && entry.entryName.endsWith('.jsonl'))
+    if (jsonlEntries.length === 0) {
+      return { success: false, error: 'No .jsonl files found in archive. Please ensure you exported Claude usage logs.' }
+    }
+    
+    console.log(`[Import] Found ${jsonlEntries.length} JSONL files out of ${entries.length} total entries`)
     
     // Log entry names for debugging
-  entries.forEach((entry: any) => {
-      console.log('Entry:', entry.entryName, 'isDirectory:', entry.isDirectory)
+    entries.forEach((entry: any) => {
+      console.log(`[Import] Entry: ${entry.entryName} (directory: ${entry.isDirectory})`)
     })
 
-    // Helper function to get existing session IDs from a JSONL file
-    const getExistingSessionIds = (filePath: string): Set<string> => {
-      const sessionIds = new Set<string>()
-      if (!fs.existsSync(filePath)) return sessionIds
+    // Helper function to get existing message IDs from a JSONL file (for proper deduplication)
+    const getExistingMessageIds = (filePath: string): Set<string> => {
+      const messageIds = new Set<string>()
+      if (!fs.existsSync(filePath)) return messageIds
       
       try {
         const content = fs.readFileSync(filePath, 'utf8')
-  const lines = content.trim().split('\n').filter((line: string) => line.trim())
+        const lines = content.trim().split('\n').filter((line: string) => line.trim())
+        
+        console.log(`[Import] Checking existing messages in ${path.basename(filePath)} (${lines.length} lines)`)
         
         for (const line of lines) {
           try {
             const entry = JSON.parse(line)
-            if (entry.sessionId) {
-              sessionIds.add(entry.sessionId)
+            // Use multiple possible message ID fields for robustness
+            const messageId = entry.message?.id || entry.messageId || entry.uuid
+            if (messageId) {
+              messageIds.add(messageId)
             }
           } catch (e) {
             // Skip invalid JSON lines
           }
         }
+        
+        console.log(`[Import] Found ${messageIds.size} existing message IDs in ${path.basename(filePath)}`)
       } catch (e) {
-        console.warn(`Could not read existing sessions from ${filePath}:`, e)
+        console.warn(`[Import] Could not read existing messages from ${filePath}:`, e)
       }
       
-      return sessionIds
+      return messageIds
     }
 
-    // Helper function to normalize project names
-    const normalizeProjectName = (rawName: string): string => {
-      // Remove common path prefixes and clean up the name
-      let cleaned = rawName
+    // Helper function to detect current machine's path pattern
+    const getCurrentMachinePattern = (): string => {
+      try {
+        const existingProjects = fs.readdirSync(targetBase)
+        console.log(`[Import] Existing projects on this machine:`, existingProjects.slice(0, 3))
+        
+        // Look for pattern like "-Users-currentuser-"
+        const userPatterns = existingProjects
+          .filter(name => name.startsWith('-Users-'))
+          .map(name => {
+            const match = name.match(/^(-Users-[^-]+-)/)
+            return match ? match[1] : null
+          })
+          .filter(Boolean)
+        
+        if (userPatterns.length > 0) {
+          const currentPattern = userPatterns[0]
+          console.log(`[Import] Detected current machine pattern: "${currentPattern}"`)
+          return currentPattern
+        }
+        
+        // Fallback: create pattern from current user
+        const currentUser = os.userInfo().username
+        const fallbackPattern = `-Users-${currentUser}-`
+        console.log(`[Import] No existing pattern found, using fallback: "${fallbackPattern}"`)
+        return fallbackPattern
+      } catch (error) {
+        // Ultimate fallback
+        const currentUser = os.userInfo().username
+        const fallbackPattern = `-Users-${currentUser}-`
+        console.log(`[Import] Error detecting pattern, using fallback: "${fallbackPattern}"`)
+        return fallbackPattern
+      }
+    }
+
+    // Helper function to map imported project name to current machine
+    const mapProjectNameToCurrentMachine = (importedName: string): string => {
+      console.log(`[Import] Mapping project name: "${importedName}"`)
       
-      // Remove user home directory patterns
-      cleaned = cleaned.replace(/^-?Users-[^-]+-?/i, '')
-      
-      // Remove common directory patterns
-      cleaned = cleaned.replace(/^(Documents|Downloads|Desktop|Library|Mobile-Documents)-?/i, '')
-      
-      // Remove iCloud path patterns
-      cleaned = cleaned.replace(/com-apple-CloudDocs-?/i, '')
-      
-      // Extract the actual project name (usually the last meaningful part)
-      const segments = cleaned.split('-').filter(Boolean)
-      if (segments.length > 0) {
-        // Take the last 1-2 segments as the project name
-        const meaningfulSegments = segments.slice(-2)
-        cleaned = meaningfulSegments.join('-')
+      // If it doesn't look like a path-based name, keep it as-is
+      if (!importedName.includes('-Users-')) {
+        console.log(`[Import] Not a path-based name, keeping as-is: "${importedName}"`)
+        return importedName
       }
       
-      // Final cleanup
-      cleaned = cleaned
-        .replace(/[^a-zA-Z0-9-_.]/g, '-')
-        .replace(/^-+|-+$/g, '')
-        .toLowerCase()
+      // Extract the non-user part of the path
+      const match = importedName.match(/^-Users-[^-]+-(.+)$/)
+      if (match) {
+        const pathSuffix = match[1]
+        const currentMachinePattern = getCurrentMachinePattern()
+        const mappedName = currentMachinePattern + pathSuffix
+        
+        console.log(`[Import] Mapped: "${importedName}" -> "${mappedName}"`)
+        return mappedName
+      }
       
-      return cleaned || 'imported-project'
+      // If pattern doesn't match expected format, keep original
+      console.log(`[Import] Couldn't parse path pattern, keeping original: "${importedName}"`)
+      return importedName
     }
 
     // Only clear existing data if not in merge mode
@@ -1170,32 +1224,37 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
         continue
       }
       
-      console.log('Processing JSONL file:', entry.entryName)
+      console.log(`[Import] Processing JSONL file: ${entry.entryName}`)
       
-      // entry.entryName should be like projectName/file.jsonl
-      const segments = entry.entryName.split(/\\|\//).filter(Boolean)
+      // entry.entryName should be like projectName/file.jsonl or nested paths
+      const segments = entry.entryName.split(/[\\\/]+/).filter(Boolean)
       let projectName: string
       let fileName: string
       
-      console.log('Entry segments:', segments)
+      console.log(`[Import] Entry segments:`, segments)
       
       if (segments.length === 1) {
         // File at root level - create a generic project
         projectName = 'imported-project'
         fileName = segments[0]
+        console.log(`[Import] Root level file detected, using generic project`)
       } else if (segments.length >= 2) {
-        // Normal case: projectName/file.jsonl
+        // Normal case: projectName/file.jsonl or nested structure
         fileName = segments[segments.length - 1]
         
-        // Use normalized project name
-        const rawProjectName = segments[0]
-        projectName = normalizeProjectName(rawProjectName)
+        // Extract the original project name (preserve the full path-based name)
+        let rawProjectName = segments[0]
         
-        console.log(`Raw project name: "${rawProjectName}" -> normalized: "${projectName}"`)
+        // If we have nested segments, the first one should be the project directory name
+        // This preserves the original Claude naming like "-Users-john-Documents-MyProject"
+        projectName = mapProjectNameToCurrentMachine(rawProjectName)
+        
+        console.log(`[Import] Preserved and mapped project: "${rawProjectName}" -> "${projectName}" from path: ${entry.entryName}`)
       } else {
         // Fallback
         projectName = 'imported-project'
         fileName = entry.entryName
+        console.log(`[Import] Fallback case for entry: ${entry.entryName}`)
       }
       
       const projectDir = path.join(importRoot, projectName)
@@ -1205,57 +1264,100 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
       console.log('Creating project directory:', projectDir)
       console.log('Writing file to:', destPath)
       
-      // Handle merge mode with session deduplication
+      // Handle merge mode with message deduplication (enables cross-computer session continuity)
       if (mergeMode && skipDuplicates && fs.existsSync(destPath)) {
-        console.log(`File already exists: ${destPath}`)
+        console.log(`[Import] File already exists: ${destPath}`)
         
-        // Get existing session IDs from the target file
-        const existingSessionIds = getExistingSessionIds(destPath)
-        console.log(`Found ${existingSessionIds.size} existing sessions in target file`)
+        // Get existing message IDs from the target file (not session IDs)
+        const existingMessageIds = getExistingMessageIds(destPath)
+        console.log(`[Import] Found ${existingMessageIds.size} existing messages in target file`)
         
-        if (existingSessionIds.size > 0) {
-          // Parse the new content and filter out duplicate sessions
+        if (existingMessageIds.size > 0) {
+          // Parse the new content and filter out duplicate messages
           const newContent = entry.getData().toString('utf8')
           const newLines = newContent.trim().split('\n').filter((line: string) => line.trim())
           const uniqueNewLines: string[] = []
+          let skippedDuplicates = 0
           
           for (const line of newLines) {
             try {
               const parsed = JSON.parse(line)
-              if (!parsed.sessionId || !existingSessionIds.has(parsed.sessionId)) {
+              // Check for duplicate messages, not sessions (enables session continuity)
+              const messageId = parsed.message?.id || parsed.messageId || parsed.uuid
+              
+              if (!messageId || !existingMessageIds.has(messageId)) {
                 uniqueNewLines.push(line)
               } else {
-                console.log(`Skipping duplicate session: ${parsed.sessionId}`)
+                skippedDuplicates++
+                console.log(`[Import] Skipping duplicate message: ${messageId}`)
               }
             } catch (e) {
               // Include lines that can't be parsed (might be valid JSONL)
               uniqueNewLines.push(line)
+              console.warn(`[Import] Could not parse line, including anyway: ${e}`)
             }
           }
           
           if (uniqueNewLines.length > 0) {
-            // Append only new sessions to existing file
+            // Append only new messages to existing file
             const newContentToAppend = uniqueNewLines.join('\n') + '\n'
             fs.appendFileSync(destPath, newContentToAppend)
-            console.log(`Appended ${uniqueNewLines.length} new sessions to existing file`)
+            console.log(`[Import] Appended ${uniqueNewLines.length} new messages to existing file (skipped ${skippedDuplicates} duplicates)`)
           } else {
-            console.log('No new sessions to add - all were duplicates')
+            console.log(`[Import] No new messages to add - all ${skippedDuplicates} were duplicates`)
           }
           
           importedFiles++
         } else {
-          // No existing sessions, just append the new content
+          // No existing messages, just append the new content
           fs.appendFileSync(destPath, entry.getData())
+          console.log(`[Import] No existing messages found, appending all content`)
           importedFiles++
         }
       } else {
         // Create directory and write file (original behavior or replace mode)
-        fs.mkdirSync(projectDir, { recursive: true })
-        fs.writeFileSync(destPath, entry.getData())
-        importedFiles++
+        try {
+          fs.mkdirSync(projectDir, { recursive: true })
+          
+          // Validate JSONL content before writing
+          const content = entry.getData().toString('utf8')
+          const lines = content.trim().split('\n').filter((line: string) => line.trim())
+          let validLines = 0
+          let invalidLines = 0
+          
+          for (const line of lines) {
+            try {
+              const parsed = JSON.parse(line)
+              // Basic validation - ensure it has required fields
+              if (parsed.timestamp && (parsed.message || parsed.type)) {
+                validLines++
+              } else {
+                invalidLines++
+                console.warn(`[Import] Line missing required fields: ${line.substring(0, 100)}...`)
+              }
+            } catch (e) {
+              invalidLines++
+              console.warn(`[Import] Invalid JSON line: ${line.substring(0, 100)}...`)
+            }
+          }
+          
+          if (validLines === 0) {
+            console.error(`[Import] No valid entries found in ${fileName}`)
+            // Skip this file but continue with others
+            continue
+          }
+          
+          fs.writeFileSync(destPath, content)
+          console.log(`[Import] Wrote ${fileName}: ${validLines} valid entries, ${invalidLines} invalid entries`)
+          importedFiles++
+        } catch (writeError) {
+          console.error(`[Import] Failed to write file ${destPath}:`, writeError)
+          // Continue with other files
+          continue
+        }
       }
       
-      console.log(`Processed file ${importedFiles}/${totalFiles}: ${fileName}`)
+      console.log(`[Import] Processed file ${importedFiles}/${totalFiles}: ${fileName}`)
       
       // Send progress update
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -1315,7 +1417,13 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
       }
     }
 
-    return { success: true, importedFiles, importRoot: targetBase }
+    console.log(`[Import] Import completed successfully: ${importedFiles} files imported to ${targetBase}`)
+    return { 
+      success: true, 
+      importedFiles, 
+      importRoot: targetBase,
+      message: `Successfully imported ${importedFiles} files. Sessions can now be continued across computers.`
+    }
   } catch (error) {
     console.error('Failed to import Claude usage logs:', error)
     // Send error progress update
