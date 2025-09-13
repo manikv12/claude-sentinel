@@ -153,7 +153,15 @@ export function Dashboard() {
     
     setIsRefreshing(true)
     try {
-      await Promise.all([refreshData(), refreshStatus()])
+      // Perform a hard refresh from main (reset cache + push new data),
+      // then update local renewal status
+      try {
+        await window.electronAPI.hardRefreshUsageData?.()
+      } catch (e) {
+        // Fallback to soft refresh if IPC not available
+        await refreshData()
+      }
+      await refreshStatus()
     } finally {
       setIsRefreshing(false)
     }

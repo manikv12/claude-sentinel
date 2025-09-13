@@ -4,7 +4,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
 import { isDev } from './utils'
-import { loadUsageData, getRecentUsage, getCurrentBlockInfo } from './services/ccusage-service'
+import { loadUsageData, getRecentUsage, getCurrentBlockInfo, resetUsageCache } from './services/ccusage-service'
 import { 
   getRenewalStatus, 
   startRenewalService, 
@@ -20,8 +20,34 @@ const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'] || 'http://localh
 let mainWindow: BrowserWindow | null = null
 let floatingWindow: BrowserWindow | null = null
 let tray: Tray | null = null
+let trayUsageInterval: NodeJS.Timeout | null = null
 
-// Create an app icon matching the sidebar's Activity logo (lucide)
+// Create a small dot icon for auto-renewal status
+const createStatusDotIcon = (options?: { size?: number; enabled?: boolean }) => {
+  const size = options?.size ?? 18
+  const isEnabled = options?.enabled ?? false
+  
+  // Use red for disabled, green for enabled
+  const color = isEnabled ? '#22c55e' : '#ef4444' // Green or red
+  
+  const svg = `<svg width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="${size/2}" cy="${size/2}" r="4" fill="${color}"/>
+  </svg>`
+  
+  console.log(`Creating status dot: ${isEnabled ? 'enabled (green)' : 'disabled (red)'}`)
+  
+  const image = nativeImage.createFromBuffer(Buffer.from(svg))
+  image.setTemplateImage(false) // Don't use template mode for colored dots
+  
+  if (image.isEmpty()) {
+    console.error('Status dot creation failed - falling back to activity icon')
+    return createActivityIcon({ size, color: '#000000', template: true })
+  }
+  
+  return image
+}
+
+// Create an app icon matching the sidebar's Activity logo (lucide) - keep for non-tray uses
 const createActivityIcon = (options?: { size?: number; color?: string; template?: boolean }) => {
   const size = options?.size ?? 24
   const color = options?.color ?? '#3b82f6' // Tailwind blue-500
@@ -35,6 +61,110 @@ const createActivityIcon = (options?: { size?: number; color?: string; template?
     image.setTemplateImage(true)
   }
   return image
+}
+
+// Helpers for tray usage display
+const formatMinutes = (minutes: number | null) => {
+  if (minutes === null || minutes < 0) return '—'
+  const h = Math.floor(minutes / 60)
+  const m = Math.floor(minutes % 60)
+  if (h <= 0) return `${m}m`
+  if (m <= 0) return `${h}h`
+  return `${h}h ${m}m`
+}
+
+const formatTokens = (tokens: number) => {
+  if (tokens >= 1_000_000_000) return `${(tokens / 1_000_000_000).toFixed(2)}B`
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(2)}M`
+  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}K`
+  return tokens.toLocaleString()
+}
+
+const getUsagePercent = () => {
+  try {
+    const block = getCurrentBlockInfo()
+    if (!block || !block.limit || block.limit <= 0) return { percent: null as number | null, block }
+    const percent = Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100)))
+    return { percent, block }
+  } catch {
+    return { percent: null as number | null, block: null as any }
+  }
+}
+
+const updateTrayUsage = () => {
+  if (!tray) return
+  const { percent, block } = getUsagePercent()
+
+  // Update tray icon to colored dot based on auto-renewal status
+  try {
+    // Check auto-renewal status for dot color
+    let isRenewalEnabled = false
+    try {
+      const configFile = path.join(os.homedir(), '.claude-sentinel-config.json')
+      if (fs.existsSync(configFile)) {
+        const config = JSON.parse(fs.readFileSync(configFile, 'utf8'))
+        isRenewalEnabled = config.enabled || false
+      }
+    } catch (configError) {
+      // Keep disabled state if we can't read config
+    }
+    
+    const statusDotIcon = createStatusDotIcon({ 
+      size: 18, 
+      enabled: isRenewalEnabled
+    })
+    tray.setImage(statusDotIcon)
+    console.log(`Updated tray dot icon: ${isRenewalEnabled ? 'green (enabled)' : 'red (disabled)'}`)
+  } catch (error) {
+    console.warn('Failed to update tray dot icon:', error)
+  }
+
+  // Show percentage text on macOS
+  if (process.platform === 'darwin') {
+    try {
+      const displayText = percent === null ? '—' : `${percent}%`
+      tray.setTitle(displayText)
+    } catch {}
+  }
+
+  // Tooltip with details including next renewal time
+  const timeLeft = block?.timeRemaining ?? null
+  const usageText = block ? `${formatTokens(block.usage)} / ${formatTokens(block.limit || 0)} tokens` : 'Usage unavailable'
+  
+  // Get next renewal time
+  let renewalInfo = ''
+  try {
+    const configFile = path.join(os.homedir(), '.claude-sentinel-config.json')
+    if (fs.existsSync(configFile)) {
+      const config = JSON.parse(fs.readFileSync(configFile, 'utf8'))
+      if (config.enabled) {
+        renewalInfo = '\nAuto-renewal: ON'
+        // Calculate next renewal time (assuming monthly billing cycle)
+        const now = new Date()
+        const nextRenewal = new Date(now.getFullYear(), now.getMonth() + 1, 1) // First day of next month
+        const daysUntilRenewal = Math.ceil((nextRenewal.getTime() - now.getTime()) / (1000 * 60 * 60 * 24))
+        renewalInfo += `\nNext renewal: ${daysUntilRenewal} days`
+      } else {
+        renewalInfo = '\nAuto-renewal: OFF'
+      }
+    }
+  } catch (configError) {
+    renewalInfo = '\nAuto-renewal: Status unknown'
+  }
+  
+  const tooltip = `Claude Sentinel\n${percent === null ? '' : `Usage: ${percent}%\n`}${usageText}${timeLeft !== null ? `\nTime remaining: ${formatMinutes(timeLeft)}` : ''}${renewalInfo}`.trim()
+  try { tray.setToolTip(tooltip) } catch {}
+
+  // Refresh tray context menu to reflect latest usage
+  try { updateTrayMenu() } catch {}
+}
+
+const startTrayUsageUpdates = () => {
+  // Immediately update once tray exists
+  updateTrayUsage()
+  // Refresh every minute
+  if (trayUsageInterval) { clearInterval(trayUsageInterval); trayUsageInterval = null }
+  trayUsageInterval = setInterval(updateTrayUsage, 60 * 1000)
 }
 
 const createWindow = () => {
@@ -80,10 +210,14 @@ const createWindow = () => {
     mainWindow = null
   })
 
-  // Hide floating window when main window is restored/shown
+  // Hide floating window when main window is restored/shown and show dock icon
   mainWindow.on('restore', () => {
     if (floatingWindow && !floatingWindow.isDestroyed()) {
       floatingWindow.close()
+    }
+    // Show dock icon when window is restored on macOS
+    if (process.platform === 'darwin') {
+      try { if (app.dock) app.dock.show() } catch {}
     }
   })
 
@@ -91,21 +225,51 @@ const createWindow = () => {
     if (floatingWindow && !floatingWindow.isDestroyed()) {
       floatingWindow.close()
     }
+    // Show dock icon when window is shown on macOS
+    if (process.platform === 'darwin') {
+      try { if (app.dock) app.dock.show() } catch {}
+    }
   })
 
-  // Handle minimize and show floating window
-  mainWindow.on('minimize', (event: Electron.Event) => {
-    // Show floating window when main window is minimized
-    createFloatingWindow()
-    
-    if (process.platform === 'darwin') {
-      // On macOS, ensure Dock icon remains visible
-      try { if (app.dock) app.dock.show() } catch {}
-      return
+  // Handle minimize behavior based on user settings
+  mainWindow.on('minimize', async (event: Electron.Event) => {
+    try {
+      // Load user settings to check minimize behavior preference
+      const settingsFile = getSettingsFilePath()
+      let userSettings = getDefaultSettings()
+      
+      if (fs.existsSync(settingsFile)) {
+        try {
+          const fileContent = fs.readFileSync(settingsFile, 'utf8')
+          const savedSettings = JSON.parse(fileContent)
+          userSettings = { ...userSettings, ...savedSettings }
+        } catch (parseError) {
+          console.warn('Could not parse settings file, using defaults for minimize behavior')
+        }
+      }
+      
+      // Handle minimize behavior based on user preference
+      if (userSettings.minimizeBehavior === 'floating') {
+        // Show floating window when main window is minimized
+        createFloatingWindow()
+      }
+      
+      if (process.platform === 'darwin') {
+        // On macOS, hide dock icon when minimized since app is only in top bar
+        try { if (app.dock) app.dock.hide() } catch {}
+        return
+      }
+      
+      // On Windows/Linux, respect tray setting
+      if (userSettings.minimizeToTray) {
+        event.preventDefault()
+        mainWindow?.hide()
+      }
+    } catch (error) {
+      console.error('Error handling minimize event:', error)
+      // Fallback to default behavior
+      createFloatingWindow()
     }
-    // On Windows/Linux, hide to system tray
-    event.preventDefault()
-    mainWindow?.hide()
   })
 }
 
@@ -181,19 +345,45 @@ const createFloatingWindow = () => {
 }
 
 const createTray = () => {
-  // Create tray icon
-  const icon = nativeImage.createFromPath(
-    join(__dirname, process.platform === 'darwin' ? '../assets/tray-icon-mac.png' : '../assets/tray-icon.png')
-  )
-  
-  // Use template monochrome icon on macOS so the OS tints it
-  const trayIcon = process.platform === 'darwin'
-    ? createActivityIcon({ size: 24, color: '#000000', template: true })
-    : createActivityIcon({ size: 24, color: '#3b82f6' })
+  // Create initial red dot (auto-renewal disabled by default)
+  let trayIcon
+  try {
+    trayIcon = createStatusDotIcon({ 
+      size: 18, 
+      enabled: false // Start with red dot (disabled)
+    })
+    
+    // If dot icon is empty, fall back to activity icon
+    if (trayIcon.isEmpty()) {
+      console.warn('Status dot icon is empty, falling back to activity icon')
+      trayIcon = createActivityIcon({ size: 18, color: '#000000', template: true })
+    }
+  } catch (error) {
+    console.error('Failed to create status dot icon, falling back to activity icon:', error)
+    trayIcon = createActivityIcon({ size: 18, color: '#000000', template: true })
+  }
 
-  tray = new Tray(trayIcon.isEmpty() ? icon : trayIcon)
+  console.log('Creating tray with status dot icon')
+  tray = new Tray(trayIcon)
+  
+  // Verify tray was created successfully
+  if (!tray || tray.isDestroyed()) {
+    console.error('Failed to create tray')
+    return
+  }
+  
+  console.log('Tray created successfully')
   
   const contextMenu = Menu.buildFromTemplate([
+    {
+      label: 'Usage: updating…',
+      enabled: false
+    },
+    {
+      label: 'Time remaining: —',
+      enabled: false
+    },
+    { type: 'separator' },
     {
       label: 'Show Claude Sentinel',
       click: () => {
@@ -201,6 +391,10 @@ const createTray = () => {
           if (mainWindow.isMinimized()) mainWindow.restore()
           mainWindow.show()
           mainWindow.focus()
+          // Show dock icon when showing window on macOS
+          if (process.platform === 'darwin') {
+            try { if (app.dock) app.dock.show() } catch {}
+          }
         } else {
           createWindow()
         }
@@ -233,19 +427,11 @@ const createTray = () => {
   tray.setToolTip('Claude Sentinel - Usage Monitor & Auto-Renewal')
   tray.setContextMenu(contextMenu)
 
-  // Handle tray click
-  tray.on('click', () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      if (mainWindow.isVisible()) {
-        mainWindow.hide()
-      } else {
-        mainWindow.show()
-        mainWindow.focus()
-      }
-    } else {
-      createWindow()
-    }
-  })
+  // Handle tray click - show context menu only (no direct app opening)
+  // Note: The context menu will be shown automatically on click, we don't need to handle direct clicks
+
+  // Start periodic usage updates for tray title/tooltip
+  startTrayUsageUpdates()
 }
 
 // App event handlers
@@ -296,6 +482,10 @@ app.on('before-quit', () => {
   // Clean up tray
   if (tray) {
     tray.destroy()
+  }
+  if (trayUsageInterval) {
+    clearInterval(trayUsageInterval)
+    trayUsageInterval = null
   }
 })
 
@@ -481,7 +671,20 @@ const updateTrayMenu = () => {
   if (!tray) return
   
   const status = getRenewalStatus()
+  const block = getCurrentBlockInfo()
+  const percent = block && block.limit > 0 ? Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100))) : null
+  const usageLine = percent === null ? 'Usage: unknown' : `Usage: ${percent}% (${formatTokens(block.usage)} / ${formatTokens(block.limit)})`
+  const timeLine = `Time remaining: ${formatMinutes(block?.timeRemaining ?? null)}`
   const contextMenu = Menu.buildFromTemplate([
+    {
+      label: usageLine,
+      enabled: false
+    },
+    {
+      label: timeLine,
+      enabled: false
+    },
+    { type: 'separator' },
     {
       label: 'Show Claude Sentinel',
       click: () => {
@@ -489,6 +692,10 @@ const updateTrayMenu = () => {
           if (mainWindow.isMinimized()) mainWindow.restore()
           mainWindow.show()
           mainWindow.focus()
+          // Show dock icon when showing window on macOS
+          if (process.platform === 'darwin') {
+            try { if (app.dock) app.dock.show() } catch {}
+          }
         } else {
           createWindow()
         }
@@ -659,16 +866,37 @@ ipcMain.handle('set-scheduled-start-time', async (_, isoTime: string | null) => 
   }
 })
 
-ipcMain.handle('minimize-to-tray', () => {
+ipcMain.handle('minimize-to-tray', async () => {
   if (mainWindow) {
+    // Load user settings to check minimize behavior preference
+    const settingsFile = getSettingsFilePath()
+    let userSettings = getDefaultSettings()
+    
+    if (fs.existsSync(settingsFile)) {
+      try {
+        const fileContent = fs.readFileSync(settingsFile, 'utf8')
+        const savedSettings = JSON.parse(fileContent)
+        userSettings = { ...userSettings, ...savedSettings }
+      } catch (parseError) {
+        console.warn('Could not parse settings file, using defaults for minimize behavior')
+      }
+    }
+    
     if (process.platform === 'darwin') {
-      // Minimize (keeps Dock icon), floating window will be created by the 'minimize' handler
-      try { if (app.dock) app.dock.show() } catch {}
+      // On macOS, hide dock icon when minimized and minimize
+      try { if (app.dock) app.dock.hide() } catch {}
       mainWindow.minimize()
     } else {
-      // Hide to system tray on Windows/Linux
-      mainWindow.hide()
-      createFloatingWindow()
+      // On Windows/Linux, respect user preference
+      if (userSettings.minimizeToTray) {
+        mainWindow.hide()
+      } else {
+        mainWindow.minimize()
+      }
+      
+      if (userSettings.minimizeBehavior === 'floating') {
+        createFloatingWindow()
+      }
     }
   }
 })
@@ -704,10 +932,59 @@ ipcMain.handle('refresh-usage-data', async () => {
     if (floatingWindow && !floatingWindow.isDestroyed()) {
       floatingWindow.webContents.send('usage-update', data)
     }
+    // Update tray usage immediately
+    updateTrayUsage()
     return data
   } catch (error) {
     console.error('Error refreshing usage data:', error)
     throw error
+  }
+})
+
+// Force reset usage cache and perform a fresh usage read (hard refresh)
+ipcMain.handle('hard-refresh-usage-data', async () => {
+  try {
+    // Reset analysis/cache so next read hits disk
+    resetUsageCache()
+
+    // Small delay to allow filesystem writes to settle when called after imports
+    await new Promise((r) => setTimeout(r, 200))
+
+    const recentData = getRecentUsage(30)
+    const blockInfo = getCurrentBlockInfo()
+
+    const data = {
+      daily: recentData.daily.map(day => ({
+        date: day.date,
+        inputTokens: day.inputTokens,
+        outputTokens: day.outputTokens,
+        totalTokens: day.totalTokens,
+        cost: day.cost,
+        model: 'mixed',
+        sessionsCount: Array.from(day.sessions).length
+      })),
+      summary: {
+        totalCost: recentData.totalCost,
+        totalTokens: recentData.totalTokens,
+        totalSessions: recentData.totalSessions,
+        averageTokensPerSession: recentData.totalSessions > 0 ?
+          recentData.totalTokens / recentData.totalSessions : 0
+      },
+      currentBlock: blockInfo
+    }
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('usage-update', data)
+    }
+    if (floatingWindow && !floatingWindow.isDestroyed()) {
+      floatingWindow.webContents.send('usage-update', data)
+    }
+    // Update tray usage immediately
+    updateTrayUsage()
+    return data
+  } catch (error) {
+    console.error('Error performing hard refresh:', error)
+    return { success: false }
   }
 })
 
@@ -942,9 +1219,18 @@ ipcMain.handle('export-claude-usage-logs', async (_, fromDate?: string, toDate?:
     if (existing.length === 0) {
       return { success: false, error: 'No Claude data directories found' }
     }
-    // Parse date range
-    const fromTime = fromDate ? new Date(fromDate).getTime() : 0
-    const toTime = toDate ? new Date(toDate).getTime() + 24 * 60 * 60 * 1000 : Date.now() // Include end of day
+    // Parse date range using local calendar day boundaries to avoid TZ off-by-one
+    const parseLocalDayStart = (dateStr: string) => {
+      const [y, m, d] = dateStr.split('-').map((n: string) => parseInt(n, 10))
+      return new Date(y, m - 1, d, 0, 0, 0, 0).getTime()
+    }
+    const parseLocalDayEnd = (dateStr: string) => {
+      const [y, m, d] = dateStr.split('-').map((n: string) => parseInt(n, 10))
+      return new Date(y, m - 1, d, 23, 59, 59, 999).getTime()
+    }
+
+    const fromTime = fromDate ? parseLocalDayStart(fromDate) : 0
+    const toTime = toDate ? parseLocalDayEnd(toDate) : Date.now()
     
     // Collect .jsonl files
     const files: string[] = []
@@ -1440,32 +1726,76 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
 })
 
 // Settings management
+const getSettingsFilePath = () => path.join(os.homedir(), '.claude-sentinel-settings.json')
+
+const getDefaultSettings = () => ({
+  autoStart: false,
+  minimizeToTray: true,
+  minimizeBehavior: 'floating', // 'floating' or 'tray'
+  notifications: true,
+  refreshInterval: 5,
+  theme: 'system',
+  dataPath: '',
+  claudePlan: 'auto',
+  autoRenewal: {
+    enabled: false,
+    checkInterval: 5,
+    enableLogging: true,
+    notifyOnRenewal: true,
+    waitTimeBeforeSession: 60
+  }
+})
+
 ipcMain.handle('get-settings', async () => {
   try {
-    // Return default settings for now - could be enhanced to load from storage
-    return {
-      autoStart: false,
-      minimizeToTray: true,
-      notifications: true,
-      refreshInterval: 5,
-      theme: 'system',
-      dataPath: '',
-      autoRenewal: {
-        enabled: false,
-        checkInterval: 5,
-        enableLogging: true,
-        notifyOnRenewal: true
+    const settingsFile = getSettingsFilePath()
+    
+    // Load settings from file if it exists
+    if (fs.existsSync(settingsFile)) {
+      try {
+        const fileContent = fs.readFileSync(settingsFile, 'utf8')
+        const savedSettings = JSON.parse(fileContent)
+        
+        // Merge with defaults to ensure all properties exist
+        const defaultSettings = getDefaultSettings()
+        const mergedSettings = {
+          ...defaultSettings,
+          ...savedSettings,
+          autoRenewal: {
+            ...defaultSettings.autoRenewal,
+            ...(savedSettings.autoRenewal || {})
+          }
+        }
+        
+        return mergedSettings
+      } catch (parseError) {
+        console.warn('Could not parse settings file, using defaults:', parseError)
+        return getDefaultSettings()
       }
     }
+    
+    // Return default settings if file doesn't exist
+    return getDefaultSettings()
   } catch (error) {
     console.error('Error getting settings:', error)
-    return {}
+    return getDefaultSettings()
   }
 })
 
 ipcMain.handle('save-settings', async (_, settings: any) => {
   try {
-    // Save renewal settings to the config file that the backend reads from
+    // Save all settings to the main settings file
+    const settingsFile = getSettingsFilePath()
+    
+    try {
+      fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2))
+      console.log('Settings saved to:', settingsFile)
+    } catch (writeError) {
+      console.error('Error writing settings file:', writeError)
+      return { success: false, error: 'Failed to write settings file' }
+    }
+    
+    // Also save renewal settings to the config file that the backend reads from
     if (settings.autoRenewal) {
       const configFile = path.join(os.homedir(), '.claude-sentinel-config.json')
       let currentConfig: any = { enabled: false }
@@ -1482,6 +1812,7 @@ ipcMain.handle('save-settings', async (_, settings: any) => {
       currentConfig.checkInterval = settings.autoRenewal.checkInterval
       currentConfig.enableLogging = settings.autoRenewal.enableLogging
       currentConfig.notifyOnRenewal = settings.autoRenewal.notifyOnRenewal
+      currentConfig.waitTimeBeforeSession = settings.autoRenewal.waitTimeBeforeSession
       
       // Preserve the enabled state
       if (currentConfig.enabled === undefined) {
@@ -1795,6 +2126,11 @@ ipcMain.handle('show-main-window', async () => {
       }
       mainWindow.show()
       mainWindow.focus()
+      
+      // Show dock icon when main window is shown on macOS
+      if (process.platform === 'darwin') {
+        try { if (app.dock) app.dock.show() } catch {}
+      }
       
       // Hide floating window when showing main window
       if (floatingWindow && !floatingWindow.isDestroyed()) {
