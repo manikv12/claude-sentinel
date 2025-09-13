@@ -3,7 +3,6 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/
 import { Button } from './ui/button'
 import { 
   Settings as SettingsIcon, 
-  Folder, 
   Bell, 
   Palette,
   Save,
@@ -13,14 +12,26 @@ import {
   Download,
   Calendar,
   Trash2,
-  Loader2
+  Loader2,
+  Database,
+  ChevronRight
 } from 'lucide-react'
 import { Switch } from './ui/switch'
+import { DateRangePicker } from './ui/date-range-picker'
 import { useThemeStore } from '@/stores/themeStore'
+import { 
+  Dialog, 
+  DialogContent, 
+  DialogDescription, 
+  DialogHeader, 
+  DialogTitle, 
+  DialogTrigger 
+} from './ui/dialog'
 
 interface AppSettings {
   autoStart: boolean
   minimizeToTray: boolean
+  minimizeBehavior: 'tray' | 'floating' // New setting for minimize behavior
   notifications: boolean
   refreshInterval: number
   theme: 'light' | 'dark' | 'system'
@@ -40,6 +51,7 @@ export function Settings() {
   const [settings, setSettings] = useState<AppSettings>({
     autoStart: false,
     minimizeToTray: true,
+    minimizeBehavior: 'floating',
     notifications: true,
     refreshInterval: 5,
     theme: 'system',
@@ -55,8 +67,10 @@ export function Settings() {
   })
 
   const [isDirty, setIsDirty] = useState(false)
-  const [exportFromDate, setExportFromDate] = useState(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0])
-  const [exportToDate, setExportToDate] = useState(new Date().toISOString().split('T')[0])
+  const [exportDateRange, setExportDateRange] = useState<{from: Date | null, to: Date | null}>({
+    from: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
+    to: new Date()
+  })
   const [clearDaysToKeep, setClearDaysToKeep] = useState(7)
   const [importProgress, setImportProgress] = useState<{current: number, total: number, phase: string} | null>(null)
   const [clearProgress, setClearProgress] = useState<{current: number, total: number, phase: string, daysToKeep?: number} | null>(null)
@@ -72,14 +86,14 @@ export function Settings() {
 
   useEffect(() => {
     // Listen for import progress events
-    const handleImportProgress = (event: any, progress: {current: number, total: number, phase: string}) => {
+    const handleImportProgress = (_event: any, progress: {current: number, total: number, phase: string}) => {
       setImportProgress(progress)
       if (progress.phase === 'completed' || progress.phase === 'error') {
         setTimeout(() => setImportProgress(null), 3000) // Clear after 3 seconds
       }
     }
 
-    const handleClearProgress = (event: any, progress: {current: number, total: number, phase: string, daysToKeep?: number}) => {
+    const handleClearProgress = (_event: any, progress: {current: number, total: number, phase: string, daysToKeep?: number}) => {
       setClearProgress(progress)
       if (progress.phase === 'completed' || progress.phase === 'error') {
         setTimeout(() => setClearProgress(null), 3000) // Clear after 3 seconds
@@ -134,6 +148,7 @@ export function Settings() {
     setSettings({
       autoStart: false,
       minimizeToTray: true,
+      minimizeBehavior: 'floating',
       notifications: true,
       refreshInterval: 5,
       theme: 'system',
@@ -183,6 +198,306 @@ export function Settings() {
       window.electronAPI.showNotification?.('Clear failed')
     }
   }
+
+  // Data management modal component
+  const DataManagementModal = () => (
+    <DialogContent className="max-w-4xl max-h-[80vh] overflow-y-auto">
+      <DialogHeader>
+        <DialogTitle className="flex items-center space-x-2">
+          <Database className="h-5 w-5" />
+          <span>Data Management</span>
+        </DialogTitle>
+        <DialogDescription>
+          Export, import, and manage your Claude usage data
+        </DialogDescription>
+      </DialogHeader>
+      
+      <div className="space-y-6">
+        {/* Data Path Configuration */}
+        <div className="space-y-4">
+          <h4 className="font-medium">Claude Data Directory</h4>
+          <p className="text-xs text-muted-foreground">
+            Override the default Claude data location
+          </p>
+          <div className="flex space-x-2">
+            <input
+              type="text"
+              value={settings.dataPath}
+              onChange={(e) => updateSetting('dataPath', e.target.value)}
+              placeholder="Default: ~/.claude or ~/.config/claude"
+              className="flex-1 px-3 py-2 border rounded-md text-sm bg-secondary text-foreground placeholder:text-muted-foreground border-border focus:outline-none focus:ring-1 focus:ring-primary"
+            />
+            <Button onClick={selectDataPath} variant="outline" size="sm">
+              Browse
+            </Button>
+          </div>
+        </div>
+
+        {/* Export Section */}
+        <div className="space-y-4 pt-4 border-t">
+          <div className="flex items-center space-x-2">
+            <Share2 className="h-4 w-4" />
+            <h4 className="font-medium">Export Usage Logs</h4>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Creates a ZIP of raw Claude JSONL usage logs for backup or sharing across devices.
+          </p>
+          
+          <div className="space-y-4 p-4 rounded-lg bg-secondary/10">
+            <div className="flex items-center space-x-2 mb-4">
+              <Calendar className="h-4 w-4" />
+              <label className="text-sm font-medium">Export Date Range</label>
+            </div>
+            
+            <DateRangePicker 
+              value={exportDateRange}
+              onChange={setExportDateRange}
+              placeholder="Select date range for export"
+            />
+            
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={async () => {
+                try {
+                  if (!exportDateRange.from || !exportDateRange.to) {
+                    window.electronAPI.showNotification?.('Please select a complete date range')
+                    return
+                  }
+
+                  const fromStart = new Date(exportDateRange.from).getTime()
+                  const toEnd = new Date(exportDateRange.to).getTime()
+                  const today = new Date()
+                  const todayEnd = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999).getTime()
+
+                  if (fromStart > toEnd) {
+                    window.electronAPI.showNotification?.('Start date cannot be after end date')
+                    return
+                  }
+                  if (fromStart > todayEnd) {
+                    window.electronAPI.showNotification?.('Start date cannot be in the future')
+                    return
+                  }
+                  if (toEnd > todayEnd) {
+                    window.electronAPI.showNotification?.('End date cannot be in the future')
+                    return
+                  }
+
+                  const fromStr = exportDateRange.from.toISOString().split('T')[0]
+                  const toStr = exportDateRange.to.toISOString().split('T')[0]
+
+                  const res = await window.electronAPI.exportClaudeUsageLogs?.(fromStr, toStr)
+                  if (res?.success) {
+                    const days = Math.floor((toEnd - fromStart) / (1000 * 60 * 60 * 24)) + 1
+                    window.electronAPI.showNotification?.(`Exported ${res.fileCount} files (${days} day${days !== 1 ? 's' : ''})`) 
+                  } else {
+                    window.electronAPI.showNotification?.(res?.error || 'Export failed')
+                  }
+                } catch (e) {
+                  console.error(e)
+                  window.electronAPI.showNotification?.('Export failed')
+                }
+              }}
+              className="w-full"
+            >
+              <Download className="h-4 w-4 mr-2" />
+              Export Logs (ZIP)
+            </Button>
+          </div>
+        </div>
+
+        {/* Import Section */}
+        <div className="space-y-4 pt-4 border-t">
+          <div className="flex items-center space-x-2">
+            <UploadCloud className="h-4 w-4" />
+            <h4 className="font-medium">Import Usage Logs</h4>
+          </div>
+          
+          <div className="space-y-4 p-4 rounded-lg bg-secondary/10">
+            <div className="space-y-3">
+              <label className="text-sm font-medium">Import Mode</label>
+              <div className="space-y-2">
+                <div className="flex items-center space-x-2">
+                  <input
+                    type="radio"
+                    id="merge-mode"
+                    name="importMode"
+                    value="merge"
+                    checked={importMode === 'merge'}
+                    onChange={(e) => setImportMode(e.target.value as 'merge' | 'replace')}
+                    className="h-4 w-4 text-primary focus:ring-primary border-gray-300"
+                  />
+                  <label htmlFor="merge-mode" className="text-sm">
+                    <span className="font-medium">Merge with existing data</span>
+                    <p className="text-xs text-muted-foreground">Add new sessions to existing data (recommended)</p>
+                  </label>
+                </div>
+                <div className="flex items-center space-x-2">
+                  <input
+                    type="radio"
+                    id="replace-mode"
+                    name="importMode"
+                    value="replace"
+                    checked={importMode === 'replace'}
+                    onChange={(e) => setImportMode(e.target.value as 'merge' | 'replace')}
+                    className="h-4 w-4 text-primary focus:ring-primary border-gray-300"
+                  />
+                  <label htmlFor="replace-mode" className="text-sm">
+                    <span className="font-medium">Replace all data</span>
+                    <p className="text-xs text-muted-foreground">Clear existing data and replace with imported data</p>
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            {importMode === 'merge' && (
+              <div className="flex items-center justify-between">
+                <div>
+                  <label className="text-sm font-medium">Skip duplicate sessions</label>
+                  <p className="text-xs text-muted-foreground">
+                    Avoid importing sessions that already exist
+                  </p>
+                </div>
+                <Switch
+                  checked={skipDuplicates}
+                  onCheckedChange={setSkipDuplicates}
+                />
+              </div>
+            )}
+
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={async () => {
+                try {
+                  const options = {
+                    mergeMode: importMode === 'merge',
+                    skipDuplicates: skipDuplicates
+                  }
+                  const res = await window.electronAPI.importClaudeUsageLogs?.(options)
+                  if (res?.success) {
+                    window.electronAPI.showNotification?.(`Imported ${res.importedFiles} files`) 
+                  } else {
+                    window.electronAPI.showNotification?.(res?.error || 'Import failed')
+                  }
+                } catch (e) {
+                  console.error(e)
+                  window.electronAPI.showNotification?.('Import failed')
+                }
+              }}
+              disabled={!!importProgress}
+              className="w-full"
+            >
+              {importProgress ? (
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              ) : (
+                <UploadCloud className="h-4 w-4 mr-2" />
+              )}
+              Import ZIP ({importMode === 'merge' ? 'Merge' : 'Replace'})
+            </Button>
+
+            {/* Import Progress */}
+            {importProgress && (
+              <div className="mt-4 p-3 bg-secondary/20 border rounded-lg">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-sm font-medium">
+                    {importProgress.phase === 'importing' && 'Importing files...'}
+                    {importProgress.phase === 'rebuilding' && 'Rebuilding cache...'}
+                    {importProgress.phase === 'completed' && '✅ Import completed!'}
+                    {importProgress.phase === 'error' && '❌ Import failed'}
+                  </span>
+                  <span className="text-sm text-muted-foreground">
+                    {importProgress.current}/{importProgress.total}
+                  </span>
+                </div>
+                <div className="w-full bg-secondary rounded-full h-2">
+                  <div 
+                    className="bg-primary h-2 rounded-full transition-all duration-300"
+                    style={{ 
+                      width: `${importProgress.total > 0 ? (importProgress.current / importProgress.total) * 100 : 0}%` 
+                    }}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Clear Data Section */}
+        <div className="space-y-4 pt-4 border-t">
+          <div className="flex items-center space-x-2">
+            <Trash2 className="h-4 w-4" />
+            <h4 className="font-medium">Clear Usage Data</h4>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Remove old usage data to free up space or reset tracking.
+          </p>
+          
+          <div className="space-y-4 p-4 rounded-lg bg-secondary/10">
+            <div className="flex items-center justify-between">
+              <div>
+                <label className="text-sm font-medium">Days to keep</label>
+                <p className="text-xs text-muted-foreground">
+                  Set to 0 to clear all data, or specify days to preserve
+                </p>
+              </div>
+              <select
+                value={clearDaysToKeep}
+                onChange={(e) => setClearDaysToKeep(parseInt(e.target.value))}
+                className="px-3 py-1 border rounded-md text-sm bg-secondary text-foreground border-border focus:outline-none focus:ring-1 focus:ring-primary"
+              >
+                <option value={0}>Clear all data</option>
+                <option value={1}>Keep last 1 day</option>
+                <option value={3}>Keep last 3 days</option>
+                <option value={7}>Keep last 7 days</option>
+                <option value={14}>Keep last 14 days</option>
+                <option value={30}>Keep last 30 days</option>
+              </select>
+            </div>
+
+            <Button
+              size="sm"
+              variant="destructive"
+              onClick={clearUsageData}
+              disabled={!!clearProgress}
+              className="w-full"
+            >
+              {clearProgress ? (
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              ) : (
+                <Trash2 className="h-4 w-4 mr-2" />
+              )}
+              {clearDaysToKeep === 0 ? 'Clear All Usage Data' : `Clear Data Older Than ${clearDaysToKeep} Days`}
+            </Button>
+
+            {/* Clear Progress */}
+            {clearProgress && (
+              <div className="mt-4 p-3 bg-secondary/20 border rounded-lg">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-sm font-medium">
+                    {clearProgress.phase === 'clearing' && `Clearing files (keeping last ${clearProgress.daysToKeep || 0} days)...`}
+                    {clearProgress.phase === 'completed' && '✅ Clear completed!'}
+                    {clearProgress.phase === 'error' && '❌ Clear failed'}
+                  </span>
+                  <span className="text-sm text-muted-foreground">
+                    {clearProgress.current}/{clearProgress.total}
+                  </span>
+                </div>
+                <div className="w-full bg-secondary rounded-full h-2">
+                  <div 
+                    className="bg-destructive h-2 rounded-full transition-all duration-300"
+                    style={{ 
+                      width: `${clearProgress.total > 0 ? (clearProgress.current / clearProgress.total) * 100 : 0}%` 
+                    }}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </DialogContent>
+  )
 
   return (
     <div className="space-y-6">
@@ -245,6 +560,23 @@ export function Settings() {
               checked={settings.minimizeToTray}
               onCheckedChange={(v) => updateSetting('minimizeToTray', v)}
             />
+          </div>
+
+          <div className="flex items-center justify-between">
+            <div>
+              <label className="text-sm font-medium">Minimize behavior</label>
+              <p className="text-xs text-muted-foreground">
+                Choose what happens when you minimize the main window (dock icon only shows when app is visible)
+              </p>
+            </div>
+            <select
+              value={settings.minimizeBehavior}
+              onChange={(e) => updateSetting('minimizeBehavior', e.target.value as 'tray' | 'floating')}
+              className="px-3 py-1 border rounded-md text-sm bg-secondary text-foreground border-border focus:outline-none focus:ring-1 focus:ring-primary"
+            >
+              <option value="floating">Show floating window</option>
+              <option value="tray">Hide to tray only</option>
+            </select>
           </div>
 
           <div className="flex items-center justify-between">
@@ -346,309 +678,29 @@ export function Settings() {
         </CardContent>
       </Card>
 
-      {/* Data */}
+      {/* Advanced Settings - Popup Trigger */}
       <Card className="glass-card">
         <CardHeader>
           <CardTitle className="flex items-center space-x-2">
-            <Folder className="h-5 w-5" />
-            <span>Data</span>
+            <Database className="h-5 w-5" />
+            <span>Data Management</span>
           </CardTitle>
           <CardDescription>
-            Configure data sources and storage locations
+            Export, import, and manage your Claude usage data
           </CardDescription>
         </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="space-y-2">
-            <label className="text-sm font-medium">Claude data directory</label>
-            <p className="text-xs text-muted-foreground">
-              Override the default Claude data location
-            </p>
-            <div className="flex space-x-2">
-              <input
-                type="text"
-                value={settings.dataPath}
-                onChange={(e) => updateSetting('dataPath', e.target.value)}
-                placeholder="Default: ~/.claude or ~/.config/claude"
-                className="flex-1 px-3 py-2 border rounded-md text-sm bg-secondary text-foreground placeholder:text-muted-foreground border-border focus:outline-none focus:ring-1 focus:ring-primary"
-              />
-              <Button
-                onClick={selectDataPath}
-                variant="outline"
-                size="sm"
-              >
-                Browse
+        <CardContent>
+          <Dialog>
+            <DialogTrigger asChild>
+              <Button variant="outline" className="w-full justify-between">
+                <span>Advanced Data Options</span>
+                <ChevronRight className="h-4 w-4" />
               </Button>
-            </div>
-          </div>
-
-          {/* Export Claude Usage Logs for Support / Sharing */}
-          <div className="space-y-4 pt-4 border-t">
-            <label className="text-sm font-medium flex items-center space-x-2">
-              <Share2 className="h-4 w-4" />
-              <span>Export Claude Usage Logs</span>
-            </label>
-            <p className="text-xs text-muted-foreground leading-relaxed">
-              Creates a ZIP of raw Claude JSONL usage logs (projects/*/*.jsonl). You can AirDrop this archive to another Mac to replicate session analysis or for troubleshooting auto-renewal.
-            </p>
-            
-            {/* Date Range Selection */}
-            <div className="space-y-4 p-4 border rounded-lg bg-secondary/10">
-              <div className="flex items-center space-x-2">
-                <Calendar className="h-5 w-5 text-primary" />
-                <label className="text-sm font-medium">Export Date Range</label>
-              </div>
-              
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="text-xs text-muted-foreground mb-1 block">From Date</label>
-                  <input
-                    type="date"
-                    value={exportFromDate}
-                    onChange={(e) => setExportFromDate(e.target.value)}
-                    className="w-full px-3 py-2 border rounded-md text-sm bg-secondary text-foreground border-border focus:outline-none focus:ring-1 focus:ring-primary"
-                  />
-                </div>
-                <div>
-                  <label className="text-xs text-muted-foreground mb-1 block">To Date</label>
-                  <input
-                    type="date"
-                    value={exportToDate}
-                    onChange={(e) => setExportToDate(e.target.value)}
-                    className="w-full px-3 py-2 border rounded-md text-sm bg-secondary text-foreground border-border focus:outline-none focus:ring-1 focus:ring-primary"
-                  />
-                </div>
-              </div>
-            </div>
-
-            <div className="flex space-x-2">
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={async () => {
-                  try {
-                    if (!exportFromDate || !exportToDate) {
-                      window.electronAPI.showNotification?.('Please select valid from and to dates')
-                      return
-                    }
-                    
-                    if (new Date(exportFromDate) > new Date(exportToDate)) {
-                      window.electronAPI.showNotification?.('From date cannot be after to date')
-                      return
-                    }
-                    
-                    const res = await window.electronAPI.exportClaudeUsageLogs?.(exportFromDate, exportToDate)
-                    if (res?.success) {
-                      const days = Math.ceil((new Date(exportToDate).getTime() - new Date(exportFromDate).getTime()) / (1000 * 60 * 60 * 24)) + 1
-                      window.electronAPI.showNotification?.(`Exported ${res.fileCount} files (${days} days)`) 
-                    } else {
-                      window.electronAPI.showNotification?.(res?.error || 'Export failed')
-                    }
-                  } catch (e) {
-                    console.error(e)
-                    window.electronAPI.showNotification?.('Export failed')
-                  }
-                }}
-                className="flex-1"
-              >
-                <Download className="h-4 w-4 mr-2" />
-                Export Logs (ZIP)
-              </Button>
-            </div>
-
-            {/* Import Options Section */}
-            <div className="space-y-4 pt-4 border-t">
-              <label className="text-sm font-medium flex items-center space-x-2">
-                <UploadCloud className="h-4 w-4" />
-                <span>Import Options</span>
-              </label>
-              
-              <div className="space-y-4 p-4 border rounded-lg bg-secondary/10">
-                <div className="space-y-3">
-                  <label className="text-sm font-medium">Import Mode</label>
-                  <div className="space-y-2">
-                    <div className="flex items-center space-x-2">
-                      <input
-                        type="radio"
-                        id="merge-mode"
-                        name="importMode"
-                        value="merge"
-                        checked={importMode === 'merge'}
-                        onChange={(e) => setImportMode(e.target.value as 'merge' | 'replace')}
-                        className="h-4 w-4 text-primary focus:ring-primary border-gray-300"
-                      />
-                      <label htmlFor="merge-mode" className="text-sm">
-                        <span className="font-medium">Merge with existing data</span>
-                        <p className="text-xs text-muted-foreground">Add new sessions to existing data (recommended)</p>
-                      </label>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                      <input
-                        type="radio"
-                        id="replace-mode"
-                        name="importMode"
-                        value="replace"
-                        checked={importMode === 'replace'}
-                        onChange={(e) => setImportMode(e.target.value as 'merge' | 'replace')}
-                        className="h-4 w-4 text-primary focus:ring-primary border-gray-300"
-                      />
-                      <label htmlFor="replace-mode" className="text-sm">
-                        <span className="font-medium">Replace all data</span>
-                        <p className="text-xs text-muted-foreground">Clear existing data and replace with imported data</p>
-                      </label>
-                    </div>
-                  </div>
-                </div>
-
-                {importMode === 'merge' && (
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <label className="text-sm font-medium">Skip duplicate sessions</label>
-                      <p className="text-xs text-muted-foreground">
-                        Avoid importing sessions that already exist (based on session ID)
-                      </p>
-                    </div>
-                    <Switch
-                      checked={skipDuplicates}
-                      onCheckedChange={setSkipDuplicates}
-                    />
-                  </div>
-                )}
-              </div>
-
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={async () => {
-                  try {
-                    const options = {
-                      mergeMode: importMode === 'merge',
-                      skipDuplicates: skipDuplicates
-                    }
-                    const res = await window.electronAPI.importClaudeUsageLogs?.(options)
-                    if (res?.success) {
-                      window.electronAPI.showNotification?.(`Imported ${res.importedFiles} files`) 
-                    } else {
-                      window.electronAPI.showNotification?.(res?.error || 'Import failed')
-                    }
-                  } catch (e) {
-                    console.error(e)
-                    window.electronAPI.showNotification?.('Import failed')
-                  }
-                }}
-                disabled={!!importProgress}
-                className="w-full"
-              >
-                {importProgress ? (
-                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                ) : (
-                  <UploadCloud className="h-4 w-4 mr-2" />
-                )}
-                Import ZIP ({importMode === 'merge' ? 'Merge' : 'Replace'})
-              </Button>
-            </div>
-
-            {/* Import Progress */}
-            {importProgress && (
-              <div className="mt-4 p-3 bg-secondary/20 border rounded-lg">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-sm font-medium">
-                    {importProgress.phase === 'importing' && 'Importing files...'}
-                    {importProgress.phase === 'rebuilding' && 'Rebuilding cache...'}
-                    {importProgress.phase === 'completed' && '✅ Import completed!'}
-                    {importProgress.phase === 'error' && '❌ Import failed'}
-                  </span>
-                  <span className="text-sm text-muted-foreground">
-                    {importProgress.current}/{importProgress.total}
-                  </span>
-                </div>
-                <div className="w-full bg-secondary rounded-full h-2">
-                  <div 
-                    className="bg-primary h-2 rounded-full transition-all duration-300"
-                    style={{ 
-                      width: `${importProgress.total > 0 ? (importProgress.current / importProgress.total) * 100 : 0}%` 
-                    }}
-                  />
-                </div>
-              </div>
-            )}
-
-            {/* Clear Usage Data Section */}
-            <div className="space-y-4 pt-4 border-t">
-              <label className="text-sm font-medium flex items-center space-x-2">
-                <Trash2 className="h-4 w-4" />
-                <span>Clear Claude Usage Data</span>
-              </label>
-              <p className="text-xs text-muted-foreground leading-relaxed">
-                Remove old usage data to free up space or reset tracking. You can keep recent data by specifying how many days to preserve.
-              </p>
-              
-              <div className="space-y-4 p-4 border rounded-lg bg-secondary/10">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <label className="text-sm font-medium">Days to keep</label>
-                    <p className="text-xs text-muted-foreground">
-                      Set to 0 to clear all data, or specify days to preserve recent data
-                    </p>
-                  </div>
-                  <select
-                    value={clearDaysToKeep}
-                    onChange={(e) => setClearDaysToKeep(parseInt(e.target.value))}
-                    className="px-3 py-1 border rounded-md text-sm bg-secondary text-foreground border-border focus:outline-none focus:ring-1 focus:ring-primary"
-                  >
-                    <option value={0}>Clear all data</option>
-                    <option value={1}>Keep last 1 day</option>
-                    <option value={3}>Keep last 3 days</option>
-                    <option value={7}>Keep last 7 days</option>
-                    <option value={14}>Keep last 14 days</option>
-                    <option value={30}>Keep last 30 days</option>
-                  </select>
-                </div>
-              </div>
-
-              <Button
-                size="sm"
-                variant="destructive"
-                onClick={clearUsageData}
-                disabled={!!clearProgress}
-                className="w-full"
-              >
-                {clearProgress ? (
-                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                ) : (
-                  <Trash2 className="h-4 w-4 mr-2" />
-                )}
-                {clearDaysToKeep === 0 ? 'Clear All Usage Data' : `Clear Data Older Than ${clearDaysToKeep} Days`}
-              </Button>
-
-              {/* Clear Progress */}
-              {clearProgress && (
-                <div className="mt-4 p-3 bg-secondary/20 border rounded-lg">
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-sm font-medium">
-                      {clearProgress.phase === 'clearing' && `Clearing files (keeping last ${clearProgress.daysToKeep || 0} days)...`}
-                      {clearProgress.phase === 'completed' && '✅ Clear completed!'}
-                      {clearProgress.phase === 'error' && '❌ Clear failed'}
-                    </span>
-                    <span className="text-sm text-muted-foreground">
-                      {clearProgress.current}/{clearProgress.total}
-                    </span>
-                  </div>
-                  <div className="w-full bg-secondary rounded-full h-2">
-                    <div 
-                      className="bg-destructive h-2 rounded-full transition-all duration-300"
-                      style={{ 
-                        width: `${clearProgress.total > 0 ? (clearProgress.current / clearProgress.total) * 100 : 0}%` 
-                      }}
-                    />
-                  </div>
-                </div>
-              )}
-            </div>
-            {/* Sharing instructions removed per user request */}
-          </div>
+            </DialogTrigger>
+            <DataManagementModal />
+          </Dialog>
         </CardContent>
       </Card>
-
 
       {/* About */}
       <Card className="glass-card">

@@ -5,11 +5,11 @@ import { Switch } from './ui/switch'
 import { useUsageStore, UsagePrediction } from '@/stores/usageStore'
 import { useRenewalStore } from '@/stores/renewalStore'
 import { formatCurrency, formatTokens, formatTimeRemaining, getTimeAgo } from '@/lib/utils'
-import { 
-  RefreshCw, 
-  DollarSign, 
-  Zap, 
-  Clock, 
+import {
+  RefreshCw,
+  DollarSign,
+  Zap,
+  Clock,
   Activity,
   Power,
   PowerOff,
@@ -21,9 +21,12 @@ import {
   Info,
   MessageCircle,
   ChevronDown,
-  ChevronRight
+  ChevronRight,
+  TrendingUp,
+  Calendar
 } from 'lucide-react'
 import { Skeleton } from './ui/skeleton'
+import { UsageChart } from './UsageChart'
 
 function DashboardSkeleton() {
   return (
@@ -77,12 +80,12 @@ function DashboardSkeleton() {
 }
 
 export function Dashboard() {
-  const { summary, currentBlock, isLoading: usageLoading, refreshData } = useUsageStore()
-  const { 
-    status, 
-    isLoading: renewalLoading, 
+  const { summary, currentBlock, isLoading: usageLoading, refreshData, usageData } = useUsageStore()
+  const {
+    status,
+    isLoading: renewalLoading,
     toggleAutoRenewal,
-    refreshStatus 
+    refreshStatus
   } = useRenewalStore()
 
   const [autoRefresh, setAutoRefresh] = useState(false)
@@ -92,6 +95,9 @@ export function Dashboard() {
   const [showUsageDetails, setShowUsageDetails] = useState(false)
   const [isWindowFocused, setIsWindowFocused] = useState(true)
   const [userPlan, setUserPlan] = useState<'pro' | 'max-5x' | 'max-20x' | 'auto'>('auto')
+  const [chartType, setChartType] = useState<'area' | 'bar'>('area')
+  const [chartMetric, setChartMetric] = useState<'tokens' | 'cost'>('tokens')
+  const [chartView, setChartView] = useState<'daily' | 'sessions'>('daily')
 
   // Track window focus to pause auto-refresh when not visible
   useEffect(() => {
@@ -150,10 +156,12 @@ export function Dashboard() {
 
   const handleRefresh = async () => {
     if (isRefreshing) return // Prevent concurrent refreshes
-    
+
     setIsRefreshing(true)
     try {
-      await Promise.all([refreshData(), refreshStatus()])
+      // Always use hard refresh to ensure tray icon updates
+      await window.electronAPI.hardRefreshUsageData?.()
+      await refreshStatus()
     } finally {
       setIsRefreshing(false)
     }
@@ -518,7 +526,7 @@ export function Dashboard() {
                     <div className="px-2 pb-2 text-xs text-muted-foreground space-y-1">
                       <div>• ~{getEstimatedPromptCount(currentBlock.usage)} prompts estimated</div>
                       <div>• ~{Math.round(currentBlock.usage / getEstimatedPromptCount(currentBlock.usage)).toLocaleString()} tokens/prompt average</div>
-                      <div>• Since {new Date(currentBlock.startTime).toLocaleTimeString()}</div>
+                      {currentBlock.startTime && <div>• Since {new Date(currentBlock.startTime).toLocaleTimeString()}</div>}
                     </div>
                   )}
                 </div>
@@ -610,19 +618,85 @@ export function Dashboard() {
         </Card>
       </div>
 
-      {/* Usage Chart Placeholder */}
+      {/* Usage Chart */}
       <Card className="glass-card">
         <CardHeader>
-          <CardTitle>Usage</CardTitle>
-          <CardDescription>Last 7 days</CardDescription>
+          <div className="flex items-center justify-between">
+            <div>
+              <CardTitle className="flex items-center space-x-2">
+                <TrendingUp className="h-5 w-5" />
+                <span>Usage Trends</span>
+              </CardTitle>
+              <CardDescription>Last 7 days activity</CardDescription>
+            </div>
+            <div className="flex items-center space-x-2">
+              <Button
+                variant={chartType === 'area' ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => setChartType('area')}
+              >
+                Area
+              </Button>
+              <Button
+                variant={chartType === 'bar' ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => setChartType('bar')}
+              >
+                Bar
+              </Button>
+            </div>
+          </div>
         </CardHeader>
         <CardContent>
-          <div className="flex items-center justify-center h-64 border-2 border-dashed border-white/10 rounded-lg">
-            <div className="text-center">
-              <Activity className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
-              <p className="text-lg font-medium">Usage Chart</p>
-              <p className="text-sm text-muted-foreground">Coming soon</p>
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-4">
+                <Button
+                  variant={chartView === 'daily' ? 'default' : 'outline'}
+                  size="sm"
+                  onClick={() => setChartView('daily')}
+                >
+                  <Calendar className="h-4 w-4 mr-2" />
+                  Daily
+                </Button>
+                <Button
+                  variant={chartView === 'sessions' ? 'default' : 'outline'}
+                  size="sm"
+                  onClick={() => {
+                    console.log('Sessions data:', usageData.sessions)
+                    setChartView('sessions')
+                  }}
+                >
+                  <MessageCircle className="h-4 w-4 mr-2" />
+                  Sessions ({usageData.sessions?.length || 0})
+                </Button>
+              </div>
+              <div className="flex items-center space-x-2">
+                <Button
+                  variant={chartMetric === 'tokens' ? 'default' : 'outline'}
+                  size="sm"
+                  onClick={() => setChartMetric('tokens')}
+                >
+                  <Zap className="h-4 w-4 mr-2" />
+                  Tokens
+                </Button>
+                <Button
+                  variant={chartMetric === 'cost' ? 'default' : 'outline'}
+                  size="sm"
+                  onClick={() => setChartMetric('cost')}
+                >
+                  <DollarSign className="h-4 w-4 mr-2" />
+                  Cost
+                </Button>
+              </div>
             </div>
+            <UsageChart
+              data={chartView === 'daily' ? usageData.daily : (usageData.sessions || [])}
+              height={250}
+              type={chartType}
+              showCost={chartMetric === 'cost'}
+              viewType={chartView}
+            />
           </div>
         </CardContent>
       </Card>

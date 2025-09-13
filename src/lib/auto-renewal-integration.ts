@@ -102,7 +102,7 @@ function getMinutesUntilReset(): number | null {
 /**
  * Start a new Claude session to keep the billing cycle active
  */
-export function startClaudeSession(): boolean {
+export function startClaudeSession(): Promise<boolean> {
   try {
     log('Attempting to start Claude session...', 'info', 'session')
     
@@ -115,18 +115,24 @@ export function startClaudeSession(): boolean {
     if (checkResult.status !== 0) {
       log('Claude command not found - cannot start session', 'error', 'session')
       log(`PATH environment: ${process.env.PATH}`, 'info', 'session')
-      return false
+      return Promise.resolve(false)
     }
     
     log(`Claude command found at: ${checkResult.stdout?.trim()}`, 'info', 'session')
     log('Starting new Claude session...', 'info', 'session')
     
-    // Start claude session with a simple greeting
-    const child = spawn('bash', ['-lc', 'echo "hi" | claude'], { 
+    // Start claude session with proper conversation initialization
+    const child = spawn('bash', ['-lc', 'claude'], {
       detached: false,
       stdio: 'pipe',
       env: { ...process.env }
     })
+
+    // Send a simple greeting to start the session
+    if (child.stdin) {
+      child.stdin.write('hi\n')
+      child.stdin.end()
+    }
     
     log(`Child process spawned with PID: ${child.pid}`, 'info', 'session')
     
@@ -156,13 +162,16 @@ export function startClaudeSession(): boolean {
         log(`Timeout - stdout: "${stdoutData.trim()}", stderr: "${stderrData.trim()}"`, 'warn', 'session')
         child.kill('SIGTERM')
         
-        // Only assume successful if we got some reasonable output
-        if (stdoutData.trim().length > 0) {
-          log('⏰ Timeout but got output - marking as successful', 'info', 'session')
-          // Note: No longer writing to lastActivity file - using block data instead
+        // Look for Claude's response patterns to determine success
+        const hasClaudeResponse = stdoutData.includes('Hi!') || stdoutData.includes('Hello') ||
+                                  stdoutData.includes('claude') || stdoutData.trim().length > 10
+
+        if (hasClaudeResponse) {
+          log('⏰ Timeout but detected Claude response - marking as successful', 'info', 'session')
           log(`🔄 Session activity detected at: ${new Date().toLocaleString()}`, 'info', 'session')
         } else {
-          log('⏰ Timeout with no output - marking as failed', 'error', 'session')
+          log('⏰ Timeout with no Claude response - marking as failed', 'error', 'session')
+          log(`Stdout was: "${stdoutData.trim()}", stderr: "${stderrData.trim()}"`, 'error', 'session')
         }
         completed = true
       }
@@ -177,16 +186,17 @@ export function startClaudeSession(): boolean {
       clearTimeout(timeout)
       completed = true
       
-      if (code === 0) {
+      // Check for successful session based on output content and exit code
+      const hasValidResponse = stdoutData.trim().length > 5 && !stderrData.includes('Error')
+      const sessionSuccessful = (code === 0 || hasValidResponse)
+
+      if (sessionSuccessful) {
         log('✅ Claude session started successfully', 'info', 'session')
-        try {
-          // Note: No longer writing to lastActivity file - using block data instead
-          log(`🔄 Session completed successfully at: ${new Date().toLocaleString()}`, 'info', 'session')
-        } catch (logError) {
-          log(`❌ Failed to log session completion: ${logError}`, 'error', 'session')
-        }
+        log(`🔄 Session completed successfully at: ${new Date().toLocaleString()}`, 'info', 'session')
+        log(`Session output: "${stdoutData.trim().slice(0, 100)}"`, 'info', 'session')
       } else {
         log(`❌ Claude session failed with exit code ${code}`, 'error', 'session')
+        log(`Failed session stderr: "${stderrData.trim()}"`, 'error', 'session')
       }
     })
     
@@ -206,13 +216,33 @@ export function startClaudeSession(): boolean {
     })
     
     log('Claude session spawn initiated, waiting for completion...', 'info', 'session')
-    return true
+
+    // Return a promise-based result instead of always true
+    return new Promise<boolean>((resolve) => {
+      const originalTimeout = setTimeout(() => {
+        if (!completed) {
+          resolve(false) // Session failed
+        }
+      }, 16000) // Slightly longer than child timeout
+
+      const originalExit = child.on('exit', (code) => {
+        clearTimeout(originalTimeout)
+        const hasValidResponse = stdoutData.trim().length > 5 && !stderrData.includes('Error')
+        const sessionSuccessful = (code === 0 || hasValidResponse)
+        resolve(sessionSuccessful)
+      })
+
+      const originalError = child.on('error', () => {
+        clearTimeout(originalTimeout)
+        resolve(false)
+      })
+    })
   } catch (error) {
     log(`Exception starting Claude session: ${error}`, 'error', 'session')
     if (error instanceof Error) {
       log(`Exception stack: ${error.stack}`, 'error', 'session')
     }
-    return false
+    return Promise.resolve(false)
   }
 }
 
@@ -439,18 +469,18 @@ export function resetSessionTracking(): { success: boolean; error?: string } {
 /**
  * Force start a new Claude session and reset tracking
  */
-export function forceStartNewSession(): { success: boolean; error?: string } {
+export async function forceStartNewSession(): Promise<{ success: boolean; error?: string }> {
   try {
     log('Force starting new Claude session...', 'info', 'session')
-    
+
     // Reset session tracking first
     const resetResult = resetSessionTracking()
     if (!resetResult.success) {
       return resetResult
     }
-    
+
     // Start new session
-    const sessionResult = startClaudeSession()
+    const sessionResult = await startClaudeSession()
     if (sessionResult) {
       log('New session forced successfully', 'info', 'session')
       return { success: true }
@@ -527,76 +557,4 @@ export function getSessionStatus(): {
   }
 }
 
-/**
- * Perform a single renewal check and action if needed
- * Non-blocking implementation that returns immediately
- */
-export function performRenewalCheck(): { success: boolean; action?: string; error?: string } {
-  try {
-    const scheduledStartTime = existsSync(START_TIME_FILE) ? readFileSync(START_TIME_FILE, 'utf8').trim() : null
-    let shouldRenew = false
-    let reason = ''
-    
-    // 1. Check if user has scheduled a future start time
-    if (scheduledStartTime) {
-      const scheduledTime = new Date(scheduledStartTime)
-      const now = new Date()
-      
-      if (scheduledTime > now) {
-        // Scheduled time is in the future - wait until then
-        const hoursUntilScheduled = (scheduledTime.getTime() - now.getTime()) / (1000 * 60 * 60)
-        log(`⏰ SCHEDULED RENEWAL: Waiting for scheduled time in ${hoursUntilScheduled.toFixed(1)} hours`, 'info', 'renewal')
-        return { success: true }
-      } else {
-        // Scheduled time has passed - clear schedule and proceed with renewal check
-        log(`⏰ SCHEDULED TIME REACHED: Clearing schedule and checking for renewal`, 'info', 'renewal')
-        if (existsSync(START_TIME_FILE)) unlinkSync(START_TIME_FILE)
-      }
-    }
-
-    // 2. Base renewal decision on current block state instead of lastActivity
-    let block: any = null
-    try {
-      const { getCurrentBlockInfo } = require('./ccusage-integration')
-      block = getCurrentBlockInfo()
-    } catch (error) {
-      // Fallback if ccusage-integration is not available
-      block = null
-    }
-    
-    if (!block) {
-      shouldRenew = true
-      reason = 'No current block detected - starting fresh session'
-    } else if (!block.isActive) {
-      shouldRenew = true
-      reason = 'Current block has expired - starting new session'
-    } else {
-      const timeRemainingHours = (block.timeRemaining || 0) / 60
-      log(`⏳ WAITING: Block still active, ${timeRemainingHours.toFixed(1)} hours remaining`, 'info', 'renewal')
-      return { success: true }
-    }
-    
-    if (shouldRenew) {
-      log(`🚀 SESSION START TRIGGERED: ${reason}`, 'info', 'renewal')
-      
-      // Start session asynchronously without blocking (fire and forget)
-      setImmediate(() => {
-        try {
-          startClaudeSession()
-        } catch (error) {
-          log(`Error starting Claude session asynchronously: ${error}`, 'error', 'renewal')
-        }
-      })
-      
-      return { success: true, action: reason }
-    } else {
-      const nextCheckIn = Math.round(calculateSleepDuration() / 60)
-      log(`No renewal needed. Next check in ${nextCheckIn} minutes`, 'info', 'renewal')
-      return { success: true }
-    }
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error'
-    log(`Error during renewal check: ${errorMessage}`, 'error', 'renewal')
-    return { success: false, error: errorMessage }
-  }
-}
+// Note: performRenewalCheck is now handled by renewal-service.ts to maintain single source of truth

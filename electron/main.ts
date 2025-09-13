@@ -4,7 +4,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
 import { isDev } from './utils'
-import { loadUsageData, getRecentUsage, getCurrentBlockInfo } from './services/ccusage-service'
+import { loadUsageData, getRecentUsage, getCurrentBlockInfo, resetUsageCache } from './services/ccusage-service'
 import { 
   getRenewalStatus, 
   startRenewalService, 
@@ -20,8 +20,244 @@ const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'] || 'http://localh
 let mainWindow: BrowserWindow | null = null
 let floatingWindow: BrowserWindow | null = null
 let tray: Tray | null = null
+let trayUsageInterval: NodeJS.Timeout | null = null
 
-// Create an app icon matching the sidebar's Activity logo (lucide)
+
+// Create a high-quality PNG pulse icon for macOS menu bar
+const createBatteryIcon = (options?: { size?: number; percentage?: number }) => {
+  const baseSize = options?.size ?? 16 // Base size for menu bar
+  const percentage = Math.max(0, Math.min(100, options?.percentage ?? 0))
+
+  console.log(`Creating HD tray pulse icon: ${percentage}% - size: ${baseSize}px`)
+
+  try {
+    // Create ultra high-DPI canvas (4x for maximum Retina quality)
+    const scale = 4 // Higher scale for ultra-crisp rendering
+    const canvasSize = baseSize * scale
+
+    const { createCanvas } = require('canvas')
+    const canvas = createCanvas(canvasSize, canvasSize)
+    const ctx = canvas.getContext('2d')
+
+    // Scale the context for ultra high-DPI rendering
+    ctx.scale(scale, scale)
+
+    // Enable maximum quality rendering with all optimizations
+    ctx.imageSmoothingEnabled = false // Disable for pixel-perfect edges
+    ctx.patternQuality = 'best'
+    ctx.textDrawingMode = 'path'
+    ctx.antialias = 'subpixel'
+
+    // Clear canvas with transparent background
+    ctx.clearRect(0, 0, baseSize, baseSize)
+
+    // Apple-style battery dimensions (exact proportions from macOS)
+    const batteryWidth = 10.5
+    const batteryHeight = 5.5
+    const batteryX = (baseSize - batteryWidth) / 2
+    const batteryY = (baseSize - batteryHeight) / 2
+
+    // Apple-style terminal (precise proportions)
+    const terminalWidth = 1
+    const terminalHeight = 2.5
+    const terminalX = batteryX + batteryWidth - 0.1 // Slight overlap for seamless connection
+    const terminalY = batteryY + (batteryHeight - terminalHeight) / 2
+
+    // Apple system colors with proper opacity
+    let fillColor
+    if (percentage <= 20) {
+      fillColor = "#FF3B30" // Apple red
+    } else if (percentage <= 50) {
+      fillColor = "#FF9500" // Apple orange
+    } else {
+      fillColor = "#34C759" // Apple green
+    }
+
+    // Pixel-perfect alignment for ultra-sharp rendering
+    const pixelAlign = (value: number) => Math.round(value * scale) / scale
+
+    // Apple-style rendering with precise stroke width
+    ctx.lineWidth = pixelAlign(0.8)
+    ctx.lineCap = 'round'
+    ctx.lineJoin = 'round'
+
+    // Battery outline with Apple's exact styling
+    ctx.strokeStyle = "#FFFFFF"
+    ctx.fillStyle = "transparent"
+    ctx.beginPath()
+    const outlineX = pixelAlign(batteryX)
+    const outlineY = pixelAlign(batteryY)
+    const outlineW = pixelAlign(batteryWidth)
+    const outlineH = pixelAlign(batteryHeight)
+    const cornerRadius = pixelAlign(1.2)
+
+    // Draw battery body with Apple's corner radius
+    ctx.roundRect(outlineX, outlineY, outlineW, outlineH, cornerRadius)
+    ctx.stroke()
+
+    // Apple-style terminal with seamless connection
+    ctx.fillStyle = "#FFFFFF"
+    ctx.beginPath()
+    const termX = pixelAlign(terminalX)
+    const termY = pixelAlign(terminalY)
+    const termW = pixelAlign(terminalWidth)
+    const termH = pixelAlign(terminalHeight)
+    ctx.roundRect(termX, termY, termW, termH, pixelAlign(0.4))
+    ctx.fill()
+
+    // Apple-style battery fill with proper padding
+    if (percentage > 0) {
+      const padding = pixelAlign(1.2)
+      const fillWidth = pixelAlign(Math.max(0.8, (batteryWidth - padding * 2) * (percentage / 100)))
+      const fillX = pixelAlign(batteryX + padding)
+      const fillY = pixelAlign(batteryY + padding)
+      const fillHeight = pixelAlign(batteryHeight - padding * 2)
+      const fillRadius = pixelAlign(0.6)
+
+      // Apple's battery fill style
+      ctx.fillStyle = fillColor
+      ctx.beginPath()
+      ctx.roundRect(fillX, fillY, fillWidth, fillHeight, fillRadius)
+      ctx.fill()
+    }
+
+    // Convert canvas to PNG with ultra-high quality settings
+    const buffer = canvas.toBuffer('image/png', {
+      compressionLevel: 0, // No compression for maximum quality
+      filters: canvas.PNG_FILTER_NONE,
+      resolution: 288, // Ultra-high DPI (4x base)
+      palette: false // Full color depth
+    })
+
+    // Create image with proper scale factor for Retina
+    const image = nativeImage.createFromBuffer(buffer, {
+      scaleFactor: scale / 2, // Adjust scale factor for proper sizing
+      width: baseSize,
+      height: baseSize
+    })
+
+    // Ensure colored rendering (not template)
+    image.setTemplateImage(false)
+
+    // Verify the image was created successfully
+    if (image.isEmpty()) {
+      console.error('HD battery PNG creation failed - falling back to SVG')
+      return createBatteryIconSVG(options)
+    }
+
+    console.log(`Successfully created HD battery icon: ${image.getSize().width}x${image.getSize().height} (scale: ${scale}x)`)
+    return image
+
+  } catch (error) {
+    console.error('Failed to create HD battery PNG, falling back to SVG:', error)
+    return createBatteryIconSVG(options)
+  }
+}
+
+// Fallback SVG generation for battery icons
+const createBatteryIconSVG = (options?: { size?: number; percentage?: number }) => {
+  const size = options?.size ?? 16 // macOS menu bar standard size
+  const percentage = options?.percentage ?? 0
+
+  // Calculate battery dimensions with better proportions
+  const batteryWidth = Math.max(14, size * 0.8)
+  const batteryHeight = Math.max(9, size * 0.56)
+  const batteryX = (size - batteryWidth) / 2
+  const batteryY = (size - batteryHeight) / 2
+  
+  // Battery terminal (small rectangle on the right)
+  const terminalWidth = Math.max(2, size * 0.12)
+  const terminalHeight = Math.max(5, size * 0.31)
+  const terminalX = batteryX + batteryWidth
+  const terminalY = batteryY + (batteryHeight - terminalHeight) / 2
+
+  // Fill level calculation with better precision
+  const fillWidth = Math.max(0, (batteryWidth - 3) * (percentage / 100)) // -3 for border
+  const fillX = batteryX + 1.5 // +1.5 for border
+  const fillY = batteryY + 1.5 // +1.5 for border
+  const fillHeight = batteryHeight - 3 // -3 for border
+
+  // Determine colors based on percentage
+  let fillColor, borderColor
+  if (percentage <= 20) {
+    fillColor = "#FF3B30" // Red for low battery
+    borderColor = "#FF3B30"
+  } else if (percentage <= 50) {
+    fillColor = "#FF9500" // Orange for medium battery
+    borderColor = "#FF9500"
+  } else {
+    fillColor = "#34C759" // Green for good battery
+    borderColor = "#34C759"
+  }
+
+  const svg = `
+    <svg width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}">
+      <defs>
+        <filter id="shadow" x="-50%" y="-50%" width="200%" height="200%">
+          <feDropShadow dx="0" dy="0" stdDeviation="0.5" flood-opacity="0.3"/>
+        </filter>
+      </defs>
+      <!-- Battery outline with better stroke -->
+      <rect x="${batteryX}" y="${batteryY}" 
+            width="${batteryWidth}" height="${batteryHeight}" 
+            fill="none" stroke="${borderColor}" stroke-width="1.5" rx="1.5" 
+            stroke-linecap="round" stroke-linejoin="round"/>
+      
+      <!-- Battery terminal with better proportions -->
+      <rect x="${terminalX}" y="${terminalY}" 
+            width="${terminalWidth}" height="${terminalHeight}" 
+            fill="${borderColor}" rx="0.8" 
+            stroke-linecap="round" stroke-linejoin="round"/>
+      
+      <!-- Battery fill with better precision -->
+      ${percentage > 0 ? `
+        <rect x="${fillX}" y="${fillY}" 
+              width="${fillWidth}" height="${fillHeight}" 
+              fill="${fillColor}" rx="0.8" 
+              stroke-linecap="round" stroke-linejoin="round"/>
+      ` : ''}
+    </svg>
+  `
+
+  return nativeImage.createFromBuffer(Buffer.from(svg))
+}
+
+// Fallback SVG generation (original implementation)
+const createStatusDotIconSVG = (options?: { size?: number; enabled?: boolean }) => {
+  const size = options?.size ?? 16 // macOS menu bar standard size
+  const isEnabled = options?.enabled ?? false
+
+  // Use high contrast colors optimized for macOS menu bar
+  const color = isEnabled ? '#00D900' : '#FF3B30' // Apple's system green/red
+
+  // Create SVG with proper XML declaration and viewBox
+  const svg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg">
+  <circle cx="${size/2}" cy="${size/2}" r="${size/3}" fill="${color}"/>
+</svg>`
+
+  try {
+    const image = nativeImage.createFromBuffer(Buffer.from(svg, 'utf8'))
+
+    // For macOS, we want colored icons, not template
+    image.setTemplateImage(false)
+
+    // Verify the image was created successfully
+    if (image.isEmpty()) {
+      console.error('Status dot SVG creation failed - image is empty')
+      return createActivityIcon({ size: 16, color: '#000000', template: true })
+    }
+
+    console.log(`Successfully created status dot icon from SVG: ${image.getSize().width}x${image.getSize().height}`)
+    return image
+
+  } catch (error) {
+    console.error('Failed to create status dot from SVG:', error)
+    return createActivityIcon({ size: 16, color: '#000000', template: true })
+  }
+}
+
+// Create an app icon matching the sidebar's Activity logo (lucide) - keep for non-tray uses
 const createActivityIcon = (options?: { size?: number; color?: string; template?: boolean }) => {
   const size = options?.size ?? 24
   const color = options?.color ?? '#3b82f6' // Tailwind blue-500
@@ -35,6 +271,210 @@ const createActivityIcon = (options?: { size?: number; color?: string; template?
     image.setTemplateImage(true)
   }
   return image
+}
+
+// Helpers for tray usage display
+const formatMinutes = (minutes: number | null) => {
+  if (minutes === null || minutes < 0) return '—'
+  const h = Math.floor(minutes / 60)
+  const m = Math.floor(minutes % 60)
+  if (h <= 0) return `${m}m`
+  if (m <= 0) return `${h}h`
+  return `${h}h ${m}m`
+}
+
+const formatTokens = (tokens: number) => {
+  if (tokens >= 1_000_000_000) return `${(tokens / 1_000_000_000).toFixed(2)}B`
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(2)}M`
+  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}K`
+  return tokens.toLocaleString()
+}
+
+const getUsagePercent = () => {
+  try {
+    const block = getCurrentBlockInfo()
+    if (!block || !block.limit || block.limit <= 0) return { percent: null as number | null, block }
+    const percent = Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100)))
+    return { percent, block }
+  } catch {
+    return { percent: null as number | null, block: null as any }
+  }
+}
+
+const updateTrayUsage = () => {
+  if (!tray) return
+  const { percent, block } = getUsagePercent()
+
+  // Use battery icon to show REMAINING tokens (100 - used percentage)
+  try {
+    const usedPercentage = percent || 0
+    const remainingPercentage = Math.max(0, 100 - usedPercentage) // Invert to show remaining
+
+    const batteryIcon = createBatteryIcon({
+      size: 16,
+      percentage: remainingPercentage
+    })
+    tray.setImage(batteryIcon)
+    console.log(`Updated tray battery icon: ${remainingPercentage}% remaining (${usedPercentage}% used)`)
+  } catch (error) {
+    console.warn('Failed to update tray battery icon:', error)
+    // Fallback to text if icon fails
+    try {
+      tray.setImage(nativeImage.createEmpty())
+      const displayText = percent === null ? '—' : `${100 - percent}%`
+      tray.setTitle(displayText)
+    } catch {}
+  }
+
+  // Clear title since we're using icon
+  if (process.platform === 'darwin') {
+    try {
+      tray.setTitle('')
+    } catch {}
+  }
+
+  // Tooltip with details including next renewal time
+  const timeLeft = block?.timeRemaining ?? null
+  const usageText = block ? `${formatTokens(block.usage)} / ${formatTokens(block.limit || 0)} tokens` : 'Usage unavailable'
+  
+  // Get next renewal time from the renewal service
+  let renewalInfo = ''
+  try {
+    const renewalStatus = getRenewalStatus()
+    if (renewalStatus.enabled) {
+      renewalInfo = '\nAuto-renewal: ON'
+
+      // Use the actual next renewal time from the service
+      if (renewalStatus.nextRenewal) {
+        const nextRenewalTime = new Date(renewalStatus.nextRenewal)
+
+        // Format the time in a readable way
+        const timeOptions: Intl.DateTimeFormatOptions = {
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: true
+        }
+
+        const dateOptions: Intl.DateTimeFormatOptions = {
+          month: 'short',
+          day: 'numeric'
+        }
+
+        const now = new Date()
+        const isToday = nextRenewalTime.toDateString() === now.toDateString()
+        const isTomorrow = nextRenewalTime.toDateString() === new Date(now.getTime() + 24*60*60*1000).toDateString()
+
+        let timeStr
+        if (isToday) {
+          timeStr = `Today at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
+        } else if (isTomorrow) {
+          timeStr = `Tomorrow at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
+        } else {
+          timeStr = `${nextRenewalTime.toLocaleDateString('en-US', dateOptions)} at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
+        }
+
+        renewalInfo += `\nNext session: ${timeStr}`
+      } else if (renewalStatus.timeRemaining) {
+        // If no specific next renewal time, show time remaining in current block
+        renewalInfo += `\nTime remaining: ${renewalStatus.timeRemaining}`
+      } else {
+        renewalInfo += '\nNext session: TBD'
+      }
+    } else {
+      renewalInfo = '\nAuto-renewal: OFF'
+    }
+  } catch (configError) {
+    renewalInfo = '\nAuto-renewal: Status unknown'
+  }
+  
+  // Create modern glass-style tooltip content
+  const tooltipData = {
+    title: 'Claude Sentinel',
+    usage: percent !== null ? `${percent}%` : null,
+    tokens: usageText,
+    timeRemaining: timeLeft !== null ? formatMinutes(timeLeft) : null,
+    renewalStatus: renewalInfo.replace('\n', '').replace('Auto-renewal: ', ''),
+    nextSession: renewalInfo.includes('Next session:') ? renewalInfo.split('Next session: ')[1] : null
+  }
+
+  // Set comprehensive tooltip with usage data
+  const tooltipLines = []
+  tooltipLines.push('Claude Sentinel')
+
+  if (percent !== null) {
+    tooltipLines.push(`Usage: ${percent}% used`)
+    tooltipLines.push(`Remaining: ${100 - percent}%`)
+  } else {
+    tooltipLines.push('Usage: Unknown')
+  }
+
+  tooltipLines.push(usageText)
+
+  if (timeLeft !== null) {
+    tooltipLines.push(`Time left: ${formatMinutes(timeLeft)}`)
+  }
+
+  // Add renewal status info
+  try {
+    const renewalStatus = getRenewalStatus()
+    if (renewalStatus.enabled) {
+      tooltipLines.push('')
+      tooltipLines.push('Auto-renewal: ON')
+
+      if (renewalStatus.nextRenewal) {
+        const nextRenewalTime = new Date(renewalStatus.nextRenewal)
+        const now = new Date()
+        const isToday = nextRenewalTime.toDateString() === now.toDateString()
+        const isTomorrow = nextRenewalTime.toDateString() === new Date(now.getTime() + 24*60*60*1000).toDateString()
+
+        const timeOptions: Intl.DateTimeFormatOptions = {
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: true
+        }
+
+        const dateOptions: Intl.DateTimeFormatOptions = {
+          month: 'short',
+          day: 'numeric'
+        }
+
+        let timeStr
+        if (isToday) {
+          timeStr = `Today at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
+        } else if (isTomorrow) {
+          timeStr = `Tomorrow at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
+        } else {
+          timeStr = `${nextRenewalTime.toLocaleDateString('en-US', dateOptions)} at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
+        }
+
+        tooltipLines.push(`Next session: ${timeStr}`)
+      } else if (renewalStatus.timeRemaining) {
+        tooltipLines.push(`Time remaining: ${renewalStatus.timeRemaining}`)
+      } else {
+        tooltipLines.push('Next session: TBD')
+      }
+    } else {
+      tooltipLines.push('')
+      tooltipLines.push('Auto-renewal: OFF')
+    }
+  } catch (configError) {
+    tooltipLines.push('')
+    tooltipLines.push('Auto-renewal: Status unknown')
+  }
+
+  // Set the tooltip
+  tray.setToolTip(tooltipLines.join('\n'))
+
+  // Refresh tray context menu to reflect latest usage
+  try { updateTrayMenu() } catch {}
+}
+
+const startTrayUsageUpdates = () => {
+  // Immediately update once tray exists
+  updateTrayUsage()
+  // Refresh every minute
+  if (trayUsageInterval) { clearInterval(trayUsageInterval); trayUsageInterval = null }
+  trayUsageInterval = setInterval(updateTrayUsage, 60 * 1000)
 }
 
 const createWindow = () => {
@@ -75,15 +515,35 @@ const createWindow = () => {
     mainWindow.webContents.openDevTools()
   }
 
-  // Handle window closed
+  // Handle window close button - hide to menu bar instead of closing
+  mainWindow.on('close', (event) => {
+    if (process.platform === 'darwin') {
+      // On macOS, hide window and dock icon instead of closing
+      event.preventDefault()
+      mainWindow?.hide()
+
+      // Hide dock icon when window is hidden to menu bar
+      try { if (app.dock) app.dock.hide() } catch {}
+    } else {
+      // On Windows/Linux, hide to system tray
+      event.preventDefault()
+      mainWindow?.hide()
+    }
+  })
+
+  // Handle window closed (for cleanup when app actually quits)
   mainWindow.on('closed', () => {
     mainWindow = null
   })
 
-  // Hide floating window when main window is restored/shown
+  // Hide floating window when main window is restored/shown and show dock icon
   mainWindow.on('restore', () => {
     if (floatingWindow && !floatingWindow.isDestroyed()) {
       floatingWindow.close()
+    }
+    // Show dock icon when window is restored on macOS
+    if (process.platform === 'darwin') {
+      try { if (app.dock) app.dock.show() } catch {}
     }
   })
 
@@ -91,21 +551,51 @@ const createWindow = () => {
     if (floatingWindow && !floatingWindow.isDestroyed()) {
       floatingWindow.close()
     }
+    // Show dock icon when window is shown on macOS
+    if (process.platform === 'darwin') {
+      try { if (app.dock) app.dock.show() } catch {}
+    }
   })
 
-  // Handle minimize and show floating window
-  mainWindow.on('minimize', (event: Electron.Event) => {
-    // Show floating window when main window is minimized
-    createFloatingWindow()
-    
-    if (process.platform === 'darwin') {
-      // On macOS, ensure Dock icon remains visible
-      try { if (app.dock) app.dock.show() } catch {}
-      return
+  // Handle minimize behavior based on user settings
+  mainWindow.on('minimize', async (event: Electron.Event) => {
+    try {
+      // Load user settings to check minimize behavior preference
+      const settingsFile = getSettingsFilePath()
+      let userSettings = getDefaultSettings()
+      
+      if (fs.existsSync(settingsFile)) {
+        try {
+          const fileContent = fs.readFileSync(settingsFile, 'utf8')
+          const savedSettings = JSON.parse(fileContent)
+          userSettings = { ...userSettings, ...savedSettings }
+        } catch (parseError) {
+          console.warn('Could not parse settings file, using defaults for minimize behavior')
+        }
+      }
+      
+      // Handle minimize behavior based on user preference
+      if (userSettings.minimizeBehavior === 'floating') {
+        // Show floating window when main window is minimized
+        createFloatingWindow()
+      }
+      
+      if (process.platform === 'darwin') {
+        // On macOS, hide dock icon when minimized since app is only in top bar
+        try { if (app.dock) app.dock.hide() } catch {}
+        return
+      }
+      
+      // On Windows/Linux, respect tray setting
+      if (userSettings.minimizeToTray) {
+        event.preventDefault()
+        mainWindow?.hide()
+      }
+    } catch (error) {
+      console.error('Error handling minimize event:', error)
+      // Fallback to default behavior
+      createFloatingWindow()
     }
-    // On Windows/Linux, hide to system tray
-    event.preventDefault()
-    mainWindow?.hide()
   })
 }
 
@@ -181,19 +671,42 @@ const createFloatingWindow = () => {
 }
 
 const createTray = () => {
-  // Create tray icon
-  const icon = nativeImage.createFromPath(
-    join(__dirname, process.platform === 'darwin' ? '../assets/tray-icon-mac.png' : '../assets/tray-icon.png')
-  )
-  
-  // Use template monochrome icon on macOS so the OS tints it
-  const trayIcon = process.platform === 'darwin'
-    ? createActivityIcon({ size: 24, color: '#000000', template: true })
-    : createActivityIcon({ size: 24, color: '#3b82f6' })
+  console.log('=== Creating macOS menu bar tray ===')
 
-  tray = new Tray(trayIcon.isEmpty() ? icon : trayIcon)
+  // Create initial battery icon at 100% remaining (full battery)
+  let trayIcon
+  try {
+    trayIcon = createBatteryIcon({
+      size: 16,
+      percentage: 100 // Start with full battery (100% tokens remaining)
+    })
+    console.log('Created initial full battery icon (100% tokens remaining)')
+  } catch (error) {
+    console.error('Failed to create initial battery icon:', error)
+    trayIcon = nativeImage.createEmpty()
+  }
+
+  console.log('Creating tray...')
+  tray = new Tray(trayIcon)
+  
+  // Verify tray was created successfully
+  if (!tray || tray.isDestroyed()) {
+    console.error('Failed to create tray')
+    return
+  }
+  
+  console.log('Tray created successfully')
   
   const contextMenu = Menu.buildFromTemplate([
+    {
+      label: 'Usage: updating…',
+      enabled: false
+    },
+    {
+      label: 'Time remaining: —',
+      enabled: false
+    },
+    { type: 'separator' },
     {
       label: 'Show Claude Sentinel',
       click: () => {
@@ -201,6 +714,10 @@ const createTray = () => {
           if (mainWindow.isMinimized()) mainWindow.restore()
           mainWindow.show()
           mainWindow.focus()
+          // Show dock icon when showing window on macOS
+          if (process.platform === 'darwin') {
+            try { if (app.dock) app.dock.show() } catch {}
+          }
         } else {
           createWindow()
         }
@@ -230,22 +747,15 @@ const createTray = () => {
     }
   ])
 
-  tray.setToolTip('Claude Sentinel - Usage Monitor & Auto-Renewal')
+  // Set initial basic tooltip and context menu
+  tray.setToolTip('Claude Sentinel - Loading...')
   tray.setContextMenu(contextMenu)
 
-  // Handle tray click
-  tray.on('click', () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      if (mainWindow.isVisible()) {
-        mainWindow.hide()
-      } else {
-        mainWindow.show()
-        mainWindow.focus()
-      }
-    } else {
-      createWindow()
-    }
-  })
+  // Handle tray click - show context menu only (no direct app opening)
+  // Note: The context menu will be shown automatically on click, we don't need to handle direct clicks
+
+  // Start periodic usage updates for tray title/tooltip
+  startTrayUsageUpdates()
 }
 
 // App event handlers
@@ -284,12 +794,9 @@ app.on('activate', () => {
 })
 
 app.on('window-all-closed', () => {
-  // Keep app running in system tray
-  if (process.platform !== 'darwin') {
-    // On Windows/Linux, keep running for system tray
-    return
-  }
-  app.quit()
+  // Keep app running in menu bar/system tray on all platforms
+  // The app should only quit when explicitly requested from the tray menu
+  return
 })
 
 app.on('before-quit', () => {
@@ -297,11 +804,16 @@ app.on('before-quit', () => {
   if (tray) {
     tray.destroy()
   }
+  if (trayUsageInterval) {
+    clearInterval(trayUsageInterval)
+    trayUsageInterval = null
+  }
 })
 
 
 // Timer-based renewal scheduling
 let renewalTimer: NodeJS.Timeout | null = null
+let scheduledRenewalTimer: NodeJS.Timeout | null = null
 
 // Configuration for grace periods
 const RENEWAL_CONFIG = {
@@ -309,7 +821,7 @@ const RENEWAL_CONFIG = {
     min: 30,  // seconds
     max: 60   // seconds
   },
-  fallbackCheckInterval: 5 * 60 * 1000, // 5 minutes in ms for fallback polling
+  fallbackCheckInterval: 30 * 60 * 1000, // 30 minutes in ms for emergency fallback only
 }
 
 // Helper to add grace period to any time
@@ -323,68 +835,115 @@ const addGracePeriod = (targetTime: Date) => {
 
 // Smart timer-based renewal scheduling
 const scheduleNextRenewal = () => {
-  // Clear any existing timer
+  // Clear block-based renewal timer
   if (renewalTimer) {
     clearTimeout(renewalTimer)
     renewalTimer = null
   }
 
+  // Only clear scheduled timer if we're about to set a new one
+  // This preserves running scheduled timers when just doing block-based scheduling
+  const status = getRenewalStatus()
+  const hasScheduledTime = !!status.scheduledStartTime
+
+  if (hasScheduledTime && scheduledRenewalTimer) {
+    // There's already a scheduled timer running - clear it to set new one
+    clearTimeout(scheduledRenewalTimer)
+    scheduledRenewalTimer = null
+  }
+
   try {
-    const status = getRenewalStatus()
-    
-    // Only schedule if auto-renewal is enabled
-    if (!status.enabled || !status.running) {
-      renewalLogger.info('Auto-renewal disabled, not scheduling next renewal', 'service')
-      return
-    }
-
     const now = new Date()
-    let targetTime: Date | null = null
-    let reason = ''
 
-    // Priority 1: User scheduled time (always takes precedence if set)
+    // Priority 1: Always check for user scheduled time FIRST (regardless of auto-renewal state)
     if (status.scheduledStartTime) {
       const scheduledTime = new Date(status.scheduledStartTime)
-      
+
       if (scheduledTime > now) {
-        targetTime = scheduledTime
-        reason = 'scheduled start'
-        renewalLogger.info(`User scheduled time found: ${targetTime.toISOString()} - ignoring block expiration`, 'schedule')
+        // Add 1-2 minute random delay to scheduled renewals
+        const baseDelay = scheduledTime.getTime() - now.getTime()
+        const randomDelayMs = (60 + Math.random() * 60) * 1000 // 1-2 minutes in milliseconds
+        const totalDelay = baseDelay + randomDelayMs
+        const actualTriggerTime = new Date(now.getTime() + totalDelay)
+
+        renewalLogger.info(`🕐 SCHEDULED RENEWAL SET: Will trigger at ${actualTriggerTime.toISOString()} (scheduled for ${scheduledTime.toISOString()} + ${(randomDelayMs / 60000).toFixed(1)} min delay)`, 'schedule')
+
+        scheduledRenewalTimer = setTimeout(() => {
+          try {
+            renewalLogger.info(`🚀 EXECUTING SCHEDULED RENEWAL at ${new Date().toISOString()}`, 'schedule')
+            const result = performRenewalCheck()
+
+            // Send status updates
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
+            }
+            if (result.success && result.action && tray) {
+              updateTrayMenu()
+              updateTrayUsage()
+            }
+
+            // Schedule next renewal after scheduled execution
+            setTimeout(() => scheduleNextRenewal(), 2000)
+          } catch (error) {
+            renewalLogger.error(`❌ Error in scheduled renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+            // Retry in 1 minute
+            setTimeout(() => scheduleNextRenewal(), 60000)
+          }
+        }, totalDelay)
+
+        return // Exit early - scheduled time takes absolute priority
       } else {
         // Scheduled time has just passed (within last 5 minutes) - trigger immediate renewal
         const timeSinceScheduled = now.getTime() - scheduledTime.getTime()
         const fiveMinutesInMs = 5 * 60 * 1000
-        
+
         if (timeSinceScheduled <= fiveMinutesInMs) {
-          renewalLogger.info(`Scheduled time recently passed (${Math.round(timeSinceScheduled / 1000)}s ago), triggering immediate renewal`, 'schedule')
-          
+          renewalLogger.info(`⚡ Scheduled time recently passed (${Math.round(timeSinceScheduled / 1000)}s ago), triggering immediate renewal`, 'schedule')
+
           // Trigger immediate renewal
           setTimeout(() => {
             try {
-              renewalLogger.info('Executing immediate scheduled renewal', 'renewal')
+              renewalLogger.info('🚀 EXECUTING LATE SCHEDULED RENEWAL', 'schedule')
               const result = performRenewalCheck()
-              
+
               // Send status updates
               if (mainWindow && !mainWindow.isDestroyed()) {
                 mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
               }
               if (result.success && result.action && tray) {
                 updateTrayMenu()
+                updateTrayUsage()
               }
-              
+
               // Schedule next renewal after immediate execution
               setTimeout(() => scheduleNextRenewal(), 2000)
             } catch (error) {
-              renewalLogger.error(`Error in immediate scheduled renewal: ${error instanceof Error ? error.message : String(error)}`, 'renewal')
+              renewalLogger.error(`❌ Error in late scheduled renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
             }
           }, 1000) // Small delay to ensure proper execution
-          
+
           return // Exit early after scheduling immediate renewal
         }
       }
     }
-    // Priority 2: Block expiration (only if no scheduled time)
-    else if (status.currentBlock?.endTime && new Date(status.currentBlock.endTime) > now) {
+
+    // Only proceed with block-based renewals if auto-renewal is enabled AND no scheduled time
+    if (!status.enabled || !status.running) {
+      renewalLogger.info('🔄 Auto-renewal disabled, not scheduling block-based renewals', 'service')
+      return
+    }
+
+    // If there's a scheduled time, skip all intermediate block-based renewals
+    if (status.scheduledStartTime) {
+      renewalLogger.info('📅 Scheduled renewal set - SKIPPING all intermediate block-based renewals', 'service')
+      return
+    }
+
+    let targetTime: Date | null = null
+    let reason = ''
+
+    // Priority 2: Block expiration (only if auto-renewal enabled and no scheduled time)
+    if (status.currentBlock?.endTime && new Date(status.currentBlock.endTime) > now) {
       targetTime = new Date(status.currentBlock.endTime)
       reason = 'block expiration'
     }
@@ -410,8 +969,9 @@ const scheduleNextRenewal = () => {
             }
             if (result.success && result.action && tray) {
               updateTrayMenu()
+              updateTrayUsage()
             }
-            
+
             // Schedule next renewal
             setTimeout(() => scheduleNextRenewal(), 2000) // Brief delay before rescheduling
           } catch (error) {
@@ -431,22 +991,25 @@ const scheduleNextRenewal = () => {
         }, 1000)
       }
     } else {
-      // No valid target time - use fallback polling
-      renewalLogger.info(`No specific renewal time available, using fallback check in ${RENEWAL_CONFIG.fallbackCheckInterval / 60000} minutes`, 'schedule')
-      renewalTimer = setTimeout(() => {
-        try {
-          const currentStatus = getRenewalStatus()
-          if (currentStatus.enabled && currentStatus.running) {
+      // No valid target time - only use emergency fallback if system is in unknown state
+      const currentStatus = getRenewalStatus()
+      if (!currentStatus.currentBlock && currentStatus.enabled && currentStatus.running) {
+        renewalLogger.warn(`No current block detected and no renewal time available, using emergency fallback check in ${RENEWAL_CONFIG.fallbackCheckInterval / 60000} minutes`, 'schedule')
+        renewalTimer = setTimeout(() => {
+          try {
             performRenewalCheck()
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
             }
+            scheduleNextRenewal() // Reschedule once to see if we now have valid timing
+          } catch (error) {
+            renewalLogger.error(`Error in emergency fallback renewal check: ${error instanceof Error ? error.message : String(error)}`, 'renewal')
           }
-        } catch (error) {
-          renewalLogger.error(`Error in fallback renewal check: ${error instanceof Error ? error.message : String(error)}`, 'renewal')
-        }
-        scheduleNextRenewal() // Reschedule
-      }, RENEWAL_CONFIG.fallbackCheckInterval)
+        }, RENEWAL_CONFIG.fallbackCheckInterval)
+      } else {
+        renewalLogger.info(`No specific renewal time available but system appears stable - waiting for next status change`, 'schedule')
+        // Do not schedule any fallback - wait for external triggers or schedule changes
+      }
     }
   } catch (error) {
     renewalLogger.error(`Error scheduling next renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
@@ -467,18 +1030,89 @@ const startRenewalMonitoring = () => {
 }
 
 const stopRenewalMonitoring = () => {
+  // Kill ALL timers immediately when auto-renewal is turned off
   if (renewalTimer) {
     clearTimeout(renewalTimer)
     renewalTimer = null
   }
-  renewalLogger.info('Renewal monitoring stopped', 'service')
+  if (scheduledRenewalTimer) {
+    clearTimeout(scheduledRenewalTimer)
+    scheduledRenewalTimer = null
+  }
+  renewalLogger.info('🛑 Renewal monitoring stopped - ALL timers cleared (including scheduled)', 'service')
+}
+
+// Force stop all timers (used when clearing scheduled time)
+const forceStopAllTimers = () => {
+  if (renewalTimer) {
+    clearTimeout(renewalTimer)
+    renewalTimer = null
+  }
+  if (scheduledRenewalTimer) {
+    clearTimeout(scheduledRenewalTimer)
+    scheduledRenewalTimer = null
+  }
+  renewalLogger.info('🛑 ALL timers force-stopped', 'service')
 }
 
 const updateTrayMenu = () => {
   if (!tray) return
-  
+
   const status = getRenewalStatus()
+  const block = getCurrentBlockInfo()
+  const percent = block && block.limit > 0 ? Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100))) : null
+  const usageLine = percent === null ? 'Usage: unknown' : `Usage: ${percent}% (${formatTokens(block.usage)} / ${formatTokens(block.limit)})`
+  const timeLine = `Time remaining: ${formatMinutes(block?.timeRemaining ?? null)}`
+
+  // Get next session time
+  let nextSessionLine = null
+  if (status.enabled && status.nextRenewal) {
+    const nextRenewalTime = new Date(status.nextRenewal)
+    const now = new Date()
+    const isToday = nextRenewalTime.toDateString() === now.toDateString()
+    const isTomorrow = nextRenewalTime.toDateString() === new Date(now.getTime() + 24*60*60*1000).toDateString()
+
+    const timeOptions: Intl.DateTimeFormatOptions = {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true
+    }
+
+    if (isToday) {
+      nextSessionLine = `Next session: Today at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
+    } else if (isTomorrow) {
+      nextSessionLine = `Next session: Tomorrow at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
+    } else {
+      const dateOptions: Intl.DateTimeFormatOptions = {
+        month: 'short',
+        day: 'numeric'
+      }
+      nextSessionLine = `Next session: ${nextRenewalTime.toLocaleDateString('en-US', dateOptions)} at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
+    }
+  }
+
+  const menuItems = [
+    {
+      label: usageLine,
+      enabled: false
+    },
+    {
+      label: timeLine,
+      enabled: false
+    }
+  ]
+
+  // Add next session line if available
+  if (nextSessionLine) {
+    menuItems.push({
+      label: nextSessionLine,
+      enabled: false
+    })
+  }
+
   const contextMenu = Menu.buildFromTemplate([
+    ...menuItems,
+    { type: 'separator' },
     {
       label: 'Show Claude Sentinel',
       click: () => {
@@ -486,6 +1120,10 @@ const updateTrayMenu = () => {
           if (mainWindow.isMinimized()) mainWindow.restore()
           mainWindow.show()
           mainWindow.focus()
+          // Show dock icon when showing window on macOS
+          if (process.platform === 'darwin') {
+            try { if (app.dock) app.dock.show() } catch {}
+          }
         } else {
           createWindow()
         }
@@ -656,16 +1294,37 @@ ipcMain.handle('set-scheduled-start-time', async (_, isoTime: string | null) => 
   }
 })
 
-ipcMain.handle('minimize-to-tray', () => {
+ipcMain.handle('minimize-to-tray', async () => {
   if (mainWindow) {
+    // Load user settings to check minimize behavior preference
+    const settingsFile = getSettingsFilePath()
+    let userSettings = getDefaultSettings()
+    
+    if (fs.existsSync(settingsFile)) {
+      try {
+        const fileContent = fs.readFileSync(settingsFile, 'utf8')
+        const savedSettings = JSON.parse(fileContent)
+        userSettings = { ...userSettings, ...savedSettings }
+      } catch (parseError) {
+        console.warn('Could not parse settings file, using defaults for minimize behavior')
+      }
+    }
+    
     if (process.platform === 'darwin') {
-      // Minimize (keeps Dock icon), floating window will be created by the 'minimize' handler
-      try { if (app.dock) app.dock.show() } catch {}
+      // On macOS, hide dock icon when minimized and minimize
+      try { if (app.dock) app.dock.hide() } catch {}
       mainWindow.minimize()
     } else {
-      // Hide to system tray on Windows/Linux
-      mainWindow.hide()
-      createFloatingWindow()
+      // On Windows/Linux, respect user preference
+      if (userSettings.minimizeToTray) {
+        mainWindow.hide()
+      } else {
+        mainWindow.minimize()
+      }
+      
+      if (userSettings.minimizeBehavior === 'floating') {
+        createFloatingWindow()
+      }
     }
   }
 })
@@ -701,10 +1360,59 @@ ipcMain.handle('refresh-usage-data', async () => {
     if (floatingWindow && !floatingWindow.isDestroyed()) {
       floatingWindow.webContents.send('usage-update', data)
     }
+    // Update tray usage immediately
+    updateTrayUsage()
     return data
   } catch (error) {
     console.error('Error refreshing usage data:', error)
     throw error
+  }
+})
+
+// Force reset usage cache and perform a fresh usage read (hard refresh)
+ipcMain.handle('hard-refresh-usage-data', async () => {
+  try {
+    // Reset analysis/cache so next read hits disk
+    resetUsageCache()
+
+    // Small delay to allow filesystem writes to settle when called after imports
+    await new Promise((r) => setTimeout(r, 200))
+
+    const recentData = getRecentUsage(30)
+    const blockInfo = getCurrentBlockInfo()
+
+    const data = {
+      daily: recentData.daily.map(day => ({
+        date: day.date,
+        inputTokens: day.inputTokens,
+        outputTokens: day.outputTokens,
+        totalTokens: day.totalTokens,
+        cost: day.cost,
+        model: 'mixed',
+        sessionsCount: Array.from(day.sessions).length
+      })),
+      summary: {
+        totalCost: recentData.totalCost,
+        totalTokens: recentData.totalTokens,
+        totalSessions: recentData.totalSessions,
+        averageTokensPerSession: recentData.totalSessions > 0 ?
+          recentData.totalTokens / recentData.totalSessions : 0
+      },
+      currentBlock: blockInfo
+    }
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('usage-update', data)
+    }
+    if (floatingWindow && !floatingWindow.isDestroyed()) {
+      floatingWindow.webContents.send('usage-update', data)
+    }
+    // Update tray usage immediately
+    updateTrayUsage()
+    return data
+  } catch (error) {
+    console.error('Error performing hard refresh:', error)
+    return { success: false }
   }
 })
 
@@ -723,6 +1431,7 @@ ipcMain.handle('perform-renewal-check', async () => {
         // Update tray menu if needed
         if (result.success && result.action && tray) {
           updateTrayMenu()
+          updateTrayUsage()
         }
         
         // Reschedule next renewal after manual check (in case block state changed)
@@ -939,9 +1648,18 @@ ipcMain.handle('export-claude-usage-logs', async (_, fromDate?: string, toDate?:
     if (existing.length === 0) {
       return { success: false, error: 'No Claude data directories found' }
     }
-    // Parse date range
-    const fromTime = fromDate ? new Date(fromDate).getTime() : 0
-    const toTime = toDate ? new Date(toDate).getTime() + 24 * 60 * 60 * 1000 : Date.now() // Include end of day
+    // Parse date range using local calendar day boundaries to avoid TZ off-by-one
+    const parseLocalDayStart = (dateStr: string) => {
+      const [y, m, d] = dateStr.split('-').map((n: string) => parseInt(n, 10))
+      return new Date(y, m - 1, d, 0, 0, 0, 0).getTime()
+    }
+    const parseLocalDayEnd = (dateStr: string) => {
+      const [y, m, d] = dateStr.split('-').map((n: string) => parseInt(n, 10))
+      return new Date(y, m - 1, d, 23, 59, 59, 999).getTime()
+    }
+
+    const fromTime = fromDate ? parseLocalDayStart(fromDate) : 0
+    const toTime = toDate ? parseLocalDayEnd(toDate) : Date.now()
     
     // Collect .jsonl files
     const files: string[] = []
@@ -1060,72 +1778,126 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
     const zipPath = openResult.filePaths[0]
     console.log('Importing from ZIP:', zipPath)
     
-    const zip = new AdmZip(zipPath)
-    const entries = zip.getEntries()
-    console.log('ZIP entries found:', entries.length)
+    let zip: any
+    let entries: any[]
     
-    if (!entries.length) return { success: false, error: 'Empty archive' }
+    try {
+      zip = new AdmZip(zipPath)
+      entries = zip.getEntries()
+      console.log(`[Import] ZIP entries found: ${entries.length}`)
+      
+      if (!entries.length) {
+        return { success: false, error: 'Empty archive - no files found in ZIP' }
+      }
+    } catch (error) {
+      console.error(`[Import] Failed to read ZIP file: ${zipPath}`, error)
+      return { success: false, error: `Invalid ZIP file: ${error instanceof Error ? error.message : 'Unknown error'}` }
+    }
+    
+    // Validate that we have some JSONL files
+    const jsonlEntries = entries.filter((entry: any) => !entry.isDirectory && entry.entryName.endsWith('.jsonl'))
+    if (jsonlEntries.length === 0) {
+      return { success: false, error: 'No .jsonl files found in archive. Please ensure you exported Claude usage logs.' }
+    }
+    
+    console.log(`[Import] Found ${jsonlEntries.length} JSONL files out of ${entries.length} total entries`)
     
     // Log entry names for debugging
-  entries.forEach((entry: any) => {
-      console.log('Entry:', entry.entryName, 'isDirectory:', entry.isDirectory)
+    entries.forEach((entry: any) => {
+      console.log(`[Import] Entry: ${entry.entryName} (directory: ${entry.isDirectory})`)
     })
 
-    // Helper function to get existing session IDs from a JSONL file
-    const getExistingSessionIds = (filePath: string): Set<string> => {
-      const sessionIds = new Set<string>()
-      if (!fs.existsSync(filePath)) return sessionIds
+    // Helper function to get existing message IDs from a JSONL file (for proper deduplication)
+    const getExistingMessageIds = (filePath: string): Set<string> => {
+      const messageIds = new Set<string>()
+      if (!fs.existsSync(filePath)) return messageIds
       
       try {
         const content = fs.readFileSync(filePath, 'utf8')
-  const lines = content.trim().split('\n').filter((line: string) => line.trim())
+        const lines = content.trim().split('\n').filter((line: string) => line.trim())
+        
+        console.log(`[Import] Checking existing messages in ${path.basename(filePath)} (${lines.length} lines)`)
         
         for (const line of lines) {
           try {
             const entry = JSON.parse(line)
-            if (entry.sessionId) {
-              sessionIds.add(entry.sessionId)
+            // Use multiple possible message ID fields for robustness
+            const messageId = entry.message?.id || entry.messageId || entry.uuid
+            if (messageId) {
+              messageIds.add(messageId)
             }
           } catch (e) {
             // Skip invalid JSON lines
           }
         }
+        
+        console.log(`[Import] Found ${messageIds.size} existing message IDs in ${path.basename(filePath)}`)
       } catch (e) {
-        console.warn(`Could not read existing sessions from ${filePath}:`, e)
+        console.warn(`[Import] Could not read existing messages from ${filePath}:`, e)
       }
       
-      return sessionIds
+      return messageIds
     }
 
-    // Helper function to normalize project names
-    const normalizeProjectName = (rawName: string): string => {
-      // Remove common path prefixes and clean up the name
-      let cleaned = rawName
+    // Helper function to detect current machine's path pattern
+    const getCurrentMachinePattern = (): string => {
+      try {
+        const existingProjects = fs.readdirSync(targetBase)
+        console.log(`[Import] Existing projects on this machine:`, existingProjects.slice(0, 3))
+        
+        // Look for pattern like "-Users-currentuser-"
+        const userPatterns = existingProjects
+          .filter((name: string) => name.startsWith('-Users-'))
+          .map((name: string) => {
+            const match = name.match(/^(-Users-[^-]+-)/)
+            return match ? match[1] : null
+          })
+          .filter((pattern): pattern is string => Boolean(pattern))
+        
+        if (userPatterns.length > 0) {
+          const currentPattern = userPatterns[0]
+          console.log(`[Import] Detected current machine pattern: "${currentPattern}"`)
+          return currentPattern
+        }
+        
+        // Fallback: create pattern from current user
+        const currentUser = os.userInfo().username
+        const fallbackPattern = `-Users-${currentUser}-`
+        console.log(`[Import] No existing pattern found, using fallback: "${fallbackPattern}"`)
+        return fallbackPattern
+      } catch (error) {
+        // Ultimate fallback
+        const currentUser = os.userInfo().username
+        const fallbackPattern = `-Users-${currentUser}-`
+        console.log(`[Import] Error detecting pattern, using fallback: "${fallbackPattern}"`)
+        return fallbackPattern
+      }
+    }
+
+    // Helper function to map imported project name to current machine
+    const mapProjectNameToCurrentMachine = (importedName: string): string => {
+      console.log(`[Import] Mapping project name: "${importedName}"`)
       
-      // Remove user home directory patterns
-      cleaned = cleaned.replace(/^-?Users-[^-]+-?/i, '')
-      
-      // Remove common directory patterns
-      cleaned = cleaned.replace(/^(Documents|Downloads|Desktop|Library|Mobile-Documents)-?/i, '')
-      
-      // Remove iCloud path patterns
-      cleaned = cleaned.replace(/com-apple-CloudDocs-?/i, '')
-      
-      // Extract the actual project name (usually the last meaningful part)
-      const segments = cleaned.split('-').filter(Boolean)
-      if (segments.length > 0) {
-        // Take the last 1-2 segments as the project name
-        const meaningfulSegments = segments.slice(-2)
-        cleaned = meaningfulSegments.join('-')
+      // If it doesn't look like a path-based name, keep it as-is
+      if (!importedName.includes('-Users-')) {
+        console.log(`[Import] Not a path-based name, keeping as-is: "${importedName}"`)
+        return importedName
       }
       
-      // Final cleanup
-      cleaned = cleaned
-        .replace(/[^a-zA-Z0-9-_.]/g, '-')
-        .replace(/^-+|-+$/g, '')
-        .toLowerCase()
+      // Extract the non-user part of the path
+      const match = importedName.match(/^-Users-[^-]+-(.+)$/)
+      if (match) {
+        const pathSuffix = match[1]
+        const currentMachinePattern = getCurrentMachinePattern()
+        const mappedName = currentMachinePattern + pathSuffix
+        
+        console.log(`[Import] Mapped: "${importedName}" -> "${mappedName}"`)
+        return mappedName
+      }
       
-      return cleaned || 'imported-project'
+      // If pattern doesn't match expected format, keep original
+      console.log(`[Import] Couldn't parse path pattern, keeping original: "${importedName}"`)
+      return importedName
     }
 
     // Only clear existing data if not in merge mode
@@ -1167,32 +1939,37 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
         continue
       }
       
-      console.log('Processing JSONL file:', entry.entryName)
+      console.log(`[Import] Processing JSONL file: ${entry.entryName}`)
       
-      // entry.entryName should be like projectName/file.jsonl
-      const segments = entry.entryName.split(/\\|\//).filter(Boolean)
+      // entry.entryName should be like projectName/file.jsonl or nested paths
+      const segments = entry.entryName.split(/[\\\/]+/).filter(Boolean)
       let projectName: string
       let fileName: string
       
-      console.log('Entry segments:', segments)
+      console.log(`[Import] Entry segments:`, segments)
       
       if (segments.length === 1) {
         // File at root level - create a generic project
         projectName = 'imported-project'
         fileName = segments[0]
+        console.log(`[Import] Root level file detected, using generic project`)
       } else if (segments.length >= 2) {
-        // Normal case: projectName/file.jsonl
+        // Normal case: projectName/file.jsonl or nested structure
         fileName = segments[segments.length - 1]
         
-        // Use normalized project name
-        const rawProjectName = segments[0]
-        projectName = normalizeProjectName(rawProjectName)
+        // Extract the original project name (preserve the full path-based name)
+        let rawProjectName = segments[0]
         
-        console.log(`Raw project name: "${rawProjectName}" -> normalized: "${projectName}"`)
+        // If we have nested segments, the first one should be the project directory name
+        // This preserves the original Claude naming like "-Users-john-Documents-MyProject"
+        projectName = mapProjectNameToCurrentMachine(rawProjectName)
+        
+        console.log(`[Import] Preserved and mapped project: "${rawProjectName}" -> "${projectName}" from path: ${entry.entryName}`)
       } else {
         // Fallback
         projectName = 'imported-project'
         fileName = entry.entryName
+        console.log(`[Import] Fallback case for entry: ${entry.entryName}`)
       }
       
       const projectDir = path.join(importRoot, projectName)
@@ -1202,57 +1979,100 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
       console.log('Creating project directory:', projectDir)
       console.log('Writing file to:', destPath)
       
-      // Handle merge mode with session deduplication
+      // Handle merge mode with message deduplication (enables cross-computer session continuity)
       if (mergeMode && skipDuplicates && fs.existsSync(destPath)) {
-        console.log(`File already exists: ${destPath}`)
+        console.log(`[Import] File already exists: ${destPath}`)
         
-        // Get existing session IDs from the target file
-        const existingSessionIds = getExistingSessionIds(destPath)
-        console.log(`Found ${existingSessionIds.size} existing sessions in target file`)
+        // Get existing message IDs from the target file (not session IDs)
+        const existingMessageIds = getExistingMessageIds(destPath)
+        console.log(`[Import] Found ${existingMessageIds.size} existing messages in target file`)
         
-        if (existingSessionIds.size > 0) {
-          // Parse the new content and filter out duplicate sessions
+        if (existingMessageIds.size > 0) {
+          // Parse the new content and filter out duplicate messages
           const newContent = entry.getData().toString('utf8')
           const newLines = newContent.trim().split('\n').filter((line: string) => line.trim())
           const uniqueNewLines: string[] = []
+          let skippedDuplicates = 0
           
           for (const line of newLines) {
             try {
               const parsed = JSON.parse(line)
-              if (!parsed.sessionId || !existingSessionIds.has(parsed.sessionId)) {
+              // Check for duplicate messages, not sessions (enables session continuity)
+              const messageId = parsed.message?.id || parsed.messageId || parsed.uuid
+              
+              if (!messageId || !existingMessageIds.has(messageId)) {
                 uniqueNewLines.push(line)
               } else {
-                console.log(`Skipping duplicate session: ${parsed.sessionId}`)
+                skippedDuplicates++
+                console.log(`[Import] Skipping duplicate message: ${messageId}`)
               }
             } catch (e) {
               // Include lines that can't be parsed (might be valid JSONL)
               uniqueNewLines.push(line)
+              console.warn(`[Import] Could not parse line, including anyway: ${e}`)
             }
           }
           
           if (uniqueNewLines.length > 0) {
-            // Append only new sessions to existing file
+            // Append only new messages to existing file
             const newContentToAppend = uniqueNewLines.join('\n') + '\n'
             fs.appendFileSync(destPath, newContentToAppend)
-            console.log(`Appended ${uniqueNewLines.length} new sessions to existing file`)
+            console.log(`[Import] Appended ${uniqueNewLines.length} new messages to existing file (skipped ${skippedDuplicates} duplicates)`)
           } else {
-            console.log('No new sessions to add - all were duplicates')
+            console.log(`[Import] No new messages to add - all ${skippedDuplicates} were duplicates`)
           }
           
           importedFiles++
         } else {
-          // No existing sessions, just append the new content
+          // No existing messages, just append the new content
           fs.appendFileSync(destPath, entry.getData())
+          console.log(`[Import] No existing messages found, appending all content`)
           importedFiles++
         }
       } else {
         // Create directory and write file (original behavior or replace mode)
-        fs.mkdirSync(projectDir, { recursive: true })
-        fs.writeFileSync(destPath, entry.getData())
-        importedFiles++
+        try {
+          fs.mkdirSync(projectDir, { recursive: true })
+          
+          // Validate JSONL content before writing
+          const content = entry.getData().toString('utf8')
+          const lines = content.trim().split('\n').filter((line: string) => line.trim())
+          let validLines = 0
+          let invalidLines = 0
+          
+          for (const line of lines) {
+            try {
+              const parsed = JSON.parse(line)
+              // Basic validation - ensure it has required fields
+              if (parsed.timestamp && (parsed.message || parsed.type)) {
+                validLines++
+              } else {
+                invalidLines++
+                console.warn(`[Import] Line missing required fields: ${line.substring(0, 100)}...`)
+              }
+            } catch (e) {
+              invalidLines++
+              console.warn(`[Import] Invalid JSON line: ${line.substring(0, 100)}...`)
+            }
+          }
+          
+          if (validLines === 0) {
+            console.error(`[Import] No valid entries found in ${fileName}`)
+            // Skip this file but continue with others
+            continue
+          }
+          
+          fs.writeFileSync(destPath, content)
+          console.log(`[Import] Wrote ${fileName}: ${validLines} valid entries, ${invalidLines} invalid entries`)
+          importedFiles++
+        } catch (writeError) {
+          console.error(`[Import] Failed to write file ${destPath}:`, writeError)
+          // Continue with other files
+          continue
+        }
       }
       
-      console.log(`Processed file ${importedFiles}/${totalFiles}: ${fileName}`)
+      console.log(`[Import] Processed file ${importedFiles}/${totalFiles}: ${fileName}`)
       
       // Send progress update
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -1312,7 +2132,13 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
       }
     }
 
-    return { success: true, importedFiles, importRoot: targetBase }
+    console.log(`[Import] Import completed successfully: ${importedFiles} files imported to ${targetBase}`)
+    return { 
+      success: true, 
+      importedFiles, 
+      importRoot: targetBase,
+      message: `Successfully imported ${importedFiles} files. Sessions can now be continued across computers.`
+    }
   } catch (error) {
     console.error('Failed to import Claude usage logs:', error)
     // Send error progress update
@@ -1329,32 +2155,76 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
 })
 
 // Settings management
+const getSettingsFilePath = () => path.join(os.homedir(), '.claude-sentinel-settings.json')
+
+const getDefaultSettings = () => ({
+  autoStart: false,
+  minimizeToTray: true,
+  minimizeBehavior: 'floating', // 'floating' or 'tray'
+  notifications: true,
+  refreshInterval: 5,
+  theme: 'system',
+  dataPath: '',
+  claudePlan: 'auto',
+  autoRenewal: {
+    enabled: false,
+    checkInterval: 5,
+    enableLogging: true,
+    notifyOnRenewal: true,
+    waitTimeBeforeSession: 60
+  }
+})
+
 ipcMain.handle('get-settings', async () => {
   try {
-    // Return default settings for now - could be enhanced to load from storage
-    return {
-      autoStart: false,
-      minimizeToTray: true,
-      notifications: true,
-      refreshInterval: 5,
-      theme: 'system',
-      dataPath: '',
-      autoRenewal: {
-        enabled: false,
-        checkInterval: 5,
-        enableLogging: true,
-        notifyOnRenewal: true
+    const settingsFile = getSettingsFilePath()
+    
+    // Load settings from file if it exists
+    if (fs.existsSync(settingsFile)) {
+      try {
+        const fileContent = fs.readFileSync(settingsFile, 'utf8')
+        const savedSettings = JSON.parse(fileContent)
+        
+        // Merge with defaults to ensure all properties exist
+        const defaultSettings = getDefaultSettings()
+        const mergedSettings = {
+          ...defaultSettings,
+          ...savedSettings,
+          autoRenewal: {
+            ...defaultSettings.autoRenewal,
+            ...(savedSettings.autoRenewal || {})
+          }
+        }
+        
+        return mergedSettings
+      } catch (parseError) {
+        console.warn('Could not parse settings file, using defaults:', parseError)
+        return getDefaultSettings()
       }
     }
+    
+    // Return default settings if file doesn't exist
+    return getDefaultSettings()
   } catch (error) {
     console.error('Error getting settings:', error)
-    return {}
+    return getDefaultSettings()
   }
 })
 
 ipcMain.handle('save-settings', async (_, settings: any) => {
   try {
-    // Save renewal settings to the config file that the backend reads from
+    // Save all settings to the main settings file
+    const settingsFile = getSettingsFilePath()
+    
+    try {
+      fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2))
+      console.log('Settings saved to:', settingsFile)
+    } catch (writeError) {
+      console.error('Error writing settings file:', writeError)
+      return { success: false, error: 'Failed to write settings file' }
+    }
+    
+    // Also save renewal settings to the config file that the backend reads from
     if (settings.autoRenewal) {
       const configFile = path.join(os.homedir(), '.claude-sentinel-config.json')
       let currentConfig: any = { enabled: false }
@@ -1371,6 +2241,7 @@ ipcMain.handle('save-settings', async (_, settings: any) => {
       currentConfig.checkInterval = settings.autoRenewal.checkInterval
       currentConfig.enableLogging = settings.autoRenewal.enableLogging
       currentConfig.notifyOnRenewal = settings.autoRenewal.notifyOnRenewal
+      currentConfig.waitTimeBeforeSession = settings.autoRenewal.waitTimeBeforeSession
       
       // Preserve the enabled state
       if (currentConfig.enabled === undefined) {
@@ -1684,6 +2555,11 @@ ipcMain.handle('show-main-window', async () => {
       }
       mainWindow.show()
       mainWindow.focus()
+      
+      // Show dock icon when main window is shown on macOS
+      if (process.platform === 'darwin') {
+        try { if (app.dock) app.dock.show() } catch {}
+      }
       
       // Hide floating window when showing main window
       if (floatingWindow && !floatingWindow.isDestroyed()) {

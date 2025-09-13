@@ -59,7 +59,10 @@ export function DatePicker({ value, onChange, minDate, className }: DatePickerPr
 
   const isDateDisabled = (date: Date) => {
     if (!minDate) return false
-    return date < minDate
+    // Compare only the date part, not time
+    const dateOnly = new Date(date.getFullYear(), date.getMonth(), date.getDate())
+    const minDateOnly = new Date(minDate.getFullYear(), minDate.getMonth(), minDate.getDate())
+    return dateOnly < minDateOnly
   }
 
   const handleDateSelect = (day: number) => {
@@ -151,7 +154,7 @@ export function DatePicker({ value, onChange, minDate, className }: DatePickerPr
       </Button>
 
       {isOpen && (
-        <div className="absolute top-full left-0 z-50 mt-2 w-80 bg-white/10 dark:bg-black/10 backdrop-blur-xl border border-white/20 dark:border-white/10 rounded-xl shadow-2xl shadow-black/25">
+        <div className="absolute top-1/2 -translate-y-1/2 left-full z-50 ml-2 w-80 bg-white/10 dark:bg-black/10 backdrop-blur-xl border border-white/20 dark:border-white/10 rounded-xl shadow-2xl shadow-black/25">
           <div className="p-4">
             {/* Calendar Header */}
             <div className="flex items-center justify-between mb-4">

@@ -8,6 +8,7 @@ const electronAPI = {
   
   // Usage data
   getUsageData: () => ipcRenderer.invoke('get-usage-data'),
+  hardRefreshUsageData: () => ipcRenderer.invoke('hard-refresh-usage-data'),
   
   // Auto-renewal
   getRenewalStatus: () => ipcRenderer.invoke('get-renewal-status'),

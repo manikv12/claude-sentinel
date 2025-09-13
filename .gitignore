@@ -10,6 +10,21 @@ build/
 *.tgz
 *.tar.gz
 
+# TypeScript build artifacts (but keep config files)
+/src/**/*.js
+/src/**/*.d.ts
+/electron/**/*.js
+/electron/**/*.d.ts
+*.js.map
+*.d.ts.map
+*.tsbuildinfo
+
+# Keep essential config files
+!vite.config.js
+!tailwind.config.js
+!postcss.config.js
+!create-icons.js
+
 # Environment variables
 .env
 .env.local

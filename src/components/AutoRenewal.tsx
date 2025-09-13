@@ -178,20 +178,48 @@ export function AutoRenewal() {
     return () => clearInterval(interval)
   }, [settings.autoRefresh, settings.autoRefreshInterval, refreshStatus])
 
+  const [showModeSelection, setShowModeSelection] = useState(false)
+  const [selectedMode, setSelectedMode] = useState<'immediate' | 'scheduled'>('immediate')
+
   const handleToggleRenewal = async () => {
     try {
-      let scheduledStartTime: string | undefined = undefined
-      
-      if (scheduledTime && scheduledTime.trim() !== '') {
-        const date = new Date(scheduledTime)
-        if (!isNaN(date.getTime())) {
-          scheduledStartTime = date.toISOString()
-        }
+      if (!status.enabled) {
+        // If turning ON, show mode selection first
+        setShowModeSelection(true)
+        return
       }
-      
-      await toggleAutoRenewal(!status.enabled, scheduledStartTime)
+
+      // If turning OFF, just disable
+      await toggleAutoRenewal(false)
     } catch (error) {
       console.error('Failed to toggle auto-renewal:', error)
+    }
+  }
+
+  const handleConfirmModeSelection = async () => {
+    try {
+      let scheduledStartTime: string | undefined = undefined
+
+      if (selectedMode === 'scheduled') {
+        if (scheduledTime && scheduledTime.trim() !== '') {
+          const date = new Date(scheduledTime)
+          if (!isNaN(date.getTime())) {
+            scheduledStartTime = date.toISOString()
+          }
+        } else {
+          // Set default time to 1 hour from now if no time is set
+          const defaultTime = new Date()
+          defaultTime.setHours(defaultTime.getHours() + 1, 0, 0, 0)
+          const timeString = defaultTime.toISOString().slice(0, 16)
+          setScheduledTime(timeString)
+          scheduledStartTime = defaultTime.toISOString()
+        }
+      }
+
+      await toggleAutoRenewal(true, scheduledStartTime)
+      setShowModeSelection(false)
+    } catch (error) {
+      console.error('Failed to enable auto-renewal:', error)
     }
   }
 
@@ -307,6 +335,123 @@ export function AutoRenewal() {
 
   return (
     <div className="space-y-6">
+      {/* Mode Selection Dialog */}
+      <Dialog open={showModeSelection} onOpenChange={setShowModeSelection}>
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center space-x-2">
+              <Power className="h-5 w-5 text-green-500" />
+              <span>Enable Auto-Renewal</span>
+            </DialogTitle>
+            <DialogDescription>
+              Choose when you want auto-renewal to start monitoring and renewing your Claude sessions.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4 py-4">
+            {/* Immediate Option */}
+            <div
+              className={`p-4 border rounded-lg cursor-pointer transition-colors ${
+                selectedMode === 'immediate'
+                  ? 'border-primary bg-primary/5'
+                  : 'border-border hover:bg-secondary/50'
+              }`}
+              onClick={() => setSelectedMode('immediate')}
+            >
+              <div className="flex items-center space-x-3">
+                <input
+                  type="radio"
+                  name="renewalMode"
+                  checked={selectedMode === 'immediate'}
+                  onChange={() => setSelectedMode('immediate')}
+                  className="w-4 h-4 text-primary"
+                />
+                <div className="flex-1">
+                  <div className="flex items-center space-x-2 mb-1">
+                    <Zap className="h-4 w-4 text-green-500" />
+                    <span className="font-medium">Start Immediately</span>
+                  </div>
+                  <p className="text-sm text-muted-foreground">
+                    Begin monitoring and auto-renewal right away
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Scheduled Option */}
+            <div
+              className={`p-4 border rounded-lg cursor-pointer transition-colors ${
+                selectedMode === 'scheduled'
+                  ? 'border-primary bg-primary/5'
+                  : 'border-border hover:bg-secondary/50'
+              }`}
+              onClick={() => setSelectedMode('scheduled')}
+            >
+              <div className="flex items-center space-x-3">
+                <input
+                  type="radio"
+                  name="renewalMode"
+                  checked={selectedMode === 'scheduled'}
+                  onChange={() => setSelectedMode('scheduled')}
+                  className="w-4 h-4 text-primary"
+                />
+                <div className="flex-1">
+                  <div className="flex items-center space-x-2 mb-1">
+                    <Timer className="h-4 w-4 text-blue-500" />
+                    <span className="font-medium">Schedule for Later</span>
+                  </div>
+                  <p className="text-sm text-muted-foreground">
+                    Choose a specific date and time to begin auto-renewal
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Date/Time Picker for Scheduled Mode */}
+            {selectedMode === 'scheduled' && (
+              <div className="space-y-3 border-l-2 border-primary/20 pl-4 ml-4">
+                <label className="text-sm font-medium">Select start date and time:</label>
+                <div className="relative overflow-visible">
+                  <DatePicker
+                    value={scheduledTime}
+                    onChange={setScheduledTime}
+                    minDate={new Date()}
+                    className="w-full"
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="flex space-x-3 pt-4">
+            <Button
+              variant="outline"
+              onClick={() => setShowModeSelection(false)}
+              className="flex-1"
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={handleConfirmModeSelection}
+              disabled={isLoading}
+              className="flex-1"
+            >
+              {isLoading ? (
+                <>
+                  <RefreshCw className="h-4 w-4 mr-2 animate-spin" />
+                  Enabling...
+                </>
+              ) : (
+                <>
+                  <CheckCircle className="h-4 w-4 mr-2" />
+                  Enable Auto-Renewal
+                </>
+              )}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
@@ -608,9 +753,9 @@ export function AutoRenewal() {
           <CardContent className="space-y-4">
             <div className="flex items-center justify-between">
               <div>
-                <label className="text-sm font-medium">Check Interval</label>
+                <label className="text-sm font-medium">Smart Checking</label>
                 <p className="text-xs text-muted-foreground">
-                  How often to check for renewal (minutes)
+                  Only check when session is close to expiring
                 </p>
               </div>
               <select
@@ -620,37 +765,13 @@ export function AutoRenewal() {
                 })}
                 className="px-3 py-1 border rounded-md text-sm bg-background focus:outline-none focus:ring-2 focus:ring-primary"
               >
-                <option value={1}>1 min</option>
-                <option value={2}>2 min</option>
-                <option value={5}>5 min</option>
-                <option value={10}>10 min</option>
+                <option value={5}>Smart Mode</option>
+                <option value={1}>Every 1 min</option>
+                <option value={2}>Every 2 min</option>
+                <option value={10}>Every 10 min</option>
               </select>
             </div>
 
-            <div className="p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700 rounded-lg">
-              <div className="flex items-center space-x-2 mb-1">
-                <Timer className="h-4 w-4 text-blue-600" />
-                <span className="text-sm font-semibold text-blue-800 dark:text-blue-200">
-                  Random Session Delay
-                </span>
-              </div>
-              <p className="text-xs text-blue-800 dark:text-blue-200">
-                All renewals use a random 1-5 minute delay before starting new Claude sessions to ensure natural timing and prevent conflicts.
-              </p>
-            </div>
-
-            <div className="flex items-center justify-between">
-              <div>
-                <label className="text-sm font-medium">Enable Logging</label>
-                <p className="text-xs text-muted-foreground">
-                  Detailed activity logs
-                </p>
-              </div>
-              <Switch
-                checked={settings.enableLogging}
-                onCheckedChange={(v) => updateSettings({ enableLogging: v })}
-              />
-            </div>
 
             <div className="flex items-center justify-between">
               <div>
@@ -664,355 +785,11 @@ export function AutoRenewal() {
                 onCheckedChange={(v) => updateSettings({ notifyOnRenewal: v })}
               />
             </div>
-
-            <div className="border-t pt-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <label className="text-sm font-medium">Auto-Refresh</label>
-                  <p className="text-xs text-muted-foreground">
-                    Automatically update status
-                  </p>
-                </div>
-                <Switch
-                  checked={settings.autoRefresh}
-                  onCheckedChange={(v) => updateSettings({ autoRefresh: v })}
-                />
-              </div>
-
-              {settings.autoRefresh && (
-                <div className="flex items-center justify-between mt-3">
-                  <div>
-                    <label className="text-sm font-medium">Refresh Interval</label>
-                    <p className="text-xs text-muted-foreground">
-                      How often to update (seconds)
-                    </p>
-                  </div>
-                  <select
-                    value={settings.autoRefreshInterval}
-                    onChange={(e) => updateSettings({
-                      autoRefreshInterval: parseInt(e.target.value)
-                    })}
-                    className="px-3 py-1 border rounded-md text-sm bg-background focus:outline-none focus:ring-2 focus:ring-primary"
-                  >
-                    <option value={10}>10s</option>
-                    <option value={30}>30s</option>
-                    <option value={60}>1m</option>
-                    <option value={120}>2m</option>
-                    <option value={300}>5m</option>
-                  </select>
-                </div>
-              )}
-            </div>
           </CardContent>
         </Card>
       </div>
 
-      {/* Session Management */}
-      <Card className="glass-card border-orange-200 dark:border-orange-800">
-          <CardHeader>
-            <CardTitle className="flex items-center space-x-2">
-              <UserCheck className="h-5 w-5 text-orange-600" />
-              <span>Session Management</span>
-            </CardTitle>
-            <CardDescription>
-              Manage Claude session tracking and handle orphaned sessions
-            </CardDescription>
-          </CardHeader>
-        <CardContent className="space-y-4">
-          {/* Session Status */}
-          <div className="p-4 border rounded-lg bg-secondary/20">
-            {sessionStatus ? (
-              <div className="grid gap-3">
-                <div className="flex items-center justify-between">
-                  <span className="text-sm font-medium">Local Activity Tracked</span>
-                  <span className={`text-sm font-semibold ${sessionStatus.hasLocalActivity ? 'text-green-600' : 'text-gray-500'}`}>
-                    {sessionStatus.hasLocalActivity ? 'Yes' : 'No'}
-                  </span>
-                </div>
-                
-                {sessionStatus.lastActivityTime && (
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm font-medium">Last Activity</span>
-                    <span className="text-sm text-muted-foreground">
-                      {new Date(sessionStatus.lastActivityTime).toLocaleString()}
-                    </span>
-                  </div>
-                )}
-                
-                {sessionStatus.timeSinceActivity && (
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm font-medium">Time Since Activity</span>
-                    <span className="text-sm text-muted-foreground">
-                      {Math.round(sessionStatus.timeSinceActivity / 60)} minutes ago
-                    </span>
-                  </div>
-                )}
-                
-                <div className="flex items-center justify-between">
-                  <span className="text-sm font-medium">Session Files</span>
-                  <span className="text-sm text-muted-foreground">
-                    {sessionStatus.sessionFiles?.length || 0} files
-                  </span>
-                </div>
-                
-                {sessionStatus.orphanedSession && (
-                  <div className="flex items-center space-x-2 p-2 bg-orange-100 dark:bg-orange-900/30 rounded-lg">
-                    <AlertTriangle className="h-4 w-4 text-orange-600" />
-                    <span className="text-sm text-orange-800 dark:text-orange-200 font-medium">
-                      Potential orphaned session detected
-                    </span>
-                  </div>
-                )}
-              </div>
-            ) : sessionStatus === null ? (
-              <div className="flex items-center space-x-2 text-muted-foreground">
-                <AlertCircle className="h-4 w-4 text-orange-500" />
-                <span className="text-sm">Failed to load session status</span>
-              </div>
-            ) : (
-              <div className="flex items-center space-x-2 text-muted-foreground">
-                <RefreshCw className="h-4 w-4 animate-spin" />
-                <span className="text-sm">Loading session status...</span>
-              </div>
-            )}
-          </div>
 
-          {/* Management Actions */}
-          <div className="space-y-3">
-            <div className="p-4 border rounded-lg">
-              <div className="flex items-center justify-between">
-                <div className="flex-1">
-                  <h4 className="text-sm font-medium mb-1">Reset Session Tracking</h4>
-                  <p className="text-xs text-muted-foreground">
-                    Clear all session tracking files. Use when sessions are out of sync with Claude.
-                  </p>
-                </div>
-                <Button
-                  onClick={handleResetSessionTracking}
-                  disabled={isSessionLoading}
-                  variant="outline"
-                  size="sm"
-                  className="ml-3"
-                >
-                  {isSessionLoading ? (
-                    <RefreshCw className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <>
-                      <Trash2 className="h-4 w-4 mr-2" />
-                      Reset
-                    </>
-                  )}
-                </Button>
-              </div>
-            </div>
-
-            <div className="p-4 border rounded-lg">
-              <div className="flex items-center justify-between">
-                <div className="flex-1">
-                  <h4 className="text-sm font-medium mb-1">Force New Session</h4>
-                  <p className="text-xs text-muted-foreground">
-                    Reset tracking and start a fresh Claude session immediately.
-                  </p>
-                </div>
-                <Button
-                  onClick={handleForceNewSession}
-                  disabled={isSessionLoading}
-                  variant="outline"
-                  size="sm"
-                  className="ml-3"
-                >
-                  {isSessionLoading ? (
-                    <RefreshCw className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <>
-                      <RotateCcw className="h-4 w-4 mr-2" />
-                      Start New
-                    </>
-                  )}
-                </Button>
-              </div>
-            </div>
-          </div>
-
-          {/* Block History Viewer */}
-          <div className="p-4 border rounded-lg">
-            <div className="flex items-center justify-between">
-              <div className="flex-1">
-                <h4 className="text-sm font-medium mb-1">View Block History</h4>
-                <p className="text-xs text-muted-foreground">
-                  See all detected usage blocks and debug session tracking issues.
-                </p>
-              </div>
-              <Dialog>
-                <DialogTrigger asChild>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={loadBlocksData}
-                  >
-                    <Eye className="h-4 w-4 mr-2" />
-                    View Blocks
-                  </Button>
-                </DialogTrigger>
-                <DialogContent className="max-w-4xl max-h-[80vh] overflow-y-auto">
-                  <DialogHeader>
-                    <DialogTitle className="flex items-center space-x-2">
-                      <Activity className="h-5 w-5" />
-                      <span>Block History</span>
-                    </DialogTitle>
-                    <DialogDescription>
-                      View detected usage blocks and session tracking information
-                    </DialogDescription>
-                  </DialogHeader>
-                  
-                  <div className="space-y-4">
-                    {isBlocksLoading ? (
-                      <div className="text-center p-8">
-                        <RefreshCw className="h-8 w-8 animate-spin mx-auto mb-2" />
-                        <p className="text-sm text-muted-foreground">Loading blocks...</p>
-                      </div>
-                    ) : blocksData ? (
-                      <div className="space-y-4">
-                        {blocksData.dailyBlocks && blocksData.dailyBlocks.length > 0 ? (
-                          <div>
-                            <h3 className="font-medium mb-2">Recent Blocks</h3>
-                            <div className="space-y-2">
-                              {blocksData.dailyBlocks.slice(0, 10).map((block: any, index: number) => (
-                                <div key={index} className="p-3 border rounded-lg">
-                                  <div className="flex items-center justify-between">
-                                    <div className="flex items-center space-x-2">
-                                      {block.isActive ? (
-                                        <CheckCircle className="h-4 w-4 text-green-500" />
-                                      ) : (
-                                        <Clock className="h-4 w-4 text-gray-400" />
-                                      )}
-                                      <span className="text-sm font-medium">
-                                        Block {block.blockId?.slice(0, 8) || 'Unknown'}
-                                      </span>
-                                    </div>
-                                    <span className="text-xs text-muted-foreground">
-                                      {block.usage || 0} usage
-                                    </span>
-                                  </div>
-                                  <div className="mt-1 text-xs text-muted-foreground">
-                                    Started: {block.blockStart ? new Date(block.blockStart).toLocaleString() : 'Unknown'}
-                                  </div>
-                                  {block.blockEnd && (
-                                    <div className="text-xs text-muted-foreground">
-                                      Ended: {new Date(block.blockEnd).toLocaleString()}
-                                    </div>
-                                  )}
-                                </div>
-                              ))}
-                            </div>
-                          </div>
-                        ) : (
-                          <div className="text-center p-8">
-                            <AlertCircle className="h-8 w-8 text-muted-foreground mx-auto mb-2" />
-                            <p className="text-sm text-muted-foreground">No blocks found</p>
-                          </div>
-                        )}
-                        
-                        {blocksData.blockEvents && blocksData.blockEvents.length > 0 && (
-                          <div>
-                            <h3 className="font-medium mb-2">Recent Events</h3>
-                            <div className="space-y-1 max-h-40 overflow-y-auto">
-                              {blocksData.blockEvents.slice(0, 20).map((event: any, index: number) => (
-                                <div key={index} className="p-2 bg-secondary/20 rounded text-xs">
-                                  <span className="font-medium">{event.eventType}</span> - {event.timestamp ? new Date(event.timestamp).toLocaleString() : 'Unknown time'}
-                                </div>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    ) : (
-                      <div className="text-center p-8">
-                        <AlertCircle className="h-8 w-8 text-orange-500 mx-auto mb-2" />
-                        <p className="text-sm text-muted-foreground">Failed to load block history</p>
-                        <Button 
-                          variant="outline" 
-                          size="sm" 
-                          onClick={loadBlocksData}
-                          className="mt-2"
-                        >
-                          <RefreshCw className="h-4 w-4 mr-2" />
-                          Retry
-                        </Button>
-                      </div>
-                    )}
-                  </div>
-                </DialogContent>
-              </Dialog>
-            </div>
-          </div>
-
-          {/* Info Box */}
-          <div className="p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg">
-            <div className="flex items-start space-x-2">
-              <Info className="h-4 w-4 text-blue-600 mt-0.5 flex-shrink-0" />
-              <div className="text-xs text-blue-800 dark:text-blue-200">
-                <p className="font-medium mb-1">When to use these tools:</p>
-                <ul className="space-y-1 text-xs">
-                  <li>• <strong>Reset Tracking:</strong> If auto-renewal isn't working correctly</li>
-                  <li>• <strong>Force New Session:</strong> If Claude has an old session that doesn't match local tracking</li>
-                  <li>• <strong>Orphaned Sessions:</strong> When you see the orange warning above</li>
-                  <li>• <strong>View Blocks:</strong> See all usage blocks to debug timing issues</li>
-                </ul>
-              </div>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Help Section */}
-      <Card className="glass-card">
-        <CardHeader>
-          <CardTitle className="flex items-center space-x-2">
-            <Info className="h-5 w-5" />
-            <span>How Auto-Renewal Works</span>
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="grid gap-4 md:grid-cols-3">
-            <div className="p-4 border rounded-lg">
-              <div className="flex items-center space-x-2 mb-2">
-                <div className="w-8 h-8 bg-blue-100 dark:bg-blue-900/30 rounded-full flex items-center justify-center">
-                  <span className="text-blue-600 font-semibold">1</span>
-                </div>
-                <h4 className="font-semibold">Monitor</h4>
-              </div>
-              <p className="text-sm text-muted-foreground">
-                Claude Sentinel continuously monitors your usage block status and time remaining.
-              </p>
-            </div>
-
-            <div className="p-4 border rounded-lg">
-              <div className="flex items-center space-x-2 mb-2">
-                <div className="w-8 h-8 bg-green-100 dark:bg-green-900/30 rounded-full flex items-center justify-center">
-                  <span className="text-green-600 font-semibold">2</span>
-                </div>
-                <h4 className="font-semibold">Wait</h4>
-              </div>
-              <p className="text-sm text-muted-foreground">
-                Auto-renewal waits for your 5-hour session to completely expire. It respects scheduled times and won't renew prematurely.
-              </p>
-            </div>
-
-            <div className="p-4 border rounded-lg">
-              <div className="flex items-center space-x-2 mb-2">
-                <div className="w-8 h-8 bg-purple-100 dark:bg-purple-900/30 rounded-full flex items-center justify-center">
-                  <span className="text-purple-600 font-semibold">3</span>
-                </div>
-                <h4 className="font-semibold">Renew</h4>
-              </div>
-              <p className="text-sm text-muted-foreground">
-                After 5 hours have passed or at your scheduled time, a random 1-5 minute delay is applied before starting a new Claude session to begin the next usage block.
-              </p>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
     </div>
   )
 }
