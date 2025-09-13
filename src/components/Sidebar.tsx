@@ -4,8 +4,8 @@ import { Button } from './ui/button'
 import { BarChart3, FileText, Settings, Power, ScrollText } from 'lucide-react'
 
 interface SidebarProps {
-  activeView: 'dashboard' | 'reports' | 'settings' | 'auto-renewal' | 'logs'
-  onViewChange: (view: 'dashboard' | 'reports' | 'settings' | 'auto-renewal' | 'logs') => void
+  activeView: 'dashboard' | 'reports' | 'settings' | 'auto-renewal'
+  onViewChange: (view: 'dashboard' | 'reports' | 'settings' | 'auto-renewal') => void
 }
 
 export function Sidebar({ activeView, onViewChange }: SidebarProps) {
@@ -28,13 +28,7 @@ export function Sidebar({ activeView, onViewChange }: SidebarProps) {
       id: 'reports' as const,
       label: 'Reports',
       icon: FileText,
-      description: 'Detailed usage reports'
-    },
-    {
-      id: 'logs' as const,
-      label: 'Logs',
-      icon: ScrollText,
-      description: 'Auto-renewal activity logs'
+      description: 'Detailed usage reports & logs'
     },
     {
       id: 'settings' as const,

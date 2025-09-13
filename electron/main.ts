@@ -21,30 +21,477 @@ let mainWindow: BrowserWindow | null = null
 let floatingWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let trayUsageInterval: NodeJS.Timeout | null = null
+let tooltipWindow: BrowserWindow | null = null
 
-// Create a small dot icon for auto-renewal status
-const createStatusDotIcon = (options?: { size?: number; enabled?: boolean }) => {
-  const size = options?.size ?? 18
-  const isEnabled = options?.enabled ?? false
-  
-  // Use red for disabled, green for enabled
-  const color = isEnabled ? '#22c55e' : '#ef4444' // Green or red
-  
-  const svg = `<svg width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
-    <circle cx="${size/2}" cy="${size/2}" r="4" fill="${color}"/>
-  </svg>`
-  
-  console.log(`Creating status dot: ${isEnabled ? 'enabled (green)' : 'disabled (red)'}`)
-  
-  const image = nativeImage.createFromBuffer(Buffer.from(svg))
-  image.setTemplateImage(false) // Don't use template mode for colored dots
-  
-  if (image.isEmpty()) {
-    console.error('Status dot creation failed - falling back to activity icon')
-    return createActivityIcon({ size, color: '#000000', template: true })
+// Create modern glass-style tooltip window
+const createTooltipWindow = (tooltipData: any) => {
+  if (tooltipWindow && !tooltipWindow.isDestroyed()) {
+    tooltipWindow.close()
   }
+
+  const { screen } = require('electron')
+  const cursor = screen.getCursorScreenPoint()
+  const primaryDisplay = screen.getPrimaryDisplay()
+
+  tooltipWindow = new BrowserWindow({
+    width: 280,
+    height: 'auto' as any,
+    x: cursor.x + 10,
+    y: cursor.y - 120,
+    frame: false,
+    transparent: true,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    show: false,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true
+    }
+  })
+
+  // Create HTML content with native macOS tooltip styling
+  const htmlContent = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="UTF-8">
+      <style>
+        body {
+          margin: 0;
+          padding: 0;
+          font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif;
+          background: transparent;
+          overflow: hidden;
+          -webkit-font-smoothing: antialiased;
+          text-rendering: optimizeLegibility;
+        }
+
+        .tooltip {
+          background: rgba(35, 35, 37, 0.96);
+          backdrop-filter: blur(30px);
+          -webkit-backdrop-filter: blur(30px);
+          border-radius: 10px;
+          border: 0.5px solid rgba(255, 255, 255, 0.12);
+          padding: 14px 16px;
+          box-shadow:
+            0 10px 40px rgba(0, 0, 0, 0.5),
+            0 2px 8px rgba(0, 0, 0, 0.3),
+            inset 0 1px 0 rgba(255, 255, 255, 0.08);
+          color: #F2F2F7;
+          min-width: 220px;
+          max-width: 300px;
+          cursor: pointer;
+        }
+
+        .header {
+          font-size: 13px;
+          font-weight: 600;
+          margin-bottom: 12px;
+          color: #F2F2F7;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          letter-spacing: -0.02em;
+        }
+
+        .icon {
+          width: 14px;
+          height: 14px;
+          background: linear-gradient(135deg, #007AFF, #5AC8FA);
+          border-radius: 3px;
+          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+        }
+
+        .row {
+          display: flex;
+          justify-content: space-between;
+          align-items: baseline;
+          margin-bottom: 7px;
+          font-size: 11px;
+        }
+
+        .row:last-child {
+          margin-bottom: 0;
+        }
+
+        .label {
+          color: #8E8E93;
+          font-weight: 400;
+          letter-spacing: -0.01em;
+        }
+
+        .value {
+          color: #F2F2F7;
+          font-weight: 500;
+          text-align: right;
+          letter-spacing: -0.01em;
+        }
+
+        .usage-row {
+          margin-bottom: 8px;
+        }
+
+        .usage-bar {
+          width: 100%;
+          height: 3px;
+          background: rgba(142, 142, 147, 0.3);
+          border-radius: 1.5px;
+          overflow: hidden;
+          margin-top: 5px;
+        }
+
+        .usage-fill {
+          height: 100%;
+          background: linear-gradient(90deg, #30D158 0%, #FF9F0A 70%, #FF453A 100%);
+          border-radius: 1.5px;
+          transition: width 0.2s ease;
+        }
+
+        .status-row {
+          display: flex;
+          align-items: center;
+          font-size: 11px;
+          margin-bottom: 7px;
+        }
+
+        .status-indicator {
+          width: 6px;
+          height: 6px;
+          border-radius: 50%;
+          margin-right: 7px;
+          flex-shrink: 0;
+        }
+
+        .status-on {
+          background: #30D158;
+          box-shadow: 0 0 6px rgba(48, 209, 88, 0.4);
+        }
+
+        .status-off {
+          background: #FF453A;
+          box-shadow: 0 0 6px rgba(255, 69, 58, 0.4);
+        }
+
+        .separator {
+          height: 0.5px;
+          background: rgba(142, 142, 147, 0.2);
+          margin: 10px 0;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="tooltip" onclick="window.close()">
+        <div class="header">
+          <div class="icon"></div>
+          ${tooltipData.title}
+        </div>
+
+        ${tooltipData.usage ? `
+        <div class="row usage-row">
+          <span class="label">Usage</span>
+          <span class="value">${tooltipData.usage}</span>
+        </div>
+        <div class="usage-bar">
+          <div class="usage-fill" style="width: ${tooltipData.usage}"></div>
+        </div>
+        ` : ''}
+
+        <div class="row">
+          <span class="label">Tokens</span>
+          <span class="value">${tooltipData.tokens}</span>
+        </div>
+
+        ${tooltipData.timeRemaining ? `
+        <div class="row">
+          <span class="label">Time Remaining</span>
+          <span class="value">${tooltipData.timeRemaining}</span>
+        </div>
+        ` : ''}
+
+        <div class="separator"></div>
+
+        <div class="status-row">
+          <span class="status-indicator ${tooltipData.renewalStatus.includes('ON') ? 'status-on' : 'status-off'}"></span>
+          <span class="label">Auto-renewal ${tooltipData.renewalStatus}</span>
+        </div>
+
+        ${tooltipData.nextSession ? `
+        <div class="row">
+          <span class="label">Next Session</span>
+          <span class="value">${tooltipData.nextSession}</span>
+        </div>
+        ` : ''}
+      </div>
+
+      <script>
+        // Close tooltip on click or escape key
+        document.addEventListener('click', () => window.close());
+        document.addEventListener('keydown', (e) => {
+          if (e.key === 'Escape') window.close();
+        });
+
+        // Prevent event bubbling
+        document.querySelector('.tooltip').addEventListener('click', (e) => {
+          e.stopPropagation();
+          window.close();
+        });
+      </script>
+    </body>
+    </html>
+  `
+
+  tooltipWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(htmlContent)}`)
+
+  tooltipWindow.once('ready-to-show', () => {
+    if (tooltipWindow && !tooltipWindow.isDestroyed()) {
+      tooltipWindow.show()
+
+      // Auto-hide after 3 seconds
+      setTimeout(() => {
+        if (tooltipWindow && !tooltipWindow.isDestroyed()) {
+          tooltipWindow.close()
+        }
+      }, 3000)
+    }
+  })
+}
+
+// Create a high-quality PNG battery icon for macOS menu bar
+const createBatteryIcon = (options?: { size?: number; percentage?: number }) => {
+  const baseSize = options?.size ?? 16 // Base size for menu bar
+  const percentage = Math.max(0, Math.min(100, options?.percentage ?? 0))
+
+  console.log(`Creating HD tray battery icon: ${percentage}% - size: ${baseSize}px`)
+
+  try {
+    // Create ultra high-DPI canvas (4x for maximum Retina quality)
+    const scale = 4 // Higher scale for ultra-crisp rendering
+    const canvasSize = baseSize * scale
+
+    const { createCanvas } = require('canvas')
+    const canvas = createCanvas(canvasSize, canvasSize)
+    const ctx = canvas.getContext('2d')
+
+    // Scale the context for ultra high-DPI rendering
+    ctx.scale(scale, scale)
+
+    // Enable maximum quality rendering with all optimizations
+    ctx.imageSmoothingEnabled = false // Disable for pixel-perfect edges
+    ctx.patternQuality = 'best'
+    ctx.textDrawingMode = 'path'
+    ctx.antialias = 'subpixel'
+
+    // Clear canvas with transparent background
+    ctx.clearRect(0, 0, baseSize, baseSize)
+
+    // Apple-style battery dimensions (exact proportions from macOS)
+    const batteryWidth = 10.5
+    const batteryHeight = 5.5
+    const batteryX = (baseSize - batteryWidth) / 2
+    const batteryY = (baseSize - batteryHeight) / 2
+
+    // Apple-style terminal (precise proportions)
+    const terminalWidth = 1
+    const terminalHeight = 2.5
+    const terminalX = batteryX + batteryWidth - 0.1 // Slight overlap for seamless connection
+    const terminalY = batteryY + (batteryHeight - terminalHeight) / 2
+
+    // Apple system colors with proper opacity
+    let fillColor
+    if (percentage <= 20) {
+      fillColor = "#FF3B30" // Apple red
+    } else if (percentage <= 50) {
+      fillColor = "#FF9500" // Apple orange
+    } else {
+      fillColor = "#34C759" // Apple green
+    }
+
+    // Pixel-perfect alignment for ultra-sharp rendering
+    const pixelAlign = (value: number) => Math.round(value * scale) / scale
+
+    // Apple-style rendering with precise stroke width
+    ctx.lineWidth = pixelAlign(0.8)
+    ctx.lineCap = 'round'
+    ctx.lineJoin = 'round'
+
+    // Battery outline with Apple's exact styling
+    ctx.strokeStyle = "#FFFFFF"
+    ctx.fillStyle = "transparent"
+    ctx.beginPath()
+    const outlineX = pixelAlign(batteryX)
+    const outlineY = pixelAlign(batteryY)
+    const outlineW = pixelAlign(batteryWidth)
+    const outlineH = pixelAlign(batteryHeight)
+    const cornerRadius = pixelAlign(1.2)
+
+    // Draw battery body with Apple's corner radius
+    ctx.roundRect(outlineX, outlineY, outlineW, outlineH, cornerRadius)
+    ctx.stroke()
+
+    // Apple-style terminal with seamless connection
+    ctx.fillStyle = "#FFFFFF"
+    ctx.beginPath()
+    const termX = pixelAlign(terminalX)
+    const termY = pixelAlign(terminalY)
+    const termW = pixelAlign(terminalWidth)
+    const termH = pixelAlign(terminalHeight)
+    ctx.roundRect(termX, termY, termW, termH, pixelAlign(0.4))
+    ctx.fill()
+
+    // Apple-style battery fill with proper padding
+    if (percentage > 0) {
+      const padding = pixelAlign(1.2)
+      const fillWidth = pixelAlign(Math.max(0.8, (batteryWidth - padding * 2) * (percentage / 100)))
+      const fillX = pixelAlign(batteryX + padding)
+      const fillY = pixelAlign(batteryY + padding)
+      const fillHeight = pixelAlign(batteryHeight - padding * 2)
+      const fillRadius = pixelAlign(0.6)
+
+      // Apple's battery fill style
+      ctx.fillStyle = fillColor
+      ctx.beginPath()
+      ctx.roundRect(fillX, fillY, fillWidth, fillHeight, fillRadius)
+      ctx.fill()
+    }
+
+    // Convert canvas to PNG with ultra-high quality settings
+    const buffer = canvas.toBuffer('image/png', {
+      compressionLevel: 0, // No compression for maximum quality
+      filters: canvas.PNG_FILTER_NONE,
+      resolution: 288, // Ultra-high DPI (4x base)
+      palette: false // Full color depth
+    })
+
+    // Create image with proper scale factor for Retina
+    const image = nativeImage.createFromBuffer(buffer, {
+      scaleFactor: scale / 2, // Adjust scale factor for proper sizing
+      width: baseSize,
+      height: baseSize
+    })
+
+    // Ensure colored rendering (not template)
+    image.setTemplateImage(false)
+
+    // Verify the image was created successfully
+    if (image.isEmpty()) {
+      console.error('HD battery PNG creation failed - falling back to SVG')
+      return createBatteryIconSVG(options)
+    }
+
+    console.log(`Successfully created HD battery icon: ${image.getSize().width}x${image.getSize().height} (scale: ${scale}x)`)
+    return image
+
+  } catch (error) {
+    console.error('Failed to create HD battery PNG, falling back to SVG:', error)
+    return createBatteryIconSVG(options)
+  }
+}
+
+// Fallback SVG generation for battery icons
+const createBatteryIconSVG = (options?: { size?: number; percentage?: number }) => {
+  const size = options?.size ?? 16 // macOS menu bar standard size
+  const percentage = options?.percentage ?? 0
+
+  // Calculate battery dimensions with better proportions
+  const batteryWidth = Math.max(14, size * 0.8)
+  const batteryHeight = Math.max(9, size * 0.56)
+  const batteryX = (size - batteryWidth) / 2
+  const batteryY = (size - batteryHeight) / 2
   
-  return image
+  // Battery terminal (small rectangle on the right)
+  const terminalWidth = Math.max(2, size * 0.12)
+  const terminalHeight = Math.max(5, size * 0.31)
+  const terminalX = batteryX + batteryWidth
+  const terminalY = batteryY + (batteryHeight - terminalHeight) / 2
+
+  // Fill level calculation with better precision
+  const fillWidth = Math.max(0, (batteryWidth - 3) * (percentage / 100)) // -3 for border
+  const fillX = batteryX + 1.5 // +1.5 for border
+  const fillY = batteryY + 1.5 // +1.5 for border
+  const fillHeight = batteryHeight - 3 // -3 for border
+
+  // Determine colors based on percentage
+  let fillColor, borderColor
+  if (percentage <= 20) {
+    fillColor = "#FF3B30" // Red for low battery
+    borderColor = "#FF3B30"
+  } else if (percentage <= 50) {
+    fillColor = "#FF9500" // Orange for medium battery
+    borderColor = "#FF9500"
+  } else {
+    fillColor = "#34C759" // Green for good battery
+    borderColor = "#34C759"
+  }
+
+  const svg = `
+    <svg width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}">
+      <defs>
+        <filter id="shadow" x="-50%" y="-50%" width="200%" height="200%">
+          <feDropShadow dx="0" dy="0" stdDeviation="0.5" flood-opacity="0.3"/>
+        </filter>
+      </defs>
+      <!-- Battery outline with better stroke -->
+      <rect x="${batteryX}" y="${batteryY}" 
+            width="${batteryWidth}" height="${batteryHeight}" 
+            fill="none" stroke="${borderColor}" stroke-width="1.5" rx="1.5" 
+            stroke-linecap="round" stroke-linejoin="round"/>
+      
+      <!-- Battery terminal with better proportions -->
+      <rect x="${terminalX}" y="${terminalY}" 
+            width="${terminalWidth}" height="${terminalHeight}" 
+            fill="${borderColor}" rx="0.8" 
+            stroke-linecap="round" stroke-linejoin="round"/>
+      
+      <!-- Battery fill with better precision -->
+      ${percentage > 0 ? `
+        <rect x="${fillX}" y="${fillY}" 
+              width="${fillWidth}" height="${fillHeight}" 
+              fill="${fillColor}" rx="0.8" 
+              stroke-linecap="round" stroke-linejoin="round"/>
+      ` : ''}
+    </svg>
+  `
+
+  return nativeImage.createFromBuffer(Buffer.from(svg))
+}
+
+// Fallback SVG generation (original implementation)
+const createStatusDotIconSVG = (options?: { size?: number; enabled?: boolean }) => {
+  const size = options?.size ?? 16 // macOS menu bar standard size
+  const isEnabled = options?.enabled ?? false
+
+  // Use high contrast colors optimized for macOS menu bar
+  const color = isEnabled ? '#00D900' : '#FF3B30' // Apple's system green/red
+
+  // Create SVG with proper XML declaration and viewBox
+  const svg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg">
+  <circle cx="${size/2}" cy="${size/2}" r="${size/3}" fill="${color}"/>
+</svg>`
+
+  try {
+    const image = nativeImage.createFromBuffer(Buffer.from(svg, 'utf8'))
+
+    // For macOS, we want colored icons, not template
+    image.setTemplateImage(false)
+
+    // Verify the image was created successfully
+    if (image.isEmpty()) {
+      console.error('Status dot SVG creation failed - image is empty')
+      return createActivityIcon({ size: 16, color: '#000000', template: true })
+    }
+
+    console.log(`Successfully created status dot icon from SVG: ${image.getSize().width}x${image.getSize().height}`)
+    return image
+
+  } catch (error) {
+    console.error('Failed to create status dot from SVG:', error)
+    return createActivityIcon({ size: 16, color: '#000000', template: true })
+  }
 }
 
 // Create an app icon matching the sidebar's Activity logo (lucide) - keep for non-tray uses
@@ -95,35 +542,31 @@ const updateTrayUsage = () => {
   if (!tray) return
   const { percent, block } = getUsagePercent()
 
-  // Update tray icon to colored dot based on auto-renewal status
+  // Use battery icon to show REMAINING tokens (100 - used percentage)
   try {
-    // Check auto-renewal status for dot color
-    let isRenewalEnabled = false
-    try {
-      const configFile = path.join(os.homedir(), '.claude-sentinel-config.json')
-      if (fs.existsSync(configFile)) {
-        const config = JSON.parse(fs.readFileSync(configFile, 'utf8'))
-        isRenewalEnabled = config.enabled || false
-      }
-    } catch (configError) {
-      // Keep disabled state if we can't read config
-    }
-    
-    const statusDotIcon = createStatusDotIcon({ 
-      size: 18, 
-      enabled: isRenewalEnabled
+    const usedPercentage = percent || 0
+    const remainingPercentage = Math.max(0, 100 - usedPercentage) // Invert to show remaining
+
+    const batteryIcon = createBatteryIcon({
+      size: 16,
+      percentage: remainingPercentage
     })
-    tray.setImage(statusDotIcon)
-    console.log(`Updated tray dot icon: ${isRenewalEnabled ? 'green (enabled)' : 'red (disabled)'}`)
+    tray.setImage(batteryIcon)
+    console.log(`Updated tray battery icon: ${remainingPercentage}% remaining (${usedPercentage}% used)`)
   } catch (error) {
-    console.warn('Failed to update tray dot icon:', error)
+    console.warn('Failed to update tray battery icon:', error)
+    // Fallback to text if icon fails
+    try {
+      tray.setImage(nativeImage.createEmpty())
+      const displayText = percent === null ? '—' : `${100 - percent}%`
+      tray.setTitle(displayText)
+    } catch {}
   }
 
-  // Show percentage text on macOS
+  // Clear title since we're using icon
   if (process.platform === 'darwin') {
     try {
-      const displayText = percent === null ? '—' : `${percent}%`
-      tray.setTitle(displayText)
+      tray.setTitle('')
     } catch {}
   }
 
@@ -131,29 +574,67 @@ const updateTrayUsage = () => {
   const timeLeft = block?.timeRemaining ?? null
   const usageText = block ? `${formatTokens(block.usage)} / ${formatTokens(block.limit || 0)} tokens` : 'Usage unavailable'
   
-  // Get next renewal time
+  // Get next renewal time from the renewal service
   let renewalInfo = ''
   try {
-    const configFile = path.join(os.homedir(), '.claude-sentinel-config.json')
-    if (fs.existsSync(configFile)) {
-      const config = JSON.parse(fs.readFileSync(configFile, 'utf8'))
-      if (config.enabled) {
-        renewalInfo = '\nAuto-renewal: ON'
-        // Calculate next renewal time (assuming monthly billing cycle)
+    const renewalStatus = getRenewalStatus()
+    if (renewalStatus.enabled) {
+      renewalInfo = '\nAuto-renewal: ON'
+
+      // Use the actual next renewal time from the service
+      if (renewalStatus.nextRenewal) {
+        const nextRenewalTime = new Date(renewalStatus.nextRenewal)
+
+        // Format the time in a readable way
+        const timeOptions: Intl.DateTimeFormatOptions = {
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: true
+        }
+
+        const dateOptions: Intl.DateTimeFormatOptions = {
+          month: 'short',
+          day: 'numeric'
+        }
+
         const now = new Date()
-        const nextRenewal = new Date(now.getFullYear(), now.getMonth() + 1, 1) // First day of next month
-        const daysUntilRenewal = Math.ceil((nextRenewal.getTime() - now.getTime()) / (1000 * 60 * 60 * 24))
-        renewalInfo += `\nNext renewal: ${daysUntilRenewal} days`
+        const isToday = nextRenewalTime.toDateString() === now.toDateString()
+        const isTomorrow = nextRenewalTime.toDateString() === new Date(now.getTime() + 24*60*60*1000).toDateString()
+
+        let timeStr
+        if (isToday) {
+          timeStr = `Today at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
+        } else if (isTomorrow) {
+          timeStr = `Tomorrow at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
+        } else {
+          timeStr = `${nextRenewalTime.toLocaleDateString('en-US', dateOptions)} at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
+        }
+
+        renewalInfo += `\nNext session: ${timeStr}`
+      } else if (renewalStatus.timeRemaining) {
+        // If no specific next renewal time, show time remaining in current block
+        renewalInfo += `\nTime remaining: ${renewalStatus.timeRemaining}`
       } else {
-        renewalInfo = '\nAuto-renewal: OFF'
+        renewalInfo += '\nNext session: TBD'
       }
+    } else {
+      renewalInfo = '\nAuto-renewal: OFF'
     }
   } catch (configError) {
     renewalInfo = '\nAuto-renewal: Status unknown'
   }
   
-  const tooltip = `Claude Sentinel\n${percent === null ? '' : `Usage: ${percent}%\n`}${usageText}${timeLeft !== null ? `\nTime remaining: ${formatMinutes(timeLeft)}` : ''}${renewalInfo}`.trim()
-  try { tray.setToolTip(tooltip) } catch {}
+  // Create modern glass-style tooltip content
+  const tooltipData = {
+    title: 'Claude Sentinel',
+    usage: percent !== null ? `${percent}%` : null,
+    tokens: usageText,
+    timeRemaining: timeLeft !== null ? formatMinutes(timeLeft) : null,
+    renewalStatus: renewalInfo.replace('\n', '').replace('Auto-renewal: ', ''),
+    nextSession: renewalInfo.includes('Next session:') ? renewalInfo.split('Next session: ')[1] : null
+  }
+
+  // No system tooltip - we use custom glass tooltip on hover only
 
   // Refresh tray context menu to reflect latest usage
   try { updateTrayMenu() } catch {}
@@ -345,25 +826,22 @@ const createFloatingWindow = () => {
 }
 
 const createTray = () => {
-  // Create initial red dot (auto-renewal disabled by default)
+  console.log('=== Creating macOS menu bar tray ===')
+
+  // Create initial battery icon at 100% remaining (full battery)
   let trayIcon
   try {
-    trayIcon = createStatusDotIcon({ 
-      size: 18, 
-      enabled: false // Start with red dot (disabled)
+    trayIcon = createBatteryIcon({
+      size: 16,
+      percentage: 100 // Start with full battery (100% tokens remaining)
     })
-    
-    // If dot icon is empty, fall back to activity icon
-    if (trayIcon.isEmpty()) {
-      console.warn('Status dot icon is empty, falling back to activity icon')
-      trayIcon = createActivityIcon({ size: 18, color: '#000000', template: true })
-    }
+    console.log('Created initial full battery icon (100% tokens remaining)')
   } catch (error) {
-    console.error('Failed to create status dot icon, falling back to activity icon:', error)
-    trayIcon = createActivityIcon({ size: 18, color: '#000000', template: true })
+    console.error('Failed to create initial battery icon:', error)
+    trayIcon = nativeImage.createEmpty()
   }
 
-  console.log('Creating tray with status dot icon')
+  console.log('Creating tray...')
   tray = new Tray(trayIcon)
   
   // Verify tray was created successfully
@@ -424,8 +902,55 @@ const createTray = () => {
     }
   ])
 
-  tray.setToolTip('Claude Sentinel - Usage Monitor & Auto-Renewal')
+  // Disable system tooltip since we're using custom glass tooltip
+  tray.setToolTip('')
   tray.setContextMenu(contextMenu)
+
+  // Handle tray hover for modern glass tooltip
+  tray.on('mouse-enter', () => {
+    // Get current usage data for tooltip
+    const { percent, block } = getUsagePercent()
+    const timeLeft = block?.timeRemaining ?? null
+    const usageText = block ? `${formatTokens(block.usage)} / ${formatTokens(block.limit || 0)} tokens` : 'Usage unavailable'
+
+    // Get renewal info
+    let renewalStatus = 'OFF'
+    let nextSession = null
+    try {
+      const status = getRenewalStatus()
+      renewalStatus = status.enabled ? 'ON' : 'OFF'
+      if (status.nextRenewal) {
+        const nextRenewalTime = new Date(status.nextRenewal)
+        const now = new Date()
+        const isToday = nextRenewalTime.toDateString() === now.toDateString()
+        const isTomorrow = nextRenewalTime.toDateString() === new Date(now.getTime() + 24*60*60*1000).toDateString()
+
+        if (isToday) {
+          nextSession = `Today at ${nextRenewalTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })}`
+        } else if (isTomorrow) {
+          nextSession = `Tomorrow at ${nextRenewalTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })}`
+        } else {
+          nextSession = `${nextRenewalTime.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} at ${nextRenewalTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })}`
+        }
+      }
+    } catch {}
+
+    const tooltipData = {
+      title: 'Claude Sentinel',
+      usage: percent !== null ? `${percent}%` : null,
+      tokens: usageText,
+      timeRemaining: timeLeft !== null ? formatMinutes(timeLeft) : null,
+      renewalStatus,
+      nextSession
+    }
+
+    createTooltipWindow(tooltipData)
+  })
+
+  // Hide tooltip on mouse leave (optional - tooltip auto-hides anyway)
+  tray.on('mouse-leave', () => {
+    // Tooltip will auto-hide, but we could force close here if needed
+  })
 
   // Handle tray click - show context menu only (no direct app opening)
   // Note: The context menu will be shown automatically on click, we don't need to handle direct clicks
@@ -669,13 +1194,41 @@ const stopRenewalMonitoring = () => {
 
 const updateTrayMenu = () => {
   if (!tray) return
-  
+
   const status = getRenewalStatus()
   const block = getCurrentBlockInfo()
   const percent = block && block.limit > 0 ? Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100))) : null
   const usageLine = percent === null ? 'Usage: unknown' : `Usage: ${percent}% (${formatTokens(block.usage)} / ${formatTokens(block.limit)})`
   const timeLine = `Time remaining: ${formatMinutes(block?.timeRemaining ?? null)}`
-  const contextMenu = Menu.buildFromTemplate([
+
+  // Get next session time
+  let nextSessionLine = null
+  if (status.enabled && status.nextRenewal) {
+    const nextRenewalTime = new Date(status.nextRenewal)
+    const now = new Date()
+    const isToday = nextRenewalTime.toDateString() === now.toDateString()
+    const isTomorrow = nextRenewalTime.toDateString() === new Date(now.getTime() + 24*60*60*1000).toDateString()
+
+    const timeOptions: Intl.DateTimeFormatOptions = {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true
+    }
+
+    if (isToday) {
+      nextSessionLine = `Next session: Today at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
+    } else if (isTomorrow) {
+      nextSessionLine = `Next session: Tomorrow at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
+    } else {
+      const dateOptions: Intl.DateTimeFormatOptions = {
+        month: 'short',
+        day: 'numeric'
+      }
+      nextSessionLine = `Next session: ${nextRenewalTime.toLocaleDateString('en-US', dateOptions)} at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
+    }
+  }
+
+  const menuItems = [
     {
       label: usageLine,
       enabled: false
@@ -683,7 +1236,19 @@ const updateTrayMenu = () => {
     {
       label: timeLine,
       enabled: false
-    },
+    }
+  ]
+
+  // Add next session line if available
+  if (nextSessionLine) {
+    menuItems.push({
+      label: nextSessionLine,
+      enabled: false
+    })
+  }
+
+  const contextMenu = Menu.buildFromTemplate([
+    ...menuItems,
     { type: 'separator' },
     {
       label: 'Show Claude Sentinel',

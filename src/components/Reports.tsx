@@ -116,8 +116,7 @@ export function Reports() {
   return (
     <div className="space-y-6">
       {/* Header with filters */}
-      <div className="flex items-center justify-between">
-        <h2 className="text-3xl font-bold tracking-tight">Usage Reports</h2>
+      <div className="flex items-center justify-end">
         <Button onClick={exportToCSV} variant="outline" size="sm">
           <Download className="h-4 w-4 mr-2" />
           Export CSV

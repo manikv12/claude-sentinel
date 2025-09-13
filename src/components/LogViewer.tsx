@@ -155,14 +155,11 @@ export function LogViewer() {
     <div className="space-y-4">
       {/* Header */}
       <div className="flex items-center justify-between">
-        <div>
-          <h3 className="text-2xl font-bold tracking-tight">Auto-Renewal Logs</h3>
-          {logsPath && (
-            <p className="text-sm text-muted-foreground mt-1">
-              Logs stored in: {logsPath}
-            </p>
-          )}
-        </div>
+        {logsPath && (
+          <p className="text-sm text-muted-foreground">
+            Logs stored in: {logsPath}
+          </p>
+        )}
         <div className="flex space-x-2">
           <Button onClick={loadLogs} disabled={isLoading} variant="outline" size="sm">
             <RefreshCw className="h-4 w-4 mr-2" />

@@ -1,9 +1,8 @@
 import React, { useEffect, useState } from 'react'
 import { Dashboard } from './components/Dashboard'
-import { Reports } from './components/Reports'
+import { ReportsAndLogs } from './components/ReportsAndLogs'
 import { Settings } from './components/Settings'
 import { AutoRenewal } from './components/AutoRenewal'
-import { LogViewer } from './components/LogViewer'
 import { FloatingUsage } from './components/FloatingUsage'
 import { Sidebar } from './components/Sidebar'
 import { Header } from './components/Header'
@@ -18,7 +17,7 @@ declare global {
 }
 
 function App() {
-  const [activeView, setActiveView] = useState<'dashboard' | 'reports' | 'settings' | 'auto-renewal' | 'logs'>('dashboard')
+  const [activeView, setActiveView] = useState<'dashboard' | 'reports' | 'settings' | 'auto-renewal'>('dashboard')
   const { setUsageData } = useUsageStore()
   const { setRenewalStatus } = useRenewalStore()
 
@@ -64,8 +63,7 @@ function App() {
         <main className="flex-1 p-6 overflow-auto">
           {activeView === 'dashboard' && <Dashboard />}
           {activeView === 'auto-renewal' && <AutoRenewal />}
-          {activeView === 'reports' && <Reports />}
-          {activeView === 'logs' && <LogViewer />}
+          {activeView === 'reports' && <ReportsAndLogs />}
           {activeView === 'settings' && <Settings />}
         </main>
       </div>
