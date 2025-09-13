@@ -235,10 +235,12 @@ function groupByDate(entries: SentinelUsageEntry[]): Map<string, SentinelDailyUs
 }
 
 /**
- * Find all historical billing blocks to determine maximum usage per block
- * This replicates ccusage's exact method from identifySessionBlocks function
+ * Unified block detection algorithm that matches Claude's actual billing behavior
+ * - Sessions start at the hour of first activity (4:50 PM → 4:00 PM)  
+ * - Sessions last exactly 5 hours from that floored hour
+ * - Blocks are active if current time < blockEnd
  */
-interface HistoricalBlockMeta { isActive: boolean; usage: number; blockStart: Date; blockEnd: Date; entryCount: number }
+interface HistoricalBlockMeta { isActive: boolean; usage: number; blockStart: Date; blockEnd: Date; entryCount: number; entries: SentinelUsageEntry[] }
 function findAllHistoricalBlocks(entries: SentinelUsageEntry[]): HistoricalBlockMeta[] {
   if (entries.length === 0) return []
   
@@ -247,156 +249,98 @@ function findAllHistoricalBlocks(entries: SentinelUsageEntry[]): HistoricalBlock
   const sortedEntries = [...entries].sort((a, b) => 
     new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
   )
-  
-  let currentBlockStart: Date | null = null
-  let currentBlockEntries: SentinelUsageEntry[] = []
   const now = new Date()
   
-  // Floor to hour function (matches ccusage exactly)
+  // Floor to hour function - consistent with Claude's behavior
   function floorToHour(timestamp: Date): Date {
     const floored = new Date(timestamp)
     floored.setMinutes(0, 0, 0)
+    floored.setMilliseconds(0)
     return floored
   }
   
-  for (const entry of sortedEntries) {
-    const entryTime = new Date(entry.timestamp)
+  // Group entries into 5-hour blocks starting from floored hours
+  let i = 0
+  while (i < sortedEntries.length) {
+    const firstEntry = sortedEntries[i]
+    const blockStart = floorToHour(new Date(firstEntry.timestamp))
+    const blockEnd = new Date(blockStart.getTime() + sessionDurationMs)
     
-    if (currentBlockStart == null) {
-      // First entry - start a new block (floored to the hour like ccusage)
-      currentBlockStart = floorToHour(entryTime)
-      currentBlockEntries = [entry]
-    } else {
-      const timeSinceBlockStart = entryTime.getTime() - currentBlockStart.getTime()
-      const lastEntry = currentBlockEntries[currentBlockEntries.length - 1]
-      if (lastEntry == null) {
-        continue
-      }
-      const lastEntryTime = new Date(lastEntry.timestamp)
-      const timeSinceLastEntry = entryTime.getTime() - lastEntryTime.getTime()
-      
-      if (timeSinceBlockStart > sessionDurationMs) {
-        // Close current block when 5-hour window expires (matches ccusage logic exactly)
-        const blockEnd = new Date(currentBlockStart.getTime() + sessionDurationMs)
-        const blockUsage = currentBlockEntries.reduce((sum, e) => sum + e.totalTokens, 0)
-        const lastEntryInBlock = currentBlockEntries[currentBlockEntries.length - 1]
-        const actualEndTime = lastEntryInBlock ? new Date(lastEntryInBlock.timestamp) : currentBlockStart
-        const isActive = now.getTime() - actualEndTime.getTime() < sessionDurationMs && now < blockEnd
-        blocks.push({ isActive, usage: blockUsage, blockStart: currentBlockStart, blockEnd, entryCount: currentBlockEntries.length })
-        
-        // Log block event for tracking
-        logBlockEvent({
-          eventType: isActive ? 'block_detected' : 'block_ended',
-          blockId: createBlockId(currentBlockStart),
-          blockStart: currentBlockStart.toISOString(),
-          blockEnd: blockEnd.toISOString(),
-          usage: blockUsage,
-          isActive,
-          entryCount: currentBlockEntries.length,
-          source: 'ccusage_analysis',
-          details: `Block ${isActive ? 'active' : 'ended'} with ${currentBlockEntries.length} entries`
-        })
-        
-        // Start new block (floored to the hour like ccusage)
-        currentBlockStart = floorToHour(entryTime)
-        currentBlockEntries = [entry]
+    // Collect all entries that fall within this 5-hour block
+    const blockEntries: SentinelUsageEntry[] = []
+    while (i < sortedEntries.length) {
+      const entryTime = new Date(sortedEntries[i].timestamp)
+      if (entryTime >= blockStart && entryTime < blockEnd) {
+        blockEntries.push(sortedEntries[i])
+        i++
       } else {
-        // Add to current block
-        currentBlockEntries.push(entry)
+        break // Entry belongs to next block
       }
     }
-  }
-  
-  // Close the last block
-  if (currentBlockStart != null && currentBlockEntries.length > 0) {
-    const blockEnd = new Date(currentBlockStart.getTime() + sessionDurationMs)
-    const blockUsage = currentBlockEntries.reduce((sum, e) => sum + e.totalTokens, 0)
-    const lastEntryInBlock = currentBlockEntries[currentBlockEntries.length - 1]
-    const actualEndTime = lastEntryInBlock ? new Date(lastEntryInBlock.timestamp) : currentBlockStart
-    const isActive = now.getTime() - actualEndTime.getTime() < sessionDurationMs && now < blockEnd
-    blocks.push({ isActive, usage: blockUsage, blockStart: currentBlockStart, blockEnd, entryCount: currentBlockEntries.length })
+    
+    if (blockEntries.length > 0) {
+      const blockUsage = blockEntries.reduce((sum, e) => sum + e.totalTokens, 0)
+      // Simple rule: block is active if current time is before block end
+      const isActive = now < blockEnd
+      
+      blocks.push({ 
+        isActive, 
+        usage: blockUsage, 
+        blockStart, 
+        blockEnd, 
+        entryCount: blockEntries.length,
+        entries: blockEntries
+      })
+      
+      // Log block event for tracking
+      logBlockEvent({
+        eventType: isActive ? 'block_detected' : 'block_ended',
+        blockId: createBlockId(blockStart),
+        blockStart: blockStart.toISOString(),
+        blockEnd: blockEnd.toISOString(),
+        usage: blockUsage,
+        isActive,
+        entryCount: blockEntries.length,
+        source: 'unified_analysis',
+        details: `Block ${isActive ? 'active' : 'ended'} with ${blockEntries.length} entries`
+      })
+    }
   }
   
   return blocks
 }
 
 /**
- * Identify current billing block based on most recent activity
- * Claude's actual billing works in 5-hour windows from when you first start using it
+ * Identify current billing block using the unified algorithm
+ * Now uses the same logic as findAllHistoricalBlocks for consistency
  */
 function identifyBillingBlocks(entries: SentinelUsageEntry[]): SentinelBillingBlock[] {
   if (entries.length === 0) return []
   
-  const now = new Date()
+  // Use the unified block detection algorithm
+  const allBlocks = findAllHistoricalBlocks(entries)
   
-  // Find the most recent entry to determine the current block
-  const sortedEntries = [...entries].sort((a, b) => 
-    new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
-  )
-  
-  const mostRecentEntry = sortedEntries[0]
-  const mostRecentTime = new Date(mostRecentEntry.timestamp)
-  
-  // Check if the most recent activity was within the last 5 hours
-  const fiveHoursAgo = new Date(now.getTime() - 5 * 60 * 60 * 1000)
-  
-  if (mostRecentTime < fiveHoursAgo) {
-    if (DEBUG) console.log(`Sentinel: No active billing block (last activity was ${mostRecentTime})`)
-    return []
-  }
-  
-  // Find all entries within the current 5-hour window from the most recent activity
-  // First, find the billing block start time (rounded down to nearest hour from first activity)
-  const firstPossibleTime = new Date(mostRecentTime.getTime() - 5 * 60 * 60 * 1000)
-  
-  // Get all entries in the potential 5-hour window
-  const potentialEntries = entries.filter(entry => {
-    const entryTime = new Date(entry.timestamp)
-    return entryTime >= firstPossibleTime && entryTime <= mostRecentTime
-  }).sort((a, b) => 
-    new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
-  )
-  
-  if (potentialEntries.length === 0) return []
-  
-  // Find the actual billing block start (rounded down from first entry)
-  const actualFirstEntry = potentialEntries[0]
-  const actualBlockStart = new Date(actualFirstEntry.timestamp)
-  actualBlockStart.setMinutes(0, 0, 0) // Round down to nearest hour
-  const actualBlockEnd = new Date(actualBlockStart.getTime() + 5 * 60 * 60 * 1000)
-  
-  // Use ccusage-style block detection: apply the same algorithm we use for historical blocks
-  // but only for the most recent timeframe
-  const recentEntries = entries
-    .filter(entry => new Date(entry.timestamp) >= firstPossibleTime)
-    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
-  
-  // Apply the same block detection logic that ccusage uses
-  const recentBlocks = findAllHistoricalBlocks(recentEntries)
-  const activeBlock = recentBlocks.find(block => block.isActive)
+  // Find the currently active block
+  const activeBlock = allBlocks.find(block => block.isActive)
   
   if (!activeBlock) {
-    if (DEBUG) console.log(`Sentinel: No active block found using ccusage logic`)
+    if (DEBUG) console.log(`Sentinel: No active billing block found`)
     return []
   }
   
-  // Get the entries for this active block by re-running the block detection
-  // This ensures we use exactly the same logic as ccusage
-  if (DEBUG) console.log(`Sentinel: Using ccusage-style active block with ${activeBlock.usage} tokens`)
+  if (DEBUG) console.log(`Sentinel: Found active block with ${activeBlock.usage.toLocaleString()} tokens`)
   
-  // For now, approximate the current block entries since we need to match ccusage exactly
-  // TODO: Modify findAllHistoricalBlocks to also return the actual entries for each block
-  const currentBlockEntries = recentEntries
-  
-  if (currentBlockEntries.length === 0) return []
-  
-  // Use the active block data from our ccusage-compatible algorithm
-  const blockStart = activeBlock.blockStart || actualBlockStart
-  const blockEnd = activeBlock.blockEnd || actualBlockEnd
-  
-  // Use the active block usage from our algorithm
+  // Use the exact entries from the unified algorithm (no more approximations!)
+  const currentBlockEntries = activeBlock.entries
   const usage = activeBlock.usage
   const cost = currentBlockEntries.reduce((sum, e) => sum + (e.costUSD || 0), 0)
+  
+  // Use the block's start and end times directly from the unified algorithm
+  const blockStart = activeBlock.blockStart
+  const blockEnd = activeBlock.blockEnd
+  const isActive = activeBlock.isActive
+  const now = new Date()
+  const timeRemaining = isActive ? Math.max(0, Math.floor((blockEnd.getTime() - now.getTime()) / (1000 * 60))) : null
   
   // Debug: Show detailed token breakdown for current block
   if (DEBUG) {
@@ -406,54 +350,22 @@ function identifyBillingBlocks(entries: SentinelUsageEntry[]): SentinelBillingBl
     console.log(`Total entries in block: ${currentBlockEntries.length}`)
     console.log(`Total tokens: ${usage.toLocaleString()}`)
     console.log(`Average tokens per entry: ${Math.round(usage / currentBlockEntries.length)}`)
-    
-    console.log(`\nFirst 10 entries breakdown:`)
-    const sampleEntries = currentBlockEntries.slice(0, 10)
-    sampleEntries.forEach((entry, idx) => {
-      const entryTime = new Date(entry.timestamp).toLocaleTimeString()
-      console.log(`  ${idx + 1}. [${entryTime}] ${entry.totalTokens.toLocaleString()} tokens (in: ${entry.inputTokens.toLocaleString()}, out: ${entry.outputTokens.toLocaleString()}) - ${entry.model}`)
-    })
-    
-    if (currentBlockEntries.length > 10) {
-      console.log(`  ... and ${currentBlockEntries.length - 10} more entries`)
-    }
+    console.log(`Block is: ${isActive ? 'ACTIVE' : 'EXPIRED'}`)
+    console.log(`Time remaining: ${timeRemaining ? `${timeRemaining} minutes` : 'None'}`)
     console.log(`=====================================\n`)
   }
   
-  // Check for unusually large entries
-  const largeEntries = currentBlockEntries.filter(e => e.totalTokens > 50000)
-  if (DEBUG && largeEntries.length > 0) {
-    console.log(`Sentinel: Found ${largeEntries.length} entries with >50K tokens:`)
-    largeEntries.slice(0, 3).forEach((entry, idx) => {
-      console.log(`  Large entry ${idx + 1}: ${entry.totalTokens} tokens (${entry.model})`)
-    })
-  }
-  
-  // A block is active if current time is within the 5-hour window
-  const isActive = now >= blockStart && now <= blockEnd
-  const timeRemaining = isActive ? Math.max(0, Math.floor((blockEnd.getTime() - now.getTime()) / (1000 * 60))) : null
-  
-  if (DEBUG) {
-    console.log(`Sentinel: Current billing block: ${usage} tokens from ${currentBlockEntries.length} entries (${isActive ? 'ACTIVE' : 'EXPIRED'})`)
-    console.log(`Sentinel: Block window: ${blockStart.toLocaleString()} - ${blockEnd.toLocaleString()}`)
-    console.log(`Sentinel: Average tokens per entry: ${Math.round(usage / currentBlockEntries.length)}`)
-  }
-  
-  // Calculate stable limit based on historical data with smoothing
-  // Find all historical completed blocks to determine the maximum usage
-  const allBlocks = findAllHistoricalBlocks(entries)
-  
-  // Debug: show top 5 blocks
+  // Calculate stable limit based on historical data with smoothing  
+  // We already have allBlocks from the unified algorithm above
   const topBlocks = allBlocks
     .filter(block => !block.isActive && block.usage > 0)
     .sort((a, b) => b.usage - a.usage)
-    .slice(0, 10) // Look at top 10 instead of just top 5 for stability
+    .slice(0, 10) // Look at top 10 for stability
   
-  if (DEBUG) console.log(`Sentinel: Found ${allBlocks.length} historical blocks, top 10:`)
+  if (DEBUG) console.log(`Sentinel: Found ${allBlocks.length} total blocks, top 5 completed:`)
   topBlocks.slice(0, 5).forEach((block, idx) => {
-    const startDate = block.blockStart ? block.blockStart.toLocaleString() : 'unknown'
-    const entryCount = block.entryCount || 'unknown'
-    if (DEBUG) console.log(`  Block ${idx + 1}: ${block.usage.toLocaleString()} tokens (${entryCount} entries) ${block.isActive ? '(ACTIVE)' : '(completed)'} - ${startDate}`)
+    const startDate = block.blockStart.toLocaleString()
+    if (DEBUG) console.log(`  Block ${idx + 1}: ${block.usage.toLocaleString()} tokens (${block.entryCount} entries) - ${startDate}`)
   })
   
   // Use a more stable limit calculation based on Claude's actual limits and historical data
