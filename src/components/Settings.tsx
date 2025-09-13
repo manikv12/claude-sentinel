@@ -148,6 +148,7 @@ export function Settings() {
     setSettings({
       autoStart: false,
       minimizeToTray: true,
+      minimizeBehavior: 'floating',
       notifications: true,
       refreshInterval: 5,
       theme: 'system',

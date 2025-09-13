@@ -23,12 +23,12 @@ let tray: Tray | null = null
 let trayUsageInterval: NodeJS.Timeout | null = null
 
 
-// Create a high-quality PNG battery icon for macOS menu bar
+// Create a high-quality PNG pulse icon for macOS menu bar
 const createBatteryIcon = (options?: { size?: number; percentage?: number }) => {
   const baseSize = options?.size ?? 16 // Base size for menu bar
   const percentage = Math.max(0, Math.min(100, options?.percentage ?? 0))
 
-  console.log(`Creating HD tray battery icon: ${percentage}% - size: ${baseSize}px`)
+  console.log(`Creating HD tray pulse icon: ${percentage}% - size: ${baseSize}px`)
 
   try {
     // Create ultra high-DPI canvas (4x for maximum Retina quality)
