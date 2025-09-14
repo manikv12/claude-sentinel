@@ -5,7 +5,7 @@
 
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'fs'
 import { join } from 'path'
-import { homedir } from 'os'
+import { app } from 'electron'
 import { setImmediate, setTimeout } from 'timers'
 
 import { 
@@ -17,15 +17,15 @@ import { renewalLogger } from './log-service'
 
 import { getCurrentBlockInfo as getCurrentBlockInfoLib } from '../../src/lib/ccusage-integration'
 
-const HOME = homedir()
-const PID_FILE = join(HOME, '.claude-sentinel-renewal.pid')
-const CONFIG_FILE = join(HOME, '.claude-sentinel-config.json')
-const START_TIME_FILE = join(HOME, '.claude-auto-renew-start-time')
-const LAST_BLOCK_STATE_FILE = join(HOME, '.claude-last-block-state')
-const RENEWAL_LOCK_FILE = join(HOME, '.claude-sentinel-renewal-lock')
-const LAST_RENEWAL_CHECK_FILE = join(HOME, '.claude-last-renewal-check')
-const SCHEDULED_RENEWAL_STATE_FILE = join(HOME, '.claude-scheduled-renewal-state')
-const LAST_SUCCESSFUL_RENEWAL_FILE = join(HOME, '.claude-last-successful-renewal')
+const USER_DATA = app.getPath('userData')
+const PID_FILE = join(USER_DATA, 'renewal.pid')
+const CONFIG_FILE = join(USER_DATA, 'renewal-config.json')
+const START_TIME_FILE = join(USER_DATA, 'auto-renew-start-time')
+const LAST_BLOCK_STATE_FILE = join(USER_DATA, 'last-block-state')
+const RENEWAL_LOCK_FILE = join(USER_DATA, 'renewal-lock')
+const LAST_RENEWAL_CHECK_FILE = join(USER_DATA, 'last-renewal-check')
+const SCHEDULED_RENEWAL_STATE_FILE = join(USER_DATA, 'scheduled-renewal-state')
+const LAST_SUCCESSFUL_RENEWAL_FILE = join(USER_DATA, 'last-successful-renewal')
 
 type SimpleConfig = { 
   enabled: boolean; 
@@ -392,10 +392,10 @@ export function setScheduledStartTime(isoTime: string | null) {
 }
 
 // Compose renewal status using cached usage analysis instead of blocking ccusage CLI
-export function getRenewalStatus() {
+export async function getRenewalStatus() {
   const cfg = loadConfig()
   const proc = isProcessRunning()
-  const block = getCurrentBlockInfoLib()
+  const block = await getCurrentBlockInfoLib()
 
   // Only perform block monitoring if auto-renewal is enabled
   if (cfg.enabled) {
@@ -408,15 +408,29 @@ export function getRenewalStatus() {
   // Calculate next renewal time based on block data instead of lastActivity
   let nextRenewal: Date | null = null
   
+  // Debug logging for next renewal calculation
+  renewalLogger.debug(`Next renewal calculation: scheduledStartTime=${scheduledStartTime}, block=${block ? `active=${block.isActive}, startTime=${block.startTime}, endTime=${block.endTime}` : 'null'}`, 'renewal')
+  
   if (scheduledStartTime) {
     // If user has scheduled a time, that's the next renewal
     nextRenewal = new Date(scheduledStartTime)
+    renewalLogger.debug(`Using scheduled start time: ${nextRenewal.toISOString()}`, 'renewal')
   } else if (block && block.isActive && block.endTime) {
     // Next renewal is when current block ends
     nextRenewal = new Date(block.endTime)
+    renewalLogger.debug(`Using active block end time: ${nextRenewal.toISOString()}`, 'renewal')
   } else if (block && block.startTime) {
     // Fallback: 5 hours after block start time
     nextRenewal = new Date(new Date(block.startTime).getTime() + 5 * 60 * 60 * 1000)
+    renewalLogger.debug(`Using block start time + 5h: ${nextRenewal.toISOString()}`, 'renewal')
+  } else if (block && block.endTime) {
+    // Block exists but is not active - next renewal is when it ends
+    nextRenewal = new Date(block.endTime)
+    renewalLogger.debug(`Using inactive block end time: ${nextRenewal.toISOString()}`, 'renewal')
+  } else {
+    // No block data available - estimate next renewal as 5 hours from now
+    nextRenewal = new Date(Date.now() + 5 * 60 * 60 * 1000)
+    renewalLogger.debug(`Using fallback time (now + 5h): ${nextRenewal.toISOString()}`, 'renewal')
   }
   
   // Use the current block's time remaining instead of calculating from lastActivity
@@ -476,7 +490,7 @@ export function performRenewalCheck(): { success: boolean; action?: string; erro
         return { success: true, action: `Renewal blocked: ${renewalCheck.hoursRemaining?.toFixed(1)} hours remaining` }
       }
       
-      const block = getCurrentBlockInfoLib()
+      const block = await getCurrentBlockInfoLib()
       
       // Detect and log any block state changes during renewal check
       detectAndLogBlockChanges(block)

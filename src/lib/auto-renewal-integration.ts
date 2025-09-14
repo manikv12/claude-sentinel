@@ -8,10 +8,25 @@ import * as childProcess from 'child_process'
 import * as path from 'path'
 import * as os from 'os'
 
-const { existsSync, readFileSync, writeFileSync, unlinkSync, appendFileSync } = fs
+const { existsSync, readFileSync, writeFileSync, unlinkSync, appendFileSync, mkdirSync } = fs
 const { spawn, spawnSync } = childProcess
 const { join } = path
 const { homedir } = os
+
+// Get app data directory - prefer Electron app.getPath if available, fallback to home
+function getAppDataDir(): string {
+  try {
+    // Try to use Electron's app.getPath if available
+    const electron = require('electron')
+    const app = electron.app || electron.remote?.app
+    if (app) {
+      return app.getPath('userData')
+    }
+  } catch {
+    // Fallback to home directory if not in Electron context
+  }
+  return join(homedir(), '.claude-sentinel')
+}
 
 export interface RenewalConfig {
   enabled: boolean
@@ -30,11 +45,18 @@ export interface RenewalStatus {
   error?: string
 }
 
-const HOME = homedir()
-const PID_FILE = join(HOME, '.claude-sentinel-renewal.pid')
-const CONFIG_FILE = join(HOME, '.claude-sentinel-config.json')
-const LAST_ACTIVITY_FILE = join(HOME, '.claude-last-activity')
-const START_TIME_FILE = join(HOME, '.claude-auto-renew-start-time')
+const APP_DATA_DIR = getAppDataDir()
+const PID_FILE = join(APP_DATA_DIR, 'renewal.pid')
+const CONFIG_FILE = join(APP_DATA_DIR, 'config.json')
+const LAST_ACTIVITY_FILE = join(APP_DATA_DIR, 'last-activity')
+const START_TIME_FILE = join(APP_DATA_DIR, 'auto-renew-start-time')
+
+// Helper function to ensure directory exists before file operations
+function ensureAppDataDir() {
+  if (!existsSync(APP_DATA_DIR)) {
+    mkdirSync(APP_DATA_DIR, { recursive: true })
+  }
+}
 
 // Import renewal logger (dynamic import to avoid circular dependency)
 let renewalLogger: any = null
@@ -295,6 +317,7 @@ export function loadConfig(): RenewalConfig {
  */
 export function saveConfig(config: RenewalConfig): void {
   try {
+    ensureAppDataDir()
     writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2))
     log(`Configuration saved: enabled=${config.enabled}`)
   } catch (error) {
@@ -309,6 +332,7 @@ export function setScheduledStartTime(isoTime: string | null): { success: boolea
       if (existsSync(START_TIME_FILE)) unlinkSync(START_TIME_FILE)
       return { success: true }
     }
+    ensureAppDataDir()
     writeFileSync(START_TIME_FILE, isoTime)
     return { success: true }
   } catch (error) {
@@ -392,6 +416,7 @@ export function startRenewalService(): { success: boolean; error?: string } {
     saveConfig(config)
     
     // Write PID file
+    ensureAppDataDir()
     writeFileSync(PID_FILE, process.pid.toString())
     
     // Start monitoring loop (this would run in the main process)
@@ -438,7 +463,7 @@ export function resetSessionTracking(): { success: boolean; error?: string } {
     const filesToReset = [
       LAST_ACTIVITY_FILE, 
       START_TIME_FILE,
-      join(homedir(), '.claude-last-block-state'),
+      join(APP_DATA_DIR, 'last-block-state'),
       join(homedir(), '.claude-last-renewal-check'),
       join(homedir(), '.claude-sentinel-renewal-lock')
     ]
@@ -512,7 +537,7 @@ export function getSessionStatus(): {
     START_TIME_FILE, 
     PID_FILE,
     CONFIG_FILE,
-    join(homedir(), '.claude-last-block-state'),
+    join(APP_DATA_DIR, 'last-block-state'),
     join(homedir(), '.claude-last-renewal-check'),
     join(homedir(), '.claude-sentinel-renewal-lock')
   ]

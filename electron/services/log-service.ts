@@ -40,7 +40,11 @@ class RenewalLogService {
         require('fs').mkdirSync(this.logsDir, { recursive: true })
       }
     } catch (error) {
-      console.error('Failed to create logs directory:', error)
+      try {
+        console.error('Failed to create logs directory:', error)
+      } catch {
+        // Silently fail if console is not available
+      }
     }
   }
 
@@ -58,15 +62,26 @@ class RenewalLogService {
     try {
       const logFile = this.getTodayLogFile()
       const logEntry = this.formatLogEntry(level, message, category)
-      
+
       appendFileSync(logFile, logEntry)
-      
-      // Also log to console in development
+
+      // Also log to console in development - with error handling
       if (process.env.NODE_ENV === 'development') {
-        console.log(`[RENEWAL LOG] ${logEntry.trim()}`)
+        try {
+          console.log(`[RENEWAL LOG] ${logEntry.trim()}`)
+        } catch (consoleError) {
+          // Silently fail console logging to prevent EIO errors from crashing the app
+          // The file logging above is the primary mechanism
+        }
       }
     } catch (error) {
-      console.error('Failed to write to renewal log:', error)
+      // Only try console.error if we can safely do so
+      try {
+        console.error('Failed to write to renewal log:', error)
+      } catch {
+        // If even console.error fails, there's nothing more we can do
+        // The application should continue running
+      }
     }
   }
 
@@ -80,6 +95,10 @@ class RenewalLogService {
 
   error(message: string, category: RenewalLogEntry['category'] = 'service') {
     this.log('error', message, category)
+  }
+
+  debug(message: string, category: RenewalLogEntry['category'] = 'service') {
+    this.log('info', `[DEBUG] ${message}`, category)
   }
 
   // Get all log entries from recent days
@@ -107,7 +126,11 @@ class RenewalLogService {
         }
       }
     } catch (error) {
-      console.error('Failed to read logs:', error)
+      try {
+        console.error('Failed to read logs:', error)
+      } catch {
+        // Silently fail if console is not available
+      }
     }
     
     // Sort by timestamp (newest first)
@@ -162,7 +185,11 @@ class RenewalLogService {
         }
       }
     } catch (error) {
-      console.error('Failed to clean old logs:', error)
+      try {
+        console.error('Failed to clean old logs:', error)
+      } catch {
+        // Silently fail if console is not available
+      }
     }
   }
 
@@ -185,7 +212,11 @@ class RenewalLogService {
         }
       }
     } catch (error) {
-      console.error('Failed to clear logs:', error)
+      try {
+        console.error('Failed to clear logs:', error)
+      } catch {
+        // Silently fail if console is not available
+      }
     }
   }
 

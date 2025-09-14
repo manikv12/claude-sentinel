@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, Notification } from 'electron'
+import { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, Notification, dialog, shell } from 'electron'
 import { join } from 'path'
 import * as fs from 'fs'
 import * as path from 'path'
@@ -14,6 +14,7 @@ import {
   loadConfig
 } from './services/renewal-service'
 import { renewalLogger } from './services/log-service'
+import { specService } from './services/spec-service'
 
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'] || 'http://localhost:5173'
 
@@ -466,7 +467,7 @@ const updateTrayUsage = () => {
   tray.setToolTip(tooltipLines.join('\n'))
 
   // Refresh tray context menu to reflect latest usage
-  try { updateTrayMenu() } catch {}
+  try { updateTrayMenu().catch(console.error) } catch {}
 }
 
 const startTrayUsageUpdates = () => {
@@ -514,6 +515,14 @@ const createWindow = () => {
   if (isDev) {
     mainWindow.webContents.openDevTools()
   }
+
+  // Add keyboard shortcut for DevTools (Cmd+Option+I on macOS, F12 on Windows/Linux)
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    if (input.key === 'F12' ||
+        (input.key === 'i' && input.meta && input.alt)) {
+      mainWindow.webContents.toggleDevTools()
+    }
+  })
 
   // Handle window close button - hide to menu bar instead of closing
   mainWindow.on('close', (event) => {
@@ -878,7 +887,7 @@ const scheduleNextRenewal = () => {
               mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
             }
             if (result.success && result.action && tray) {
-              updateTrayMenu()
+              updateTrayMenu().catch(console.error)
               updateTrayUsage()
             }
 
@@ -968,7 +977,7 @@ const scheduleNextRenewal = () => {
               mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
             }
             if (result.success && result.action && tray) {
-              updateTrayMenu()
+              updateTrayMenu().catch(console.error)
               updateTrayUsage()
             }
 
@@ -1055,22 +1064,26 @@ const forceStopAllTimers = () => {
   renewalLogger.info('🛑 ALL timers force-stopped', 'service')
 }
 
-const updateTrayMenu = () => {
+const updateTrayMenu = async () => {
   if (!tray) return
 
-  const status = getRenewalStatus()
-  const block = getCurrentBlockInfo()
+  const status = await getRenewalStatus()
+  const block = await getCurrentBlockInfo()
   const percent = block && block.limit > 0 ? Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100))) : null
   const usageLine = percent === null ? 'Usage: unknown' : `Usage: ${percent}% (${formatTokens(block.usage)} / ${formatTokens(block.limit)})`
   const timeLine = `Time remaining: ${formatMinutes(block?.timeRemaining ?? null)}`
 
   // Get next session time
   let nextSessionLine = null
+  console.log(`Tray menu update: status.enabled=${status.enabled}, status.nextRenewal=${status.nextRenewal}`)
+  
   if (status.enabled && status.nextRenewal) {
     const nextRenewalTime = new Date(status.nextRenewal)
     const now = new Date()
     const isToday = nextRenewalTime.toDateString() === now.toDateString()
     const isTomorrow = nextRenewalTime.toDateString() === new Date(now.getTime() + 24*60*60*1000).toDateString()
+
+    console.log(`Next renewal time: ${nextRenewalTime.toISOString()}, isToday: ${isToday}, isTomorrow: ${isTomorrow}`)
 
     const timeOptions: Intl.DateTimeFormatOptions = {
       hour: '2-digit',
@@ -1089,6 +1102,9 @@ const updateTrayMenu = () => {
       }
       nextSessionLine = `Next session: ${nextRenewalTime.toLocaleDateString('en-US', dateOptions)} at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
     }
+    console.log(`Generated next session line: ${nextSessionLine}`)
+  } else {
+    console.log(`Next session line not generated: enabled=${status.enabled}, nextRenewal=${status.nextRenewal}`)
   }
 
   const menuItems = [
@@ -1150,11 +1166,13 @@ const updateTrayMenu = () => {
           
           // Notify renderer
           if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
+            getRenewalStatus().then(status => {
+              mainWindow.webContents.send('renewal-status-update', status)
+            }).catch(console.error)
           }
           
           // Update tray menu
-          updateTrayMenu()
+          updateTrayMenu().catch(console.error)
         } catch (error) {
           console.error('Error toggling auto-renewal from tray:', error)
         }
@@ -1180,8 +1198,8 @@ ipcMain.handle('app-version', () => {
 
 ipcMain.handle('get-usage-data', async () => {
   try {
-    const recentData = getRecentUsage(30) // Last 30 days
-    const blockInfo = getCurrentBlockInfo()
+    const recentData = await getRecentUsage(30) // Last 30 days
+    const blockInfo = await getCurrentBlockInfo()
     
     return {
       daily: recentData.daily.map(day => ({
@@ -1264,7 +1282,7 @@ ipcMain.handle('toggle-auto-renewal', async (_, enabled: boolean, scheduledTime?
     }
     
     // Update tray menu
-    updateTrayMenu()
+    updateTrayMenu().catch(console.error)
     
     return { success: result.success, enabled, error: result.error }
   } catch (error) {
@@ -1331,8 +1349,8 @@ ipcMain.handle('minimize-to-tray', async () => {
 
 ipcMain.handle('refresh-usage-data', async () => {
   try {
-    const recentData = getRecentUsage(30) // Last 30 days
-    const blockInfo = getCurrentBlockInfo()
+    const recentData = await getRecentUsage(30) // Last 30 days
+    const blockInfo = await getCurrentBlockInfo()
     
     const data = {
       daily: recentData.daily.map(day => ({
@@ -1378,8 +1396,8 @@ ipcMain.handle('hard-refresh-usage-data', async () => {
     // Small delay to allow filesystem writes to settle when called after imports
     await new Promise((r) => setTimeout(r, 200))
 
-    const recentData = getRecentUsage(30)
-    const blockInfo = getCurrentBlockInfo()
+    const recentData = await getRecentUsage(30)
+    const blockInfo = await getCurrentBlockInfo()
 
     const data = {
       daily: recentData.daily.map(day => ({
@@ -2089,9 +2107,9 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
     try {
       const { resetUsageCache } = require('../src/lib/ccusage-integration')
       resetUsageCache()
-      setTimeout(() => {
+      setTimeout(async () => {
         try {
-          const data = getRecentUsage(30)
+          const data = await getRecentUsage(30)
           const usageUpdateData = {
             daily: data.daily.map(day => ({
               date: day.date,
@@ -2108,7 +2126,7 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
               totalSessions: data.totalSessions,
               averageTokensPerSession: data.totalSessions > 0 ? data.totalTokens / data.totalSessions : 0
             },
-            currentBlock: getCurrentBlockInfo()
+            currentBlock: await getCurrentBlockInfo()
           }
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('usage-update', usageUpdateData)
@@ -2155,7 +2173,7 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
 })
 
 // Settings management
-const getSettingsFilePath = () => path.join(os.homedir(), '.claude-sentinel-settings.json')
+const getSettingsFilePath = () => path.join(app.getPath('userData'), 'settings.json')
 
 const getDefaultSettings = () => ({
   autoStart: false,
@@ -2348,7 +2366,7 @@ ipcMain.handle('get-block-snapshot', async () => {
 ipcMain.handle('get-daily-blocks', async (_, date?: string) => {
   try {
     const { getCurrentBlockInfo } = await import('./services/ccusage-service')
-    const blockInfo = getCurrentBlockInfo()
+    const blockInfo = await getCurrentBlockInfo()
     
     // For now, return current block info. This could be enhanced to filter by date
     return blockInfo ? [blockInfo] : []
@@ -2460,9 +2478,9 @@ ipcMain.handle('clear-claude-usage-data', async (_, daysToKeep: number = 0) => {
       const { resetUsageCache } = require('../src/lib/ccusage-integration')
       resetUsageCache()
       
-      setTimeout(() => {
+      setTimeout(async () => {
         try {
-          const data = getRecentUsage(30)
+          const data = await getRecentUsage(30)
           const usageUpdateData = {
             daily: data.daily.map(day => ({
               date: day.date,
@@ -2479,7 +2497,7 @@ ipcMain.handle('clear-claude-usage-data', async (_, daysToKeep: number = 0) => {
               totalSessions: data.totalSessions,
               averageTokensPerSession: data.totalSessions > 0 ? data.totalTokens / data.totalSessions : 0
             },
-            currentBlock: getCurrentBlockInfo()
+            currentBlock: await getCurrentBlockInfo()
           }
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('usage-update', usageUpdateData)
@@ -2572,5 +2590,203 @@ ipcMain.handle('show-main-window', async () => {
   } catch (error) {
     console.error('Error showing main window:', error)
     return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+})
+
+// AI Specification Development IPC Handlers
+ipcMain.handle('spec-create-project', async (_, projectData) => {
+  try {
+    return await specService.createProject(projectData)
+  } catch (error) {
+    console.error('Error creating project:', error)
+    throw error
+  }
+})
+
+// Create user project from selected folder
+ipcMain.handle('spec-create-user-project', async (_, selectedPath, projectName, description) => {
+  try {
+    console.log('🏗️ Creating user project:', { selectedPath, projectName, description })
+    const result = await specService.createUserProject(selectedPath, projectName, description)
+    console.log('✅ User project created successfully:', result)
+    return result
+  } catch (error) {
+    console.error('❌ Error creating user project:', error)
+    throw error
+  }
+})
+
+// Show folder selection dialog
+ipcMain.handle('show-open-dialog', async (_, options) => {
+  try {
+    console.log('🔍 show-open-dialog called with options:', options)
+    const result = mainWindow
+      ? await dialog.showOpenDialog(mainWindow, options)
+      : await dialog.showOpenDialog(options)
+    console.log('🔍 Dialog result:', result)
+    return result
+  } catch (error) {
+    console.error('❌ Error showing open dialog:', error)
+    throw error
+  }
+})
+
+// Show input dialog for text input
+ipcMain.handle('show-input-dialog', async (_, options) => {
+  try {
+    console.log('💬 show-input-dialog called with options:', options)
+    const result = mainWindow
+      ? await dialog.showMessageBox(mainWindow, {
+          type: 'question',
+          title: options.title || 'Input',
+          message: options.message || 'Enter value:',
+          detail: options.placeholder,
+          buttons: ['OK', 'Cancel'],
+          defaultId: 0,
+          cancelId: 1,
+          noLink: true
+        })
+      : await dialog.showMessageBox({
+          type: 'question',
+          title: options.title || 'Input',
+          message: options.message || 'Enter value:',
+          detail: options.placeholder,
+          buttons: ['OK', 'Cancel'],
+          defaultId: 0,
+          cancelId: 1,
+        })
+
+    // For now, return the default value if OK is clicked, null if canceled
+    // This is a simple implementation - in production you'd want a proper input dialog
+    if (result.response === 0) {
+      return options.defaultValue || 'New Project'
+    }
+    return null
+  } catch (error) {
+    console.error('❌ Error showing input dialog:', error)
+    throw error
+  }
+})
+
+
+ipcMain.handle('spec-get-projects', async () => {
+  try {
+    console.log('📂 Loading projects from backend...')
+    const projects = await specService.getProjects()
+    console.log('📂 Loaded projects:', projects)
+    return projects
+  } catch (error) {
+    console.error('❌ Error getting projects:', error)
+    return []
+  }
+})
+
+ipcMain.handle('spec-save-specification', async (_, projectId, spec) => {
+  try {
+    await specService.saveSpecification(projectId, spec)
+    return { success: true }
+  } catch (error) {
+    console.error('Error saving specification:', error)
+    throw error
+  }
+})
+
+ipcMain.handle('spec-load-specifications', async (_, projectId) => {
+  try {
+    return await specService.loadSpecifications(projectId)
+  } catch (error) {
+    console.error('Error loading specifications:', error)
+    return []
+  }
+})
+
+ipcMain.handle('spec-delete-specification', async (_, projectId, specId) => {
+  try {
+    await specService.deleteSpecification(projectId, specId)
+    return { success: true }
+  } catch (error) {
+    console.error('Error deleting specification:', error)
+    throw error
+  }
+})
+
+// Execute AI specification command with streaming support
+ipcMain.handle('spec-execute-command', async (_, command, content, projectPath) => {
+  try {
+    return await specService.executeClaudeCodeCommand(command, content, projectPath, mainWindow || undefined)
+  } catch (error) {
+    console.error('Error executing AI specification command:', error)
+    throw error
+  }
+})
+
+// Execute command with streaming (for real-time updates)
+ipcMain.handle('spec-execute-command-stream', async (_, command, content, projectPath) => {
+  try {
+    return new Promise((resolve, reject) => {
+      specService.executeClaudeCodeCommand(
+        command,
+        content,
+        projectPath,
+        mainWindow || undefined,
+        // Stream callback - send updates to renderer
+        (chunk: string) => {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('spec-command-stream', chunk)
+          }
+        }
+      ).then(resolve).catch(reject)
+    })
+  } catch (error) {
+    console.error('Error executing streaming command:', error)
+    throw error
+  }
+})
+
+// Get AI tools status
+ipcMain.handle('spec-get-ai-status', async () => {
+  try {
+    return await specService.getAIToolsStatus()
+  } catch (error) {
+    console.error('Error getting AI tools status:', error)
+    return { available: false, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+})
+
+// Open path in OS file manager
+ipcMain.handle('open-path', async (_, targetPath) => {
+  try {
+    await shell.openPath(targetPath)
+    return { success: true }
+  } catch (error) {
+    console.error('Error opening path:', error)
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+})
+
+ipcMain.handle('spec-export-specification', async (_, specId, projectId, format) => {
+  try {
+    return await specService.exportSpecification(specId, projectId, format)
+  } catch (error) {
+    console.error('Error exporting specification:', error)
+    throw error
+  }
+})
+
+ipcMain.handle('spec-get-stats', async () => {
+  try {
+    return await specService.getStats()
+  } catch (error) {
+    console.error('Error getting spec stats:', error)
+    return { projects: 0, specs: 0, totalSize: 0 }
+  }
+})
+
+ipcMain.handle('spec-get-directory', async () => {
+  try {
+    return await specService.getSpecDirectory()
+  } catch (error) {
+    console.error('Error getting spec directory:', error)
+    throw error
   }
 })

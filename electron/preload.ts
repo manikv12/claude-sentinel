@@ -51,7 +51,35 @@ const electronAPI = {
   exportClaudeUsageLogs: (fromDate?: string, toDate?: string) => ipcRenderer.invoke('export-claude-usage-logs', fromDate, toDate),
   importClaudeUsageLogs: (options?: { mergeMode?: boolean, skipDuplicates?: boolean }) => ipcRenderer.invoke('import-claude-usage-logs', options),
   clearClaudeUsageData: (daysToKeep?: number) => ipcRenderer.invoke('clear-claude-usage-data', daysToKeep),
-  
+
+  // AI Specification Development
+  specCreateProject: (projectData: any) => ipcRenderer.invoke('spec-create-project', projectData),
+  specCreateUserProject: (selectedPath: string, projectName: string, description: string) => ipcRenderer.invoke('spec-create-user-project', selectedPath, projectName, description),
+  specGetProjects: () => ipcRenderer.invoke('spec-get-projects'),
+  specSaveSpecification: (projectId: string, spec: any) => ipcRenderer.invoke('spec-save-specification', projectId, spec),
+  specLoadSpecifications: (projectId: string) => ipcRenderer.invoke('spec-load-specifications', projectId),
+  specDeleteSpecification: (projectId: string, specId: string) => ipcRenderer.invoke('spec-delete-specification', projectId, specId),
+  specExecuteCommand: (command: string, content: string, projectPath: string) => ipcRenderer.invoke('spec-execute-command', command, content, projectPath),
+  specExecuteCommandStream: (command: string, content: string, projectPath: string) => ipcRenderer.invoke('spec-execute-command-stream', command, content, projectPath),
+  specExportSpecification: (specId: string, projectId: string, format?: string) => ipcRenderer.invoke('spec-export-specification', specId, projectId, format),
+  specGetStats: () => ipcRenderer.invoke('spec-get-stats'),
+  specGetDirectory: () => ipcRenderer.invoke('spec-get-directory'),
+  specGetAIStatus: () => ipcRenderer.invoke('spec-get-ai-status'),
+
+  // Folder selection
+  showOpenDialog: (options: any) => ipcRenderer.invoke('show-open-dialog', options),
+  showInputDialog: (options: any) => ipcRenderer.invoke('show-input-dialog', options),
+  openPath: (targetPath: string) => ipcRenderer.invoke('open-path', targetPath),
+
+  // Stream events
+  onSpecCommandStream: (callback: (chunk: string) => void) => {
+    ipcRenderer.on('spec-command-stream', (_, chunk) => callback(chunk))
+  },
+
+  removeSpecCommandStreamListeners: () => {
+    ipcRenderer.removeAllListeners('spec-command-stream')
+  },
+
   // Event listeners
   onToggleAutoRenewal: (callback: (enabled: boolean) => void) => {
     ipcRenderer.on('toggle-auto-renewal', (_, enabled) => callback(enabled))

@@ -3,9 +3,25 @@
  * Logs all detected blocks and their transitions for debugging
  */
 
-import { writeFileSync, readFileSync, existsSync, appendFileSync } from 'fs'
+import { writeFileSync, readFileSync, existsSync, appendFileSync, mkdirSync } from 'fs'
 import { join } from 'path'
-import { homedir } from 'os'
+// import { homedir } from 'os' // No longer needed
+
+// Get app data directory - prefer Electron app.getPath if available, fallback to home
+function getAppDataDir(): string {
+  try {
+    // Try to use Electron's app.getPath if available
+    const electron = require('electron')
+    const app = electron.app || electron.remote?.app
+    if (app) {
+      return app.getPath('userData')
+    }
+  } catch {
+    // Fallback to home directory if not in Electron context
+  }
+  // If not in Electron, use a temp directory instead of home
+  return join(require('os').tmpdir(), 'claude-sentinel')
+}
 
 export interface BlockEvent {
   timestamp: string
@@ -40,8 +56,10 @@ export interface BlockSnapshot {
   lastAnalysis: string
 }
 
-const BLOCK_LOG_FILE = join(homedir(), '.claude-sentinel-block-log.jsonl')
-const BLOCK_SNAPSHOT_FILE = join(homedir(), '.claude-sentinel-block-snapshot.json')
+// Ensure app data directory exists
+const APP_DATA_DIR = getAppDataDir()
+const BLOCK_LOG_FILE = join(APP_DATA_DIR, 'block-log.jsonl')
+const BLOCK_SNAPSHOT_FILE = join(APP_DATA_DIR, 'block-snapshot.json')
 
 /**
  * Log a block event for debugging
@@ -51,8 +69,12 @@ export function logBlockEvent(event: Omit<BlockEvent, 'timestamp'>) {
     timestamp: new Date().toISOString(),
     ...event
   }
-  
+
   try {
+    // Ensure directory exists
+    if (!existsSync(APP_DATA_DIR)) {
+      mkdirSync(APP_DATA_DIR, { recursive: true })
+    }
     appendFileSync(BLOCK_LOG_FILE, JSON.stringify(fullEvent) + '\n')
   } catch (error) {
     console.warn('Failed to log block event:', error)
@@ -67,8 +89,12 @@ export function saveBlockSnapshot(snapshot: Omit<BlockSnapshot, 'timestamp'>) {
     timestamp: new Date().toISOString(),
     ...snapshot
   }
-  
+
   try {
+    // Ensure directory exists
+    if (!existsSync(APP_DATA_DIR)) {
+      mkdirSync(APP_DATA_DIR, { recursive: true })
+    }
     writeFileSync(BLOCK_SNAPSHOT_FILE, JSON.stringify(fullSnapshot, null, 2))
   } catch (error) {
     console.warn('Failed to save block snapshot:', error)

@@ -144,16 +144,22 @@ export const useRenewalStore = create<RenewalStore>((set, get) => ({
   refreshStatus: async () => {
     set({ isLoading: true, error: null })
     try {
+      if (!window.electronAPI?.getRenewalStatus) {
+        console.warn('Running in development mode - Electron API not available')
+        set({ isLoading: false })
+        return
+      }
+
       // Add timeout to prevent hanging
       const timeoutPromise = new Promise((_, reject) => {
         setTimeout(() => reject(new Error('Request timeout')), 8000) // 8 second timeout
       })
-      
+
       const status = await Promise.race([
         window.electronAPI.getRenewalStatus(),
         timeoutPromise
       ])
-      
+
       get().setRenewalStatus(status)
     } catch (error) {
       set({ error: error instanceof Error ? error.message : 'Failed to load renewal status' })

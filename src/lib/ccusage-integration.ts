@@ -5,7 +5,7 @@
 
 import { readFileSync, existsSync, readdirSync, statSync } from 'fs'
 import { join } from 'path'
-import { homedir } from 'os'
+// import { homedir } from 'os' // No longer used - moved to userData
 import { 
   logBlockEvent, 
   saveBlockSnapshot, 
@@ -100,7 +100,7 @@ export interface SentinelUsageAnalysis {
  * Get possible Claude data directories
  */
 export function getClaudeDataPaths(): string[] {
-  const home = homedir()
+  const home = require('os').homedir()
   return [
     join(home, '.config', 'claude', 'projects'),
     join(home, '.claude', 'projects')
@@ -243,14 +243,14 @@ function groupByDate(entries: SentinelUsageEntry[]): Map<string, SentinelDailyUs
 interface HistoricalBlockMeta { isActive: boolean; usage: number; blockStart: Date; blockEnd: Date; entryCount: number; entries: SentinelUsageEntry[] }
 function findAllHistoricalBlocks(entries: SentinelUsageEntry[]): HistoricalBlockMeta[] {
   if (entries.length === 0) return []
-  
+
   const sessionDurationMs = 5 * 60 * 60 * 1000 // 5 hours in milliseconds
   const blocks: HistoricalBlockMeta[] = []
-  const sortedEntries = [...entries].sort((a, b) => 
+  const sortedEntries = [...entries].sort((a, b) =>
     new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
   )
   const now = new Date()
-  
+
   // Floor to hour function - consistent with Claude's behavior
   function floorToHour(timestamp: Date): Date {
     const floored = new Date(timestamp)
@@ -258,55 +258,124 @@ function findAllHistoricalBlocks(entries: SentinelUsageEntry[]): HistoricalBlock
     floored.setMilliseconds(0)
     return floored
   }
-  
-  // Group entries into 5-hour blocks starting from floored hours
-  let i = 0
-  while (i < sortedEntries.length) {
-    const firstEntry = sortedEntries[i]
-    const blockStart = floorToHour(new Date(firstEntry.timestamp))
-    const blockEnd = new Date(blockStart.getTime() + sessionDurationMs)
-    
-    // Collect all entries that fall within this 5-hour block
-    const blockEntries: SentinelUsageEntry[] = []
-    while (i < sortedEntries.length) {
-      const entryTime = new Date(sortedEntries[i].timestamp)
-      if (entryTime >= blockStart && entryTime < blockEnd) {
-        blockEntries.push(sortedEntries[i])
-        i++
-      } else {
-        break // Entry belongs to next block
-      }
+
+  // Create gap block representing periods with no activity (adapted from ccusage-main)
+  function createGapBlock(lastActivityTime: Date, nextActivityTime: Date): HistoricalBlockMeta | null {
+    // Only create gap blocks for gaps longer than the session duration
+    const gapDuration = nextActivityTime.getTime() - lastActivityTime.getTime()
+    if (gapDuration <= sessionDurationMs) {
+      return null
     }
-    
-    if (blockEntries.length > 0) {
-      const blockUsage = blockEntries.reduce((sum, e) => sum + e.totalTokens, 0)
-      // Simple rule: block is active if current time is before block end
-      const isActive = now < blockEnd
-      
-      blocks.push({ 
-        isActive, 
-        usage: blockUsage, 
-        blockStart, 
-        blockEnd, 
-        entryCount: blockEntries.length,
-        entries: blockEntries
-      })
-      
-      // Log block event for tracking
-      logBlockEvent({
-        eventType: isActive ? 'block_detected' : 'block_ended',
-        blockId: createBlockId(blockStart),
-        blockStart: blockStart.toISOString(),
-        blockEnd: blockEnd.toISOString(),
-        usage: blockUsage,
-        isActive,
-        entryCount: blockEntries.length,
-        source: 'ccusage_analysis',
-        details: `Block ${isActive ? 'active' : 'ended'} with ${blockEntries.length} entries`
-      })
+
+    const gapStart = new Date(lastActivityTime.getTime() + sessionDurationMs)
+    const gapEnd = nextActivityTime
+
+    return {
+      isActive: false,
+      usage: 0,
+      blockStart: gapStart,
+      blockEnd: gapEnd,
+      entryCount: 0,
+      entries: []
     }
   }
-  
+
+  // Improved block detection logic adapted from ccusage-main
+  let currentBlockStart: Date | null = null
+  let currentBlockEntries: SentinelUsageEntry[] = []
+
+  for (const entry of sortedEntries) {
+    const entryTime = new Date(entry.timestamp)
+
+    if (currentBlockStart == null) {
+      // First entry - start a new block (floored to the hour)
+      currentBlockStart = floorToHour(entryTime)
+      currentBlockEntries = [entry]
+    } else {
+      const timeSinceBlockStart = entryTime.getTime() - currentBlockStart.getTime()
+      const lastEntry = currentBlockEntries[currentBlockEntries.length - 1]
+      if (lastEntry == null) {
+        continue
+      }
+      const lastEntryTime = new Date(lastEntry.timestamp)
+      const timeSinceLastEntry = entryTime.getTime() - lastEntryTime.getTime()
+
+      // Key fix: Check BOTH conditions like ccusage-main does
+      if (timeSinceBlockStart > sessionDurationMs || timeSinceLastEntry > sessionDurationMs) {
+        // Close current block
+        const blockEnd = new Date(currentBlockStart.getTime() + sessionDurationMs)
+        const blockUsage = currentBlockEntries.reduce((sum, e) => sum + e.totalTokens, 0)
+        const isActive = now < blockEnd
+
+        blocks.push({
+          isActive,
+          usage: blockUsage,
+          blockStart: currentBlockStart,
+          blockEnd,
+          entryCount: currentBlockEntries.length,
+          entries: currentBlockEntries
+        })
+
+        // Log block event for tracking
+        logBlockEvent({
+          eventType: isActive ? 'block_detected' : 'block_ended',
+          blockId: createBlockId(currentBlockStart),
+          blockStart: currentBlockStart.toISOString(),
+          blockEnd: blockEnd.toISOString(),
+          usage: blockUsage,
+          isActive,
+          entryCount: currentBlockEntries.length,
+          source: 'ccusage_analysis',
+          details: `Block ${isActive ? 'active' : 'ended'} with ${currentBlockEntries.length} entries`
+        })
+
+        // Add gap block if there's a significant gap
+        if (timeSinceLastEntry > sessionDurationMs) {
+          const gapBlock = createGapBlock(lastEntryTime, entryTime)
+          if (gapBlock != null) {
+            blocks.push(gapBlock)
+          }
+        }
+
+        // Start new block (floored to the hour)
+        currentBlockStart = floorToHour(entryTime)
+        currentBlockEntries = [entry]
+      } else {
+        // Add to current block
+        currentBlockEntries.push(entry)
+      }
+    }
+  }
+
+  // Close the last block
+  if (currentBlockStart != null && currentBlockEntries.length > 0) {
+    const blockEnd = new Date(currentBlockStart.getTime() + sessionDurationMs)
+    const blockUsage = currentBlockEntries.reduce((sum, e) => sum + e.totalTokens, 0)
+    const isActive = now < blockEnd
+
+    blocks.push({
+      isActive,
+      usage: blockUsage,
+      blockStart: currentBlockStart,
+      blockEnd,
+      entryCount: currentBlockEntries.length,
+      entries: currentBlockEntries
+    })
+
+    // Log block event for tracking
+    logBlockEvent({
+      eventType: isActive ? 'block_detected' : 'block_ended',
+      blockId: createBlockId(currentBlockStart),
+      blockStart: currentBlockStart.toISOString(),
+      blockEnd: blockEnd.toISOString(),
+      usage: blockUsage,
+      isActive,
+      entryCount: currentBlockEntries.length,
+      source: 'ccusage_analysis',
+      details: `Block ${isActive ? 'active' : 'ended'} with ${currentBlockEntries.length} entries`
+    })
+  }
+
   return blocks
 }
 
@@ -314,7 +383,7 @@ function findAllHistoricalBlocks(entries: SentinelUsageEntry[]): HistoricalBlock
  * Identify current billing block using the unified algorithm
  * Now uses the same logic as findAllHistoricalBlocks for consistency
  */
-function identifyBillingBlocks(entries: SentinelUsageEntry[]): SentinelBillingBlock[] {
+async function identifyBillingBlocks(entries: SentinelUsageEntry[]): Promise<SentinelBillingBlock[]> {
   if (entries.length === 0) return []
   
   // Use the unified block detection algorithm
@@ -370,17 +439,30 @@ function identifyBillingBlocks(entries: SentinelUsageEntry[]): SentinelBillingBl
   
   // Use a more stable limit calculation based on Claude's actual limits and historical data
   // Reference: Claude Pro ~45 messages per 5-hour block, Max 5x ~225 messages, Max 20x ~900 messages
-  // Estimated token equivalents: Pro ~100M, Max 5x ~500M, Max 20x ~2B tokens per block
+  // Estimated token equivalents: Pro ~400K, Max 5x ~880K, Max 20x ~3.5M tokens per block
   
-  // Get user's Claude plan preference (will be passed from settings in the future)
-  // For now, use Pro plan limit for consistent results (100M tokens)
-  let userPlan: 'pro' | 'max-5x' | 'max-20x' | 'auto' = 'max-5x'
+  // Get user's Claude plan preference from settings
+  // Default to 'auto' if not available
+  let userPlan: 'pro' | 'max-5x' | 'max-20x' | 'auto' = 'auto'
   
-  // Define plan-specific limits
+  // Try to get user plan from settings if available (browser/renderer context only)
+  try {
+    const globalThis_: any = globalThis
+    if (globalThis_.window?.electronAPI?.getSettings) {
+      const settings = await globalThis_.window.electronAPI.getSettings()
+      if (settings?.claudePlan) {
+        userPlan = settings.claudePlan
+      }
+    }
+  } catch (error) {
+    if (DEBUG) console.log('Could not load user plan setting, using auto-detect')
+  }
+  
+  // Define plan-specific limits (based on actual Claude limits from ccusage)
   const PLAN_LIMITS = {
-    'pro': 100_000_000,      // 100M tokens
-    'max-5x': 500_000_000,   // 500M tokens  
-    'max-20x': 2_000_000_000 // 2B tokens
+    'pro': 51_376_961,        // ~51M tokens (base plan limit)
+    'max-5x': 256_884_805,    // ~257M tokens (5x base plan)
+    'max-20x': 1_027_539_220  // ~1B tokens (20x base plan)
   }
   
   let stableLimit: number
@@ -394,7 +476,7 @@ function identifyBillingBlocks(entries: SentinelUsageEntry[]): SentinelBillingBl
     // Auto-detect: Calculate stable limit from top 3 historical blocks with reasonable bounds
     const top3Average = Math.round((topBlocks[0].usage + topBlocks[1].usage + topBlocks[2].usage) / 3)
     
-    // Apply reasonable bounds based on Claude plan limits (100M to 2B tokens)
+    // Apply reasonable bounds based on Claude plan limits (400K to 3.5M tokens)
     const MIN_REASONABLE_LIMIT = PLAN_LIMITS['pro']
     const MAX_REASONABLE_LIMIT = PLAN_LIMITS['max-20x']
     
@@ -411,9 +493,9 @@ function identifyBillingBlocks(entries: SentinelUsageEntry[]): SentinelBillingBl
     
   } else {
     // No historical data - use intelligent default based on current usage
-    if (usage > 500_000_000) {
+    if (usage > 3_500_000) {
       stableLimit = Math.max(PLAN_LIMITS['max-20x'], usage * 1.1) // Assume Max 20x plan for heavy users
-    } else if (usage > 100_000_000) {
+    } else if (usage > 880_000) {
       stableLimit = Math.max(PLAN_LIMITS['max-5x'], usage * 1.1)   // Assume Max 5x plan for moderate users
     } else {
       stableLimit = Math.max(PLAN_LIMITS['pro'], usage * 1.1)      // Assume Pro plan for light users
@@ -495,7 +577,7 @@ function loadIncrementalUpdates(): SentinelUsageEntry[] | null {
 /**
  * Load and analyze Claude usage data with Sentinel enhancements
  */
-export function loadSentinelUsageData(): SentinelUsageAnalysis {
+export async function loadSentinelUsageData(): Promise<SentinelUsageAnalysis> {
   const now = Date.now()
   
   // If we have cached data, try incremental updates first
@@ -503,7 +585,7 @@ export function loadSentinelUsageData(): SentinelUsageAnalysis {
     // For very recent requests, return cached analysis immediately
     if (cachedAnalysis) return cachedAnalysis
     // Fallback: compute once and cache
-    cachedAnalysis = processUsageEntries(cachedData)
+    cachedAnalysis = await processUsageEntries(cachedData)
     return cachedAnalysis
   }
   
@@ -521,13 +603,13 @@ export function loadSentinelUsageData(): SentinelUsageAnalysis {
       lastCacheTime = now
       if (DEBUG) console.log(`Sentinel: Added ${incrementalEntries.length} new entries via incremental update`)
       // Recompute analysis once and cache
-      cachedAnalysis = processUsageEntries(uniqueEntries)
+      cachedAnalysis = await processUsageEntries(uniqueEntries)
       return cachedAnalysis
     }
     // No updates found, return cached analysis if present
     if (cachedAnalysis) return cachedAnalysis
     // Fallback: compute once and cache
-    cachedAnalysis = processUsageEntries(cachedData)
+    cachedAnalysis = await processUsageEntries(cachedData)
     return cachedAnalysis
   }
   
@@ -551,11 +633,11 @@ export function loadSentinelUsageData(): SentinelUsageAnalysis {
   // Cache the loaded data and processed analysis
   cachedData = allEntries
   lastCacheTime = now
-  cachedAnalysis = processUsageEntries(allEntries)
+  cachedAnalysis = await processUsageEntries(allEntries)
   return cachedAnalysis
 }
 
-function processUsageEntries(allEntries: SentinelUsageEntry[]): SentinelUsageAnalysis {
+async function processUsageEntries(allEntries: SentinelUsageEntry[]): Promise<SentinelUsageAnalysis> {
   // Work on a sorted copy to avoid mutating cached arrays
   const sortedEntries = [...allEntries].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
   
@@ -569,7 +651,7 @@ function processUsageEntries(allEntries: SentinelUsageEntry[]): SentinelUsageAna
   const allSessions = new Set(sortedEntries.map(entry => entry.sessionId))
   
   // Identify billing blocks
-  const blocks = identifyBillingBlocks(sortedEntries)
+  const blocks = await identifyBillingBlocks(sortedEntries)
   const currentBlock = blocks.find(block => block.isActive) || null
   
   // Date range
@@ -592,8 +674,8 @@ function processUsageEntries(allEntries: SentinelUsageEntry[]): SentinelUsageAna
 /**
  * Get usage data for the last N days with Sentinel enhancements
  */
-export function getRecentSentinelUsage(days: number = 30): SentinelUsageAnalysis {
-  const analysis = loadSentinelUsageData()
+export async function getRecentSentinelUsage(days: number = 30): Promise<SentinelUsageAnalysis> {
+  const analysis = await loadSentinelUsageData()
   const cutoffDate = new Date()
   cutoffDate.setDate(cutoffDate.getDate() - days)
   const cutoffString = cutoffDate.toISOString().split('T')[0]
@@ -615,8 +697,8 @@ export function getRecentSentinelUsage(days: number = 30): SentinelUsageAnalysis
 /**
  * Get current billing block information with enhanced tracking
  */
-export function getCurrentSentinelBlockInfo() {
-  const analysis = loadSentinelUsageData()
+export async function getCurrentSentinelBlockInfo() {
+  const analysis = await loadSentinelUsageData()
   const currentBlock = analysis.currentBlock
   
   // Save snapshot of current state for debugging
@@ -663,8 +745,8 @@ export function getCurrentSentinelBlockInfo() {
 }
 
 // Backward compatibility functions that map to new Sentinel functions
-export function loadUsageData() {
-  const sentinelData = loadSentinelUsageData()
+export async function loadUsageData() {
+  const sentinelData = await loadSentinelUsageData()
   return {
     daily: sentinelData.daily.map(day => ({
       ...day,
@@ -677,8 +759,8 @@ export function loadUsageData() {
   }
 }
 
-export function getRecentUsage(days: number = 30) {
-  const sentinelData = getRecentSentinelUsage(days)
+export async function getRecentUsage(days: number = 30) {
+  const sentinelData = await getRecentSentinelUsage(days)
   return {
     daily: sentinelData.daily.map(day => ({
       ...day,
@@ -691,8 +773,8 @@ export function getRecentUsage(days: number = 30) {
   }
 }
 
-export function getCurrentBlockInfo() {
-  return getCurrentSentinelBlockInfo()
+export async function getCurrentBlockInfo() {
+  return await getCurrentSentinelBlockInfo()
 }
 
 // Allow external invalidation (e.g., after importing logs)
@@ -706,14 +788,30 @@ export function resetUsageCache() {
   // Clear any existing logs to prevent duplicate events with new logic
   const { existsSync, writeFileSync } = require('fs')
   const { join } = require('path')
-  const { homedir } = require('os')
-  
+  const { tmpdir } = require('os')
+
   try {
-    const blockLogFile = join(homedir(), '.claude-sentinel-block-log.jsonl')
+    // Try to get userData path, fallback to temp directory
+    let dataDir
+    try {
+      const electron = require('electron')
+      const app = electron.app || electron.remote?.app
+      dataDir = app?.getPath('userData') || join(tmpdir(), 'claude-sentinel')
+    } catch {
+      dataDir = join(tmpdir(), 'claude-sentinel')
+    }
+
+    const blockLogFile = join(dataDir, 'block-log.jsonl')
     if (existsSync(blockLogFile)) {
       writeFileSync(blockLogFile, '') // Clear the log file
     }
+
+    // Also clear any cached snapshots
+    const snapshotFile = join(dataDir, 'block-snapshot.json')
+    if (existsSync(snapshotFile)) {
+      writeFileSync(snapshotFile, '{}') // Clear the snapshot file
+    }
   } catch (error) {
-    console.warn('Failed to clear block log:', error)
+    console.warn('Failed to clear block logs and snapshots:', error)
   }
 }

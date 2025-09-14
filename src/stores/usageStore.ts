@@ -82,16 +82,22 @@ export const useUsageStore = create<UsageStore>((set, get) => ({
   refreshData: async () => {
     set({ isLoading: true, error: null })
     try {
+      if (!window.electronAPI?.getUsageData) {
+        console.warn('Running in development mode - Electron API not available')
+        set({ isLoading: false })
+        return
+      }
+
       // Add timeout to prevent hanging
       const timeoutPromise = new Promise((_, reject) => {
         setTimeout(() => reject(new Error('Request timeout')), 8000) // 8 second timeout
       })
-      
+
       const data = await Promise.race([
         window.electronAPI.getUsageData(),
         timeoutPromise
       ])
-      
+
       get().setUsageData(data)
     } catch (error) {
       set({ error: error instanceof Error ? error.message : 'Failed to load usage data' })

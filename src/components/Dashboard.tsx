@@ -117,7 +117,11 @@ export function Dashboard() {
   useEffect(() => {
     const loadUserPlan = async () => {
       try {
-        const settings = await window.electronAPI.getSettings?.()
+        if (!window.electronAPI?.getSettings) {
+          console.warn('Running in development mode - Electron API not available')
+          return
+        }
+        const settings = await window.electronAPI.getSettings()
         if (settings?.claudePlan) {
           setUserPlan(settings.claudePlan)
         }

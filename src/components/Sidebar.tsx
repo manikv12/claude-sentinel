@@ -1,11 +1,11 @@
 import React from 'react'
 import { cn } from '@/lib/utils'
 import { Button } from './ui/button'
-import { BarChart3, FileText, Settings, Power, ScrollText } from 'lucide-react'
+import { BarChart3, FileText, Power, ScrollText, Code2, ChevronLeft } from 'lucide-react'
 
 interface SidebarProps {
-  activeView: 'dashboard' | 'reports' | 'settings' | 'auto-renewal'
-  onViewChange: (view: 'dashboard' | 'reports' | 'settings' | 'auto-renewal') => void
+  activeView: 'dashboard' | 'reports' | 'settings' | 'auto-renewal' | 'spec-development'
+  onViewChange: (view: 'dashboard' | 'reports' | 'settings' | 'auto-renewal' | 'spec-development') => void
 }
 
 export function Sidebar({ activeView, onViewChange }: SidebarProps) {
@@ -25,22 +25,22 @@ export function Sidebar({ activeView, onViewChange }: SidebarProps) {
       description: 'Manage session renewals'
     },
     {
+      id: 'spec-development' as const,
+      label: 'Spec Development',
+      icon: Code2,
+      description: 'AI-powered specification generation'
+    },
+    {
       id: 'reports' as const,
       label: 'Reports',
       icon: FileText,
       description: 'Detailed usage reports & logs'
-    },
-    {
-      id: 'settings' as const,
-      label: 'Settings',
-      icon: Settings,
-      description: 'App configuration'
     }
   ]
 
   return (
-    // Add consistent top padding so first item aligns with content under the header
-    <aside className={`w-64 glass-sidebar border-r-0 p-4 flex flex-col pt-16`}>
+    // Header now spans full width; align sidebar directly beneath it
+    <aside className={`w-64 glass-sidebar border-r border-white/10 p-4 flex flex-col pt-3`}>
 
       <nav className="flex-1 space-y-2">
         {menuItems.map((item) => {
