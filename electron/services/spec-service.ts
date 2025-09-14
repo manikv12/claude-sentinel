@@ -140,6 +140,51 @@ class SpecService {
     return project
   }
 
+  // Create new project directory and initialize with spec-kit
+  async createNewProject(parentPath: string, projectName: string, description: string): Promise<SpecProject> {
+    const projectPath = path.join(parentPath, projectName)
+
+    const project: SpecProject = {
+      id: this.generateId(),
+      name: projectName,
+      description,
+      path: projectPath,
+      createdAt: new Date(),
+      specs: [],
+      isActive: true,
+      isUserProject: true,
+      hasSpecKit: false
+    }
+
+    try {
+      // Use spec-kit to create the new project (this handles directory creation and initialization)
+      await specKitManager.initialize()
+      await specKitManager.createNewProject(parentPath, projectName)
+
+      project.hasSpecKit = true
+      console.log('✅ Spec-kit project created successfully')
+    } catch (error) {
+      console.warn('Failed to create spec-kit project:', error)
+
+      // Fallback: Create basic project directory without spec-kit
+      if (!fs.existsSync(projectPath)) {
+        fs.mkdirSync(projectPath, { recursive: true })
+        console.log('Created basic project directory as fallback')
+      }
+    }
+
+    // Save project metadata in our internal storage
+    const internalPath = path.join(this.specDir, 'user-projects', project.id)
+    if (!fs.existsSync(internalPath)) {
+      fs.mkdirSync(internalPath, { recursive: true })
+    }
+
+    const projectFile = path.join(internalPath, 'project.json')
+    fs.writeFileSync(projectFile, JSON.stringify(project, null, 2))
+
+    return project
+  }
+
   async getProjects(): Promise<SpecProject[]> {
     const projects: SpecProject[] = []
 
@@ -152,11 +197,15 @@ class SpecService {
         if (fs.existsSync(projectFile)) {
           try {
             const projectData = JSON.parse(fs.readFileSync(projectFile, 'utf8'))
+            // Check if spec-kit is initialized in internal project
+            const projectPath = path.join(internalProjectsDir, projectDir)
+            const hasSpecKit = specKitManager.isProjectInitialized(projectPath)
+
             projects.push({
               ...projectData,
               createdAt: new Date(projectData.createdAt),
               isUserProject: false,
-              hasSpecKit: false
+              hasSpecKit: hasSpecKit
             })
           } catch (error) {
             console.error(`Failed to read internal project ${projectDir}:`, error)
@@ -177,9 +226,13 @@ class SpecService {
 
             // Validate that user project path still exists
             if (fs.existsSync(projectData.path)) {
+              // Check if spec-kit is actually initialized in this project
+              const hasSpecKit = specKitManager.isProjectInitialized(projectData.path)
+
               projects.push({
                 ...projectData,
-                createdAt: new Date(projectData.createdAt)
+                createdAt: new Date(projectData.createdAt),
+                hasSpecKit: hasSpecKit
               })
             }
           } catch (error) {
@@ -291,12 +344,14 @@ class SpecService {
     onStream?: (chunk: string) => void
   ): Promise<string> {
     try {
-      // For user projects with spec-kit, use real spec-kit
-      if (this.isUserProject(projectPath) && specKitManager.isProjectInitialized(projectPath)) {
+      // Check if the project has spec-kit initialized
+      if (specKitManager.isProjectInitialized(projectPath)) {
+        console.log('Using real GitHub spec-kit scripts')
         return await this.executeRealSpecKit(command, content, projectPath, onStream)
       }
 
-      // For internal projects or projects without spec-kit, fall back to simulation
+      // Fall back to simulation if spec-kit is not initialized in project
+      console.log('spec-kit not initialized in project, using simulation mode')
       return await this.executeSimulatedCommand(command, content, onStream)
     } catch (error) {
       console.error('Error executing AI specification command:', error)

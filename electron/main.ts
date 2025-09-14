@@ -2650,6 +2650,19 @@ ipcMain.handle('spec-create-user-project', async (_, selectedPath, projectName, 
   }
 })
 
+// Create new project with spec-kit initialization
+ipcMain.handle('spec-create-new-project', async (_, parentPath, projectName, description) => {
+  try {
+    console.log('🆕 Creating new spec-kit project:', { parentPath, projectName, description })
+    const result = await specService.createNewProject(parentPath, projectName, description)
+    console.log('✅ New spec-kit project created successfully:', result)
+    return result
+  } catch (error) {
+    console.error('❌ Error creating new project:', error)
+    throw error
+  }
+})
+
 // Show folder selection dialog
 ipcMain.handle('show-open-dialog', async (_, options) => {
   try {

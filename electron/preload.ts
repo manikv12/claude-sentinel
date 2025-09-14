@@ -55,6 +55,7 @@ const electronAPI = {
   // AI Specification Development
   specCreateProject: (projectData: any) => ipcRenderer.invoke('spec-create-project', projectData),
   specCreateUserProject: (selectedPath: string, projectName: string, description: string) => ipcRenderer.invoke('spec-create-user-project', selectedPath, projectName, description),
+  specCreateNewProject: (parentPath: string, projectName: string, description: string) => ipcRenderer.invoke('spec-create-new-project', parentPath, projectName, description),
   specGetProjects: () => ipcRenderer.invoke('spec-get-projects'),
   specSaveSpecification: (projectId: string, spec: any) => ipcRenderer.invoke('spec-save-specification', projectId, spec),
   specLoadSpecifications: (projectId: string) => ipcRenderer.invoke('spec-load-specifications', projectId),

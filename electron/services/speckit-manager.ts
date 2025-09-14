@@ -181,9 +181,9 @@ class SpecKitManager {
     console.log(`Initializing spec-kit project: ${projectName}`)
 
     try {
-      // Use uvx to initialize the project
+      // Use uvx to initialize the project in existing directory (--here flag)
       await execAsync(
-        `${this.environment!.uvxPath} --from git+https://github.com/github/spec-kit.git specify init "${projectName}" --ai claude --here`,
+        `${this.environment!.uvxPath} --from git+https://github.com/github/spec-kit.git specify init --here --ai claude`,
         {
           cwd: projectPath,
           env: {
@@ -199,6 +199,39 @@ class SpecKitManager {
     }
   }
 
+  async createNewProject(parentPath: string, projectName: string): Promise<void> {
+    if (!this.environment?.isInitialized) {
+      await this.initialize()
+    }
+
+    const projectPath = path.join(parentPath, projectName)
+
+    // Check if project directory already exists
+    if (fs.existsSync(projectPath)) {
+      throw new Error(`Project directory already exists: ${projectPath}`)
+    }
+
+    console.log(`Creating new spec-kit project: ${projectName} in ${parentPath}`)
+
+    try {
+      // Use uvx to create a new project (this creates the directory)
+      await execAsync(
+        `${this.environment!.uvxPath} --from git+https://github.com/github/spec-kit.git specify init "${projectName}" --ai claude`,
+        {
+          cwd: parentPath,
+          env: {
+            ...process.env,
+            PATH: `${path.dirname(this.environment!.uvxPath)}:${process.env.PATH}`
+          }
+        }
+      )
+      console.log('New spec-kit project created successfully')
+    } catch (error) {
+      console.error('Failed to create new spec-kit project:', error)
+      throw new Error('Failed to create new project with spec-kit')
+    }
+  }
+
   async executeSpecKitCommand(
     command: string,
     content: string,
@@ -210,9 +243,8 @@ class SpecKitManager {
       await this.initialize()
     }
 
-    // Check if this is a spec-kit enabled project
-    const specKitDir = path.join(projectPath, '.specify')
-    if (!fs.existsSync(specKitDir)) {
+    // Check if project has spec-kit initialized
+    if (!this.isProjectInitialized(projectPath)) {
       throw new Error('Project is not initialized with spec-kit. Please initialize first.')
     }
 
@@ -220,43 +252,329 @@ class SpecKitManager {
       let output = ''
       let errorOutput = ''
 
-      // Map user commands to spec-kit format
-      const specKitCommand = this.mapToSpecKitCommand(command, content)
+      console.log(`Executing GitHub spec-kit script for command: ${command}`)
 
-      console.log(`Executing spec-kit command in ${projectPath}: ${specKitCommand}`)
+      const { scriptPath, args } = this.mapToSpecKitScript(command, content, projectPath)
 
-      // The spec-kit commands are meant to be used within Claude Code
-      // Since we're simulating this, we'll create a specification based on the structure
-      const response = this.generateSpecKitStyleResponse(command, content)
+      if (!fs.existsSync(scriptPath)) {
+        console.warn(`Script not found: ${scriptPath}, falling back to simulation`)
+        const fallbackResponse = this.generateSpecKitStyleResponse(command, content)
+        resolve(fallbackResponse)
+        return
+      }
 
-      // Simulate streaming by chunking the response
-      const chunks = response.split(' ')
-      let index = 0
+      const process = spawn('bash', [scriptPath, ...args], {
+        cwd: projectPath,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          PATH: `${path.dirname(this.environment!.uvxPath)}:${process.env.PATH}`,
+          ARGUMENTS: content // Pass content as environment variable for scripts
+        }
+      })
 
-      const streamInterval = setInterval(() => {
-        if (index < chunks.length) {
-          const chunk = chunks[index] + ' '
-          output += chunk
-          onOutput?.(chunk)
-          index++
+      process.stdout?.on('data', (data: Buffer) => {
+        const chunk = data.toString()
+        output += chunk
+        onOutput?.(chunk)
+      })
+
+      process.stderr?.on('data', (data: Buffer) => {
+        const chunk = data.toString()
+        errorOutput += chunk
+        onError?.(chunk)
+      })
+
+      process.on('close', (code: number) => {
+        if (code === 0) {
+          // For spec-kit commands, we need to read the generated files
+          this.readGeneratedSpecFiles(command, projectPath, output)
+            .then(resolve)
+            .catch((error) => {
+              console.warn('Error reading generated files:', error)
+              resolve(output || 'Command completed successfully')
+            })
         } else {
-          clearInterval(streamInterval)
-          resolve(output)
+          console.warn(`spec-kit script failed with code ${code}, falling back to simulation`)
+          const fallbackResponse = this.generateSpecKitStyleResponse(command, content)
+          resolve(fallbackResponse)
         }
-      }, 50)
+      })
 
-      // Handle timeout
+      process.on('error', (error) => {
+        console.warn('spec-kit script execution error, falling back to simulation:', error)
+        const fallbackResponse = this.generateSpecKitStyleResponse(command, content)
+        resolve(fallbackResponse)
+      })
+
+      // Handle timeout (60 seconds for script execution)
       setTimeout(() => {
-        clearInterval(streamInterval)
-        if (index < chunks.length) {
-          resolve(output)
-        }
-      }, 30000)
+        process.kill('SIGKILL')
+        console.warn('spec-kit script timed out, falling back to simulation')
+        const fallbackResponse = this.generateSpecKitStyleResponse(command, content)
+        resolve(fallbackResponse)
+      }, 60000)
     })
   }
 
+  private mapToSpecKitScript(command: string, content: string, projectPath: string): { scriptPath: string, args: string[] } {
+    const scriptsDir = path.join(projectPath, '.specify', 'scripts', 'bash')
+
+    switch (command) {
+      case 'generate-spec':
+      case '/specify':
+        return {
+          scriptPath: path.join(scriptsDir, 'create-new-feature.sh'),
+          args: ['--json', content]
+        }
+      case 'create-plan':
+      case '/plan':
+        return {
+          scriptPath: path.join(scriptsDir, 'setup-plan.sh'),
+          args: ['--json']
+        }
+      case 'breakdown-tasks':
+      case '/tasks':
+        // Use the plan script for tasks as well, since spec-kit combines them
+        return {
+          scriptPath: path.join(scriptsDir, 'setup-plan.sh'),
+          args: ['--json']
+        }
+      case 'refine-spec':
+      case '/refine':
+        // For refine, we'll use the create-new-feature script with existing content
+        return {
+          scriptPath: path.join(scriptsDir, 'create-new-feature.sh'),
+          args: ['--json', `refine: ${content}`]
+        }
+      default:
+        return {
+          scriptPath: path.join(scriptsDir, 'create-new-feature.sh'),
+          args: ['--json', content]
+        }
+    }
+  }
+
+  private async readGeneratedSpecFiles(command: string, projectPath: string, scriptOutput: string): Promise<string> {
+    try {
+      console.log('Reading generated spec files, script output:', scriptOutput)
+
+      // Parse JSON output from script if available
+      const jsonMatch = scriptOutput.match(/\{.*\}/s)
+      if (jsonMatch) {
+        const result = JSON.parse(jsonMatch[0])
+        console.log('Parsed JSON result:', result)
+
+        // Check for generated spec file
+        if (result.SPEC_FILE && fs.existsSync(result.SPEC_FILE)) {
+          console.log('Found spec file:', result.SPEC_FILE)
+          const specContent = fs.readFileSync(result.SPEC_FILE, 'utf8')
+
+          // If the spec file is empty, we need to generate content using the template
+          if (specContent.trim() === '') {
+            console.log('Spec file is empty, generating content from template')
+            return await this.generateSpecFromTemplate(command, projectPath, result)
+          }
+
+          return `# Generated Specification\n\n${specContent}`
+        }
+
+        // Check for implementation plan
+        if (result.IMPL_PLAN && fs.existsSync(result.IMPL_PLAN)) {
+          console.log('Found impl plan:', result.IMPL_PLAN)
+          const planContent = fs.readFileSync(result.IMPL_PLAN, 'utf8')
+          return `# Generated Implementation Plan\n\n${planContent}`
+        }
+      }
+
+      // Look for generated files in common locations
+      const specsDir = path.join(projectPath, 'specs')
+      console.log('Looking for specs in:', specsDir)
+      if (fs.existsSync(specsDir)) {
+        const specFiles = fs.readdirSync(specsDir).filter(f => f.endsWith('.md'))
+        console.log('Found spec files:', specFiles)
+        if (specFiles.length > 0) {
+          // Get the most recent spec file
+          const mostRecent = specFiles
+            .map(f => ({ name: f, time: fs.statSync(path.join(specsDir, f)).mtime }))
+            .sort((a, b) => b.time.getTime() - a.time.getTime())[0]
+
+          const content = fs.readFileSync(path.join(specsDir, mostRecent.name), 'utf8')
+          return `# Generated from ${mostRecent.name}\n\n${content}`
+        }
+      }
+
+      // If no files found, return script output
+      console.log('No generated files found, returning script output')
+      return scriptOutput || 'Command completed successfully'
+
+    } catch (error) {
+      console.warn('Error parsing script output:', error)
+      return scriptOutput || 'Command completed successfully'
+    }
+  }
+
+  private async generateSpecFromTemplate(command: string, projectPath: string, scriptResult: any): Promise<string> {
+    try {
+      // Read the template
+      const templatePath = path.join(projectPath, '.specify', 'templates', 'spec-template.md')
+      if (!fs.existsSync(templatePath)) {
+        console.warn('Template not found at:', templatePath)
+        return this.generateSpecKitStyleResponse(command, process.env.ARGUMENTS || '')
+      }
+
+      const template = fs.readFileSync(templatePath, 'utf8')
+      console.log('Using template from:', templatePath)
+
+      // Get the feature description from environment variable
+      const featureDescription = process.env.ARGUMENTS || 'feature request'
+
+      // Generate a proper specification based on the feature description and template structure
+      const generatedSpec = this.generateSpecificationContent(featureDescription, template, scriptResult)
+
+      // Write the generated content back to the spec file
+      if (scriptResult.SPEC_FILE) {
+        fs.writeFileSync(scriptResult.SPEC_FILE, generatedSpec)
+        console.log('Generated spec written to:', scriptResult.SPEC_FILE)
+      }
+
+      return `# Generated Specification\n\n${generatedSpec}`
+    } catch (error) {
+      console.warn('Error generating spec from template:', error)
+      return this.generateSpecKitStyleResponse(command, process.env.ARGUMENTS || '')
+    }
+  }
+
+  private generateSpecificationContent(featureDescription: string, template: string, scriptResult: any): string {
+    // This method generates Claude Code-style specifications based on the GitHub spec-kit template
+    const today = new Date().toISOString().split('T')[0]
+    const branchName = scriptResult.BRANCH_NAME || 'unknown-feature'
+
+    // Parse the feature description to extract key concepts
+    const concepts = this.extractKeyConceptsFromDescription(featureDescription)
+
+    // Generate the specification following the template structure
+    let specification = template
+      .replace(/\[FEATURE NAME\]/g, concepts.featureName)
+      .replace(/\[###-feature-name\]/g, branchName)
+      .replace(/\[DATE\]/g, today)
+      .replace(/\$ARGUMENTS/g, featureDescription)
+
+    // Fill in the sections based on the feature description
+    specification = this.fillUserScenariosSection(specification, concepts)
+    specification = this.fillRequirementsSection(specification, concepts)
+    specification = this.fillKeyEntitiesSection(specification, concepts)
+
+    return specification
+  }
+
+  private extractKeyConceptsFromDescription(description: string): any {
+    // Extract key concepts from the user's description
+    const words = description.toLowerCase().split(/\s+/)
+
+    // Extract potential feature name
+    let featureName = description
+    if (description.length > 50) {
+      // Create a shorter feature name from first few words
+      featureName = words.slice(0, 5).join(' ')
+    }
+
+    // Identify common patterns
+    const isAuthRelated = words.some(w => ['auth', 'login', 'user', 'account', 'password', 'signin', 'signup', 'register'].includes(w))
+    const isDataRelated = words.some(w => ['data', 'store', 'save', 'database', 'manage', 'create', 'edit', 'delete'].includes(w))
+    const isUIRelated = words.some(w => ['interface', 'ui', 'page', 'form', 'button', 'display', 'show'].includes(w))
+
+    return {
+      featureName: featureName,
+      description: description,
+      isAuth: isAuthRelated,
+      isData: isDataRelated,
+      isUI: isUIRelated,
+      keywords: words
+    }
+  }
+
+  private fillUserScenariosSection(specification: string, concepts: any): string {
+    // Generate realistic user scenarios based on the feature description
+    let primaryStory = `A user wants to ${concepts.description.toLowerCase()}`
+
+    let acceptanceScenarios = ''
+    if (concepts.isAuth) {
+      acceptanceScenarios = `1. **Given** a new user, **When** they attempt to access the system, **Then** they should be prompted to authenticate
+2. **Given** valid credentials, **When** a user submits their login information, **Then** they should be granted access to the system`
+    } else if (concepts.isData) {
+      acceptanceScenarios = `1. **Given** a user has access to the system, **When** they attempt to manage data, **Then** they should be able to perform CRUD operations
+2. **Given** invalid data input, **When** a user submits the data, **Then** they should receive clear validation feedback`
+    } else {
+      acceptanceScenarios = `1. **Given** a user has access to the feature, **When** they interact with the system, **Then** they should be able to ${concepts.description.toLowerCase()}
+2. **Given** the feature is available, **When** a user completes the workflow, **Then** the system should provide appropriate feedback`
+    }
+
+    const edgeCases = `- What happens when the user provides invalid input?
+- How does the system handle network connectivity issues?
+- What occurs when multiple users interact simultaneously?`
+
+    return specification
+      .replace(/\[Describe the main user journey in plain language\]/, primaryStory)
+      .replace(/1\. \*\*Given\*\* \[initial state\], \*\*When\*\* \[action\], \*\*Then\*\* \[expected outcome\]\s*\n2\. \*\*Given\*\* \[initial state\], \*\*When\*\* \[action\], \*\*Then\*\* \[expected outcome\]/, acceptanceScenarios)
+      .replace(/- What happens when \[boundary condition\]\?\s*\n- How does system handle \[error scenario\]\?/, edgeCases)
+  }
+
+  private fillRequirementsSection(specification: string, concepts: any): string {
+    // Generate functional requirements based on the feature description
+    let requirements = ''
+
+    if (concepts.isAuth) {
+      requirements = `- **FR-001**: System MUST allow users to create accounts with unique identifiers
+- **FR-002**: System MUST validate user credentials during authentication
+- **FR-003**: Users MUST be able to securely log in and log out
+- **FR-004**: System MUST protect user sessions and handle session expiration
+- **FR-005**: System MUST provide password reset functionality`
+    } else if (concepts.isData) {
+      requirements = `- **FR-001**: System MUST allow users to create new data records
+- **FR-002**: System MUST enable users to view and search existing data
+- **FR-003**: Users MUST be able to update existing data records
+- **FR-004**: System MUST provide data deletion capabilities with appropriate safeguards
+- **FR-005**: System MUST validate all data inputs and provide clear error messages`
+    } else {
+      // General requirements based on description
+      const mainAction = concepts.description.includes('manage') ? 'manage' :
+                         concepts.description.includes('create') ? 'create' :
+                         concepts.description.includes('view') ? 'view' : 'interact with'
+
+      requirements = `- **FR-001**: System MUST enable users to ${mainAction} ${concepts.featureName.toLowerCase()}
+- **FR-002**: System MUST provide clear feedback on all user actions
+- **FR-003**: Users MUST be able to access the feature through intuitive navigation
+- **FR-004**: System MUST handle errors gracefully and provide helpful error messages
+- **FR-005**: System MUST maintain data integrity and consistency`
+    }
+
+    // Replace the requirements section
+    const reqPattern = /- \*\*FR-001\*\*: System MUST \[specific capability.*?\n- \*\*FR-005\*\*: System MUST \[behavior.*?\]/s
+    return specification.replace(reqPattern, requirements)
+  }
+
+  private fillKeyEntitiesSection(specification: string, concepts: any): string {
+    if (!concepts.isData && !concepts.isAuth) {
+      // Remove the Key Entities section if not relevant
+      return specification.replace(/### Key Entities.*?\n\n---/s, '---')
+    }
+
+    let entities = ''
+    if (concepts.isAuth) {
+      entities = `- **User**: Represents system users with authentication credentials, profile information, and access permissions
+- **Session**: Tracks user authentication state, login time, and security context`
+    } else if (concepts.isData) {
+      entities = `- **Data Record**: Core entity representing the main data being managed, with relevant attributes and validation rules
+- **User**: System users who interact with and manage the data records`
+    }
+
+    const entityPattern = /- \*\*\[Entity 1\]\*\*: \[What it represents.*?\n- \*\*\[Entity 2\]\*\*: \[What it represents.*?\]/s
+    return specification.replace(entityPattern, entities)
+  }
+
   private mapToSpecKitCommand(userCommand: string, content: string): string {
-    // Map user-friendly commands to spec-kit commands
+    // Deprecated - kept for backward compatibility
     switch (userCommand) {
       case 'generate-spec':
       case '/specify':
@@ -928,11 +1246,58 @@ Each command leverages spec-kit methodology combined with Claude AI to provide s
   }
 
   /**
-   * Check if a project has spec-kit initialized without initializing the environment
+   * Check if spec-kit is initialized in the project
    */
   isProjectInitialized(projectPath: string): boolean {
-    const specKitDir = path.join(projectPath, '.specify')
-    return fs.existsSync(specKitDir)
+    // Check if .specify directory exists with scripts
+    const specifyDir = path.join(projectPath, '.specify')
+    const scriptsDir = path.join(specifyDir, 'scripts', 'bash')
+    const hasSpecify = fs.existsSync(specifyDir)
+    const hasScripts = fs.existsSync(scriptsDir)
+
+    console.log(`Checking spec-kit in ${projectPath}:`)
+    console.log(`  .specify exists: ${hasSpecify}`)
+    console.log(`  scripts/bash exists: ${hasScripts}`)
+    console.log(`  Final result: ${hasSpecify && hasScripts}`)
+
+    return hasSpecify && hasScripts
+  }
+
+  /**
+   * Check if spec-kit is available system-wide via uvx
+   */
+  isSpecKitAvailable(): boolean {
+    try {
+      // Check if uvx exists in PATH or common locations
+      const homeDir = os.homedir()
+      const possiblePaths = [
+        path.join(homeDir, '.local', 'bin', 'uvx'),
+        path.join(homeDir, '.cargo', 'bin', 'uvx'),
+        '/usr/local/bin/uvx',
+        '/opt/homebrew/bin/uvx'
+      ]
+
+      // Check PATH first
+      try {
+        const { execSync } = require('child_process')
+        execSync('which uvx', { stdio: 'ignore' })
+        return true
+      } catch {
+        // Continue to check specific paths
+      }
+
+      // Check specific paths
+      for (const uvxPath of possiblePaths) {
+        if (fs.existsSync(uvxPath)) {
+          return true
+        }
+      }
+
+      return false
+    } catch (error) {
+      console.warn('Error checking spec-kit availability:', error)
+      return false
+    }
   }
 
   async cleanup(): Promise<void> {
