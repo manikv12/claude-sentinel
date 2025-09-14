@@ -86,13 +86,14 @@ export const useRenewalStore = create<RenewalStore>((set, get) => ({
       
       if (result && result.success) {
         set(state => ({
-          status: { 
-            ...state.status, 
+          status: {
+            ...state.status,
             enabled: result.enabled,
             scheduledStartTime: scheduledTime || null
           },
           isLoading: false
         }))
+
       } else {
         throw new Error(result?.error || 'Failed to toggle auto-renewal')
       }
@@ -129,10 +130,11 @@ export const useRenewalStore = create<RenewalStore>((set, get) => ({
         status: { ...state.status, scheduledStartTime: time },
         isLoading: false
       }))
+
     } catch (error) {
-      set({ 
+      set({
         error: error instanceof Error ? error.message : 'Failed to set scheduled time',
-        isLoading: false 
+        isLoading: false
       })
     }
   },

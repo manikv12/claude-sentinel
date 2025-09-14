@@ -14,7 +14,7 @@ import {
   detectBlockChanges
 } from './block-tracker'
 
-// Toggle verbose logging via env var
+// Toggle verbose logging via env var (default off for performance)
 const DEBUG = process.env.SENTINEL_DEBUG === '1'
 
 // Cache for loaded data to prevent repeated file I/O
@@ -69,6 +69,7 @@ export interface SentinelDailyUsage {
   totalTokens: number
   cost: number
   sessions: Set<string>
+  blocks: Set<string> // Billing blocks for this day
   entries: SentinelUsageEntry[]
   avgSessionLength?: number
 }
@@ -88,7 +89,8 @@ export interface SentinelUsageAnalysis {
   daily: SentinelDailyUsage[]
   totalCost: number
   totalTokens: number
-  totalSessions: number
+  totalSessions: number // Keep for conversations
+  totalBlocks: number   // Add for billing blocks
   currentBlock: SentinelBillingBlock | null
   dateRange: {
     start: string
@@ -202,14 +204,21 @@ function findUsageFiles(dataPaths: string[]): Array<{ path: string; project: str
 }
 
 /**
+ * Generate a block ID from a block start time
+ */
+function generateBlockId(blockStart: Date): string {
+  return `block_${blockStart.getTime()}`
+}
+
+/**
  * Group usage entries by date
  */
 function groupByDate(entries: SentinelUsageEntry[]): Map<string, SentinelDailyUsage> {
   const dailyMap = new Map<string, SentinelDailyUsage>()
-  
+
   for (const entry of entries) {
     const date = entry.timestamp.split('T')[0] // Extract YYYY-MM-DD
-    
+
     if (!dailyMap.has(date)) {
       dailyMap.set(date, {
         date,
@@ -218,10 +227,11 @@ function groupByDate(entries: SentinelUsageEntry[]): Map<string, SentinelDailyUs
         totalTokens: 0,
         cost: 0,
         sessions: new Set(),
+        blocks: new Set(),
         entries: []
       })
     }
-    
+
     const daily = dailyMap.get(date)!
     daily.inputTokens += entry.inputTokens
     daily.outputTokens += entry.outputTokens
@@ -230,7 +240,7 @@ function groupByDate(entries: SentinelUsageEntry[]): Map<string, SentinelDailyUs
     daily.sessions.add(entry.sessionId)
     daily.entries.push(entry)
   }
-  
+
   return dailyMap
 }
 
@@ -638,34 +648,111 @@ export async function loadSentinelUsageData(): Promise<SentinelUsageAnalysis> {
 }
 
 async function processUsageEntries(allEntries: SentinelUsageEntry[]): Promise<SentinelUsageAnalysis> {
+  if (DEBUG) console.log(`🔍 SENTINEL DEBUG: processUsageEntries called with ${allEntries.length} entries`)
+
   // Work on a sorted copy to avoid mutating cached arrays
   const sortedEntries = [...allEntries].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
-  
+
   // Group by date
   const dailyMap = groupByDate(sortedEntries)
   const daily = Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date))
-  
+
+  // Get all billing blocks to assign them to days
+  const allHistoricalBlocks = findAllHistoricalBlocks(sortedEntries)
+
+  // Add billing blocks to each day based on when the block started
+  const today = new Date().toISOString().split('T')[0]
+  if (DEBUG) console.log(`\n=== BILLING BLOCKS ASSIGNMENT (Today: ${today}) ===`)
+
+  // Ensure today exists in the daily map (needed for active block counting)
+  if (!dailyMap.has(today)) {
+    dailyMap.set(today, {
+      date: today,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      cost: 0,
+      sessions: new Set(),
+      blocks: new Set(),
+      entries: []
+    })
+    if (DEBUG) console.log(`✓ Created empty daily data for today: ${today}`)
+  }
+
+  for (const block of allHistoricalBlocks) {
+    if (block.entryCount > 0) { // Only count blocks with actual usage
+      const blockStartDate = block.blockStart.toISOString().split('T')[0]
+      const blockId = generateBlockId(block.blockStart)
+      const dailyData = dailyMap.get(blockStartDate)
+
+      if (DEBUG) {
+        console.log(`Block: ${block.blockStart.toLocaleString()} -> Date: ${blockStartDate}, Entries: ${block.entryCount}, IsActive: ${block.isActive}`)
+        console.log(`  Daily data exists: ${!!dailyData}, Block ID: ${blockId}`)
+      }
+
+      if (dailyData) {
+        dailyData.blocks.add(blockId)
+        if (DEBUG && blockStartDate === today) {
+          console.log(`  ✓ Added block to TODAY (${today}): ${blockId}`)
+        }
+      } else if (DEBUG) {
+        console.log(`  ✗ No daily data found for ${blockStartDate}`)
+      }
+
+      // Also add active blocks to today's count for better UX
+      if (block.isActive && blockStartDate !== today) {
+        const todayData = dailyMap.get(today)
+        if (todayData) {
+          todayData.blocks.add(blockId)
+          if (DEBUG) {
+            console.log(`  ✓ Added ACTIVE block to TODAY (${today}): ${blockId}`)
+          }
+        }
+      }
+    } else if (DEBUG) {
+      console.log(`Block: ${block.blockStart.toLocaleString()} -> SKIPPED (no entries)`)
+    }
+  }
+
+  if (DEBUG) {
+    console.log(`\n=== TODAY'S BLOCK COUNT ===`)
+    const todayData = dailyMap.get(today)
+    if (todayData) {
+      console.log(`Today (${today}) has ${todayData.blocks.size} blocks:`, Array.from(todayData.blocks))
+    } else {
+      console.log(`No data found for today (${today})`)
+    }
+    console.log('=====================================\n')
+  }
+
   // Calculate totals
   const totalCost = daily.reduce((sum, day) => sum + day.cost, 0)
   const totalTokens = daily.reduce((sum, day) => sum + day.totalTokens, 0)
   const allSessions = new Set(sortedEntries.map(entry => entry.sessionId))
-  
+
+  // Calculate total billing blocks across all days
+  const allBlocks = new Set<string>()
+  daily.forEach(day => {
+    day.blocks.forEach(blockId => allBlocks.add(blockId))
+  })
+
   // Identify billing blocks
   const blocks = await identifyBillingBlocks(sortedEntries)
   const currentBlock = blocks.find(block => block.isActive) || null
-  
+
   // Date range
   const dates = daily.map(d => d.date).sort()
   const dateRange = {
     start: dates[0] || new Date().toISOString().split('T')[0],
     end: dates[dates.length - 1] || new Date().toISOString().split('T')[0]
   }
-  
+
   return {
     daily,
     totalCost,
     totalTokens,
     totalSessions: allSessions.size,
+    totalBlocks: allBlocks.size,
     currentBlock,
     dateRange
   }
@@ -750,11 +837,12 @@ export async function loadUsageData() {
   return {
     daily: sentinelData.daily.map(day => ({
       ...day,
-      sessions: day.sessions
+      sessions: day.sessions,
+      blocks: day.blocks // Ensure blocks is exposed
     })),
     totalCost: sentinelData.totalCost,
     totalTokens: sentinelData.totalTokens,
-    totalSessions: sentinelData.totalSessions,
+    totalSessions: sentinelData.totalSessions, // Use actual sessions, not blocks
     dateRange: sentinelData.dateRange
   }
 }
@@ -764,11 +852,12 @@ export async function getRecentUsage(days: number = 30) {
   return {
     daily: sentinelData.daily.map(day => ({
       ...day,
-      sessions: day.sessions
+      sessions: day.sessions,
+      blocks: day.blocks // Ensure blocks is exposed
     })),
     totalCost: sentinelData.totalCost,
     totalTokens: sentinelData.totalTokens,
-    totalSessions: sentinelData.totalSessions,
+    totalSessions: sentinelData.totalSessions, // Use actual sessions, not blocks
     dateRange: sentinelData.dateRange
   }
 }

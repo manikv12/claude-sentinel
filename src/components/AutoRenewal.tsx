@@ -58,15 +58,16 @@ export function AutoRenewal() {
     )
   }
 
-  const { 
-    status, 
-    isLoading, 
+  const {
+    status,
+    isLoading,
     settings,
     toggleAutoRenewal,
     updateSettings,
     setScheduledStartTime,
-    refreshStatus 
+    refreshStatus
   } = storeData
+
   
   const [scheduledTime, setScheduledTime] = useState('')
   const [isInitialLoad, setIsInitialLoad] = useState(true)

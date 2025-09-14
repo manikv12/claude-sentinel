@@ -2,6 +2,14 @@ import React, { useState, useEffect } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card'
 import { Button } from './ui/button'
 import { Switch } from './ui/switch'
+import { DatePicker } from './ui/date-picker'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle
+} from './ui/dialog'
 import { useUsageStore, UsagePrediction } from '@/stores/usageStore'
 import { useRenewalStore } from '@/stores/renewalStore'
 import { formatCurrency, formatTokens, formatTimeRemaining, getTimeAgo } from '@/lib/utils'
@@ -99,6 +107,11 @@ export function Dashboard() {
   const [chartMetric, setChartMetric] = useState<'tokens' | 'cost'>('tokens')
   const [chartView, setChartView] = useState<'daily' | 'sessions'>('daily')
 
+  // Auto-renewal modal state
+  const [showModeSelection, setShowModeSelection] = useState(false)
+  const [selectedMode, setSelectedMode] = useState<'immediate' | 'scheduled'>('immediate')
+  const [scheduledTime, setScheduledTime] = useState('')
+
   // Track window focus to pause auto-refresh when not visible
   useEffect(() => {
     const handleFocus = () => setIsWindowFocused(true)
@@ -173,9 +186,43 @@ export function Dashboard() {
 
   const handleToggleRenewal = async () => {
     try {
-      await toggleAutoRenewal(!status.enabled)
+      if (!status.enabled) {
+        // If turning ON, show mode selection first
+        setShowModeSelection(true)
+        return
+      }
+
+      // If turning OFF, just disable
+      await toggleAutoRenewal(false)
     } catch (error) {
       console.error('Failed to toggle auto-renewal:', error)
+    }
+  }
+
+  const handleConfirmModeSelection = async () => {
+    try {
+      let scheduledStartTime: string | undefined = undefined
+
+      if (selectedMode === 'scheduled') {
+        if (scheduledTime && scheduledTime.trim() !== '') {
+          const date = new Date(scheduledTime)
+          if (!isNaN(date.getTime())) {
+            scheduledStartTime = date.toISOString()
+          }
+        } else {
+          // Set default time to 1 hour from now if no time is set
+          const defaultTime = new Date()
+          defaultTime.setHours(defaultTime.getHours() + 1, 0, 0, 0)
+          const timeString = defaultTime.toISOString().slice(0, 16)
+          setScheduledTime(timeString)
+          scheduledStartTime = defaultTime.toISOString()
+        }
+      }
+
+      await toggleAutoRenewal(true, scheduledStartTime)
+      setShowModeSelection(false)
+    } catch (error) {
+      console.error('Failed to enable auto-renewal:', error)
     }
   }
 
@@ -309,7 +356,7 @@ export function Dashboard() {
           </div>
 
           {/* Stats Cards */}
-          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+          <div className="grid gap-4 md:grid-cols-3">
         <Card className="glass-card">
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle className="text-sm font-medium">Total Cost</CardTitle>
@@ -336,16 +383,6 @@ export function Dashboard() {
           </CardContent>
         </Card>
 
-        <Card className="glass-card">
-          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Sessions</CardTitle>
-            <Activity className="h-4 w-4 text-muted-foreground" />
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">{summary.totalSessions}</div>
-            <p className="text-xs text-muted-foreground">{formatTokens(Math.round(summary.averageTokensPerSession))} avg/session (today)</p>
-          </CardContent>
-        </Card>
 
         <Card className="glass-card">
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
@@ -667,7 +704,7 @@ export function Dashboard() {
                   variant={chartView === 'sessions' ? 'default' : 'outline'}
                   size="sm"
                   onClick={() => {
-                    console.log('Sessions data:', usageData.sessions)
+                    // Debug: sessions series; disabled for performance
                     setChartView('sessions')
                   }}
                 >
@@ -704,6 +741,123 @@ export function Dashboard() {
           </div>
         </CardContent>
       </Card>
+
+      {/* Mode Selection Dialog */}
+      <Dialog open={showModeSelection} onOpenChange={setShowModeSelection}>
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center space-x-2">
+              <Power className="h-5 w-5 text-green-500" />
+              <span>Enable Auto-Renewal</span>
+            </DialogTitle>
+            <DialogDescription>
+              Choose when you want auto-renewal to start monitoring and renewing your Claude sessions.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4 py-4">
+            {/* Immediate Option */}
+            <div
+              className={`p-4 border rounded-lg cursor-pointer transition-colors ${
+                selectedMode === 'immediate'
+                  ? 'border-primary bg-primary/5'
+                  : 'border-border hover:bg-secondary/50'
+              }`}
+              onClick={() => setSelectedMode('immediate')}
+            >
+              <div className="flex items-center space-x-3">
+                <input
+                  type="radio"
+                  name="renewalMode"
+                  checked={selectedMode === 'immediate'}
+                  onChange={() => setSelectedMode('immediate')}
+                  className="w-4 h-4 text-primary"
+                />
+                <div className="flex-1">
+                  <div className="flex items-center space-x-2 mb-1">
+                    <Zap className="h-4 w-4 text-green-500" />
+                    <span className="font-medium">Start Immediately</span>
+                  </div>
+                  <p className="text-sm text-muted-foreground">
+                    Begin monitoring and auto-renewal right away
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Scheduled Option */}
+            <div
+              className={`p-4 border rounded-lg cursor-pointer transition-colors ${
+                selectedMode === 'scheduled'
+                  ? 'border-primary bg-primary/5'
+                  : 'border-border hover:bg-secondary/50'
+              }`}
+              onClick={() => setSelectedMode('scheduled')}
+            >
+              <div className="flex items-center space-x-3">
+                <input
+                  type="radio"
+                  name="renewalMode"
+                  checked={selectedMode === 'scheduled'}
+                  onChange={() => setSelectedMode('scheduled')}
+                  className="w-4 h-4 text-primary"
+                />
+                <div className="flex-1">
+                  <div className="flex items-center space-x-2 mb-1">
+                    <Timer className="h-4 w-4 text-blue-500" />
+                    <span className="font-medium">Schedule for Later</span>
+                  </div>
+                  <p className="text-sm text-muted-foreground">
+                    Choose a specific date and time to begin auto-renewal
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Date/Time Picker for Scheduled Mode */}
+            {selectedMode === 'scheduled' && (
+              <div className="space-y-3 border-l-2 border-primary/20 pl-4 ml-4">
+                <label className="text-sm font-medium">Select start date and time:</label>
+                <div className="relative overflow-visible">
+                  <DatePicker
+                    value={scheduledTime}
+                    onChange={setScheduledTime}
+                    minDate={new Date()}
+                    className="w-full"
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="flex space-x-3 pt-4">
+            <Button
+              variant="outline"
+              onClick={() => setShowModeSelection(false)}
+              className="flex-1"
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={handleConfirmModeSelection}
+              disabled={renewalLoading}
+              className="flex-1"
+            >
+              {renewalLoading ? (
+                <>
+                  <RefreshCw className="h-4 w-4 mr-2 animate-spin" />
+                  Enabling...
+                </>
+              ) : (
+                <>
+                  <CheckCircle className="h-4 w-4 mr-2" />
+                  Enable Auto-Renewal
+                </>
+              )}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
       </>
       )}
     </div>

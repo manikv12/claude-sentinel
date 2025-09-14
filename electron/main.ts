@@ -1,4 +1,5 @@
 import { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, Notification, dialog, shell } from 'electron'
+import { Worker } from 'node:worker_threads'
 import { join } from 'path'
 import * as fs from 'fs'
 import * as path from 'path'
@@ -21,7 +22,80 @@ const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'] || 'http://localh
 let mainWindow: BrowserWindow | null = null
 let floatingWindow: BrowserWindow | null = null
 let tray: Tray | null = null
+// Track when the tray menu is open so we avoid heavy work or menu rebuilds
+let isTrayMenuOpen = false
 let trayUsageInterval: NodeJS.Timeout | null = null
+// Background worker for usage refresh to keep main thread responsive
+let usageWorker: Worker | null = null
+let workerBusy = false
+let pendingRefresh = false
+// Resolve Promises waiting for the next worker result
+let workerResolvers: Array<(payload: any) => void> = []
+
+const initUsageWorker = () => {
+  if (usageWorker) return
+  try {
+    usageWorker = new Worker(new URL('./workers/usageWorker.js', import.meta.url), { type: 'module' })
+    usageWorker.on('message', (msg: any) => {
+      workerBusy = false
+      if (msg?.ok && msg.data) {
+        const data = msg.data
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('usage-update', data)
+        }
+        if (floatingWindow && !floatingWindow.isDestroyed()) {
+          floatingWindow.webContents.send('usage-update', data)
+        }
+        updateTrayUsage()
+      }
+      // Resolve any pending Promises waiting for this result
+      if (workerResolvers.length > 0) {
+        const resolvers = workerResolvers
+        workerResolvers = []
+        resolvers.forEach((r) => r(msg))
+      }
+      if (pendingRefresh) {
+        pendingRefresh = false
+        scheduleBackgroundRefresh()
+      }
+    })
+    usageWorker.on('error', (err) => {
+      workerBusy = false
+      console.error('Usage worker error:', err)
+    })
+    usageWorker.on('exit', (code) => {
+      workerBusy = false
+      usageWorker = null
+      if (code !== 0) console.warn('Usage worker exited unexpectedly')
+    })
+  } catch (e) {
+    console.error('Failed to create usage worker:', e)
+  }
+}
+
+const scheduleBackgroundRefresh = (hard = false) => {
+  initUsageWorker()
+  if (!usageWorker) return
+  if (workerBusy) { pendingRefresh = true; return }
+  workerBusy = true
+  usageWorker.postMessage({ type: hard ? 'hard-refresh' : 'refresh' })
+}
+
+// Request a refresh and return the worker's payload once it's ready
+const requestUsageRefresh = (hard = false): Promise<any> => {
+  initUsageWorker()
+  if (!usageWorker) return Promise.reject(new Error('Worker not initialized'))
+  return new Promise((resolve) => {
+    workerResolvers.push((payload) => resolve(payload))
+    if (workerBusy) {
+      // Coalesce: mark pending and let current run finish
+      pendingRefresh = true
+    } else {
+      workerBusy = true
+      usageWorker!.postMessage({ type: hard ? 'hard-refresh' : 'refresh' })
+    }
+  })
+}
 
 
 // Create a high-quality PNG pulse icon for macOS menu bar
@@ -291,9 +365,9 @@ const formatTokens = (tokens: number) => {
   return tokens.toLocaleString()
 }
 
-const getUsagePercent = () => {
+const getUsagePercent = async () => {
   try {
-    const block = getCurrentBlockInfo()
+    const block = await getCurrentBlockInfo()
     if (!block || !block.limit || block.limit <= 0) return { percent: null as number | null, block }
     const percent = Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100)))
     return { percent, block }
@@ -302,9 +376,9 @@ const getUsagePercent = () => {
   }
 }
 
-const updateTrayUsage = () => {
+const updateTrayUsage = async () => {
   if (!tray) return
-  const { percent, block } = getUsagePercent()
+  const { percent } = await getUsagePercent()
 
   // Use battery icon to show REMAINING tokens (100 - used percentage)
   try {
@@ -316,7 +390,9 @@ const updateTrayUsage = () => {
       percentage: remainingPercentage
     })
     tray.setImage(batteryIcon)
-    console.log(`Updated tray battery icon: ${remainingPercentage}% remaining (${usedPercentage}% used)`)
+    if (process.env.SENTINEL_DEBUG === '1') {
+      console.log(`Updated tray battery icon: ${remainingPercentage}% remaining (${usedPercentage}% used)`)
+    }
   } catch (error) {
     console.warn('Failed to update tray battery icon:', error)
     // Fallback to text if icon fails
@@ -467,7 +543,10 @@ const updateTrayUsage = () => {
   tray.setToolTip(tooltipLines.join('\n'))
 
   // Refresh tray context menu to reflect latest usage
-  try { updateTrayMenu().catch(console.error) } catch {}
+  // Avoid rebuilding the menu while it is open to prevent UI freeze
+  if (!isTrayMenuOpen) {
+    try { updateTrayMenu().catch(console.error) } catch {}
+  }
 }
 
 const startTrayUsageUpdates = () => {
@@ -680,7 +759,7 @@ const createFloatingWindow = () => {
 }
 
 const createTray = () => {
-  console.log('=== Creating macOS menu bar tray ===')
+  if (process.env.SENTINEL_DEBUG === '1') console.log('=== Creating macOS menu bar tray ===')
 
   // Create initial battery icon at 100% remaining (full battery)
   let trayIcon
@@ -689,13 +768,13 @@ const createTray = () => {
       size: 16,
       percentage: 100 // Start with full battery (100% tokens remaining)
     })
-    console.log('Created initial full battery icon (100% tokens remaining)')
+  if (process.env.SENTINEL_DEBUG === '1') console.log('Created initial full battery icon (100% tokens remaining)')
   } catch (error) {
     console.error('Failed to create initial battery icon:', error)
     trayIcon = nativeImage.createEmpty()
   }
 
-  console.log('Creating tray...')
+  if (process.env.SENTINEL_DEBUG === '1') console.log('Creating tray...')
   tray = new Tray(trayIcon)
   
   // Verify tray was created successfully
@@ -704,7 +783,7 @@ const createTray = () => {
     return
   }
   
-  console.log('Tray created successfully')
+  if (process.env.SENTINEL_DEBUG === '1') console.log('Tray created successfully')
   
   const contextMenu = Menu.buildFromTemplate([
     {
@@ -758,10 +837,18 @@ const createTray = () => {
 
   // Set initial basic tooltip and context menu
   tray.setToolTip('Claude Sentinel - Loading...')
+  // Track open/close to throttle updates while visible
+  contextMenu.on('menu-will-show', () => { isTrayMenuOpen = true })
+  contextMenu.on('menu-will-close', () => { isTrayMenuOpen = false })
   tray.setContextMenu(contextMenu)
 
-  // Handle tray click - show context menu only (no direct app opening)
-  // Note: The context menu will be shown automatically on click, we don't need to handle direct clicks
+  // Handle tray click - keep it light; defer any heavy refresh until after menu closes
+  tray.on('click', () => {
+    // Defer just a bit, but always refresh in background (hard) when clicked
+    setTimeout(() => {
+      scheduleBackgroundRefresh(true)
+    }, 300)
+  })
 
   // Start periodic usage updates for tray title/tooltip
   startTrayUsageUpdates()
@@ -771,6 +858,8 @@ const createTray = () => {
 app.whenReady().then(() => {
   createWindow()
   createTray()
+  // Prepare background worker
+  initUsageWorker()
   // Ensure Dock icon is explicitly set and shown on macOS
   if (process.platform === 'darwin' && app.dock) {
     try {
@@ -1075,7 +1164,9 @@ const updateTrayMenu = async () => {
 
   // Get next session time
   let nextSessionLine = null
-  console.log(`Tray menu update: status.enabled=${status.enabled}, status.nextRenewal=${status.nextRenewal}`)
+  if (process.env.SENTINEL_DEBUG === '1') {
+    console.log(`Tray menu update: status.enabled=${status.enabled}, status.nextRenewal=${status.nextRenewal}`)
+  }
   
   if (status.enabled && status.nextRenewal) {
     const nextRenewalTime = new Date(status.nextRenewal)
@@ -1083,7 +1174,9 @@ const updateTrayMenu = async () => {
     const isToday = nextRenewalTime.toDateString() === now.toDateString()
     const isTomorrow = nextRenewalTime.toDateString() === new Date(now.getTime() + 24*60*60*1000).toDateString()
 
-    console.log(`Next renewal time: ${nextRenewalTime.toISOString()}, isToday: ${isToday}, isTomorrow: ${isTomorrow}`)
+    if (process.env.SENTINEL_DEBUG === '1') {
+      console.log(`Next renewal time: ${nextRenewalTime.toISOString()}, isToday: ${isToday}, isTomorrow: ${isTomorrow}`)
+    }
 
     const timeOptions: Intl.DateTimeFormatOptions = {
       hour: '2-digit',
@@ -1102,9 +1195,11 @@ const updateTrayMenu = async () => {
       }
       nextSessionLine = `Next session: ${nextRenewalTime.toLocaleDateString('en-US', dateOptions)} at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
     }
-    console.log(`Generated next session line: ${nextSessionLine}`)
+    if (process.env.SENTINEL_DEBUG === '1') console.log(`Generated next session line: ${nextSessionLine}`)
   } else {
-    console.log(`Next session line not generated: enabled=${status.enabled}, nextRenewal=${status.nextRenewal}`)
+    if (process.env.SENTINEL_DEBUG === '1') {
+      console.log(`Next session line not generated: enabled=${status.enabled}, nextRenewal=${status.nextRenewal}`)
+    }
   }
 
   const menuItems = [
@@ -1188,6 +1283,9 @@ const updateTrayMenu = async () => {
     }
   ])
   
+  // Track menu open/close to prevent rebuild stalls
+  contextMenu.on('menu-will-show', () => { isTrayMenuOpen = true })
+  contextMenu.on('menu-will-close', () => { isTrayMenuOpen = false })
   tray.setContextMenu(contextMenu)
 }
 
@@ -1210,7 +1308,7 @@ ipcMain.handle('get-usage-data', async () => {
         cost: day.cost,
         model: 'mixed', // Could be enhanced to show model breakdown
         // Expose session count for per-day summaries on the dashboard
-        sessionsCount: Array.from(day.sessions).length
+        sessionsCount: Array.from(day.blocks || new Set()).length
       })),
       summary: {
         totalCost: recentData.totalCost,
@@ -1349,40 +1447,11 @@ ipcMain.handle('minimize-to-tray', async () => {
 
 ipcMain.handle('refresh-usage-data', async () => {
   try {
-    const recentData = await getRecentUsage(30) // Last 30 days
-    const blockInfo = await getCurrentBlockInfo()
-    
-    const data = {
-      daily: recentData.daily.map(day => ({
-        date: day.date,
-        inputTokens: day.inputTokens,
-        outputTokens: day.outputTokens,
-        totalTokens: day.totalTokens,
-        cost: day.cost,
-        model: 'mixed', // Could be enhanced to show model breakdown
-        sessionsCount: Array.from(day.sessions).length
-      })),
-      summary: {
-        totalCost: recentData.totalCost,
-        totalTokens: recentData.totalTokens,
-        totalSessions: recentData.totalSessions,
-        averageTokensPerSession: recentData.totalSessions > 0 ? 
-          recentData.totalTokens / recentData.totalSessions : 0
-      },
-      currentBlock: blockInfo
-    }
-    
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('usage-update', data)
-    }
-    if (floatingWindow && !floatingWindow.isDestroyed()) {
-      floatingWindow.webContents.send('usage-update', data)
-    }
-    // Update tray usage immediately
-    updateTrayUsage()
-    return data
+    const result = await requestUsageRefresh(false)
+    if (result?.ok && result.data) return result.data
+    throw new Error(result?.error || 'Worker refresh failed')
   } catch (error) {
-    console.error('Error refreshing usage data:', error)
+    console.error('Error refreshing usage data (worker):', error)
     throw error
   }
 })
@@ -1390,46 +1459,11 @@ ipcMain.handle('refresh-usage-data', async () => {
 // Force reset usage cache and perform a fresh usage read (hard refresh)
 ipcMain.handle('hard-refresh-usage-data', async () => {
   try {
-    // Reset analysis/cache so next read hits disk
-    resetUsageCache()
-
-    // Small delay to allow filesystem writes to settle when called after imports
-    await new Promise((r) => setTimeout(r, 200))
-
-    const recentData = await getRecentUsage(30)
-    const blockInfo = await getCurrentBlockInfo()
-
-    const data = {
-      daily: recentData.daily.map(day => ({
-        date: day.date,
-        inputTokens: day.inputTokens,
-        outputTokens: day.outputTokens,
-        totalTokens: day.totalTokens,
-        cost: day.cost,
-        model: 'mixed',
-        sessionsCount: Array.from(day.sessions).length
-      })),
-      summary: {
-        totalCost: recentData.totalCost,
-        totalTokens: recentData.totalTokens,
-        totalSessions: recentData.totalSessions,
-        averageTokensPerSession: recentData.totalSessions > 0 ?
-          recentData.totalTokens / recentData.totalSessions : 0
-      },
-      currentBlock: blockInfo
-    }
-
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('usage-update', data)
-    }
-    if (floatingWindow && !floatingWindow.isDestroyed()) {
-      floatingWindow.webContents.send('usage-update', data)
-    }
-    // Update tray usage immediately
-    updateTrayUsage()
-    return data
+    const result = await requestUsageRefresh(true)
+    if (result?.ok && result.data) return result.data
+    return { success: false, error: result?.error || 'Worker hard-refresh failed' }
   } catch (error) {
-    console.error('Error performing hard refresh:', error)
+    console.error('Error performing hard refresh (worker):', error)
     return { success: false }
   }
 })
@@ -2118,7 +2152,7 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
               totalTokens: day.totalTokens,
               cost: day.cost,
               model: 'mixed',
-              sessionsCount: Array.from(day.sessions).length
+              sessionsCount: Array.from(day.blocks || new Set()).length
             })),
             summary: {
               totalCost: data.totalCost,
@@ -2489,7 +2523,7 @@ ipcMain.handle('clear-claude-usage-data', async (_, daysToKeep: number = 0) => {
               totalTokens: day.totalTokens,
               cost: day.cost,
               model: 'mixed',
-              sessionsCount: Array.from(day.sessions).length
+              sessionsCount: Array.from(day.blocks || new Set()).length
             })),
             summary: {
               totalCost: data.totalCost,

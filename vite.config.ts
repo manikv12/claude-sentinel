@@ -33,6 +33,18 @@ export default defineConfig({
             }
           }
         }
+      },
+      // Build worker separately to keep heavy work off the main thread
+      {
+        entry: 'electron/workers/usageWorker.ts',
+        vite: {
+          build: {
+            outDir: 'dist/main/workers',
+            rollupOptions: {
+              external: ['electron']
+            }
+          }
+        }
       }
     ])
   ],
