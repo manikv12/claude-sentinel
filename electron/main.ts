@@ -35,7 +35,7 @@ let workerResolvers: Array<(payload: any) => void> = []
 const initUsageWorker = () => {
   if (usageWorker) return
   try {
-    usageWorker = new Worker(new URL('./workers/usageWorker.js', import.meta.url), { type: 'module' })
+    usageWorker = new Worker(new URL('./workers/usageWorker.ts', import.meta.url), { type: 'module' })
     usageWorker.on('message', (msg: any) => {
       workerBusy = false
       if (msg?.ok && msg.data) {
