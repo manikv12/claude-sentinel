@@ -313,27 +313,7 @@ function getLastSuccessfulRenewal(): number | null {
 }
 
 function canPerformRenewal(): { allowed: boolean; reason?: string; hoursRemaining?: number } {
-  const lastRenewal = getLastSuccessfulRenewal()
-  
-  if (!lastRenewal) {
-    // No previous renewal recorded - allow first renewal
-    return { allowed: true }
-  }
-  
-  const now = Math.floor(Date.now() / 1000)
-  const hoursSinceLastRenewal = (now - lastRenewal) / 3600
-  const MINIMUM_HOURS_BETWEEN_RENEWALS = 5.0 // 5 hours minimum (Claude session duration)
-  
-  if (hoursSinceLastRenewal < MINIMUM_HOURS_BETWEEN_RENEWALS) {
-    const hoursRemaining = MINIMUM_HOURS_BETWEEN_RENEWALS - hoursSinceLastRenewal
-    const lastRenewalTime = new Date(lastRenewal * 1000).toLocaleString()
-    return {
-      allowed: false,
-      reason: `Last renewal was ${hoursSinceLastRenewal.toFixed(1)} hours ago (${lastRenewalTime}). Must wait ${MINIMUM_HOURS_BETWEEN_RENEWALS} hours between renewals (Claude session duration).`,
-      hoursRemaining: hoursRemaining
-    }
-  }
-  
+  // Auto-renewal should be purely based on block expiration, not arbitrary time delays
   return { allowed: true }
 }
 
