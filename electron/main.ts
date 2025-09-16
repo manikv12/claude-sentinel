@@ -1,11 +1,14 @@
 import { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, Notification, dialog, shell } from 'electron'
 import { Worker } from 'node:worker_threads'
 import { join } from 'path'
+import { fileURLToPath } from 'url'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
+import ts from 'typescript'
 import { isDev } from './utils'
 import { loadUsageData, getRecentUsage, getCurrentBlockInfo, resetUsageCache } from './services/ccusage-service'
+import { normalizeClaudePlan } from './services/plan-utils'
 import { 
   getRenewalStatus, 
   startRenewalService, 
@@ -35,7 +38,42 @@ let workerResolvers: Array<(payload: any) => void> = []
 const initUsageWorker = () => {
   if (usageWorker) return
   try {
-    usageWorker = new Worker(new URL('./workers/usageWorker.ts', import.meta.url), { type: 'module' })
+    const usingDevServer = !!process.env.VITE_DEV_SERVER_URL
+    let workerScript: string
+    const workerOptions: ConstructorParameters<typeof Worker>[1] = {}
+
+    if (usingDevServer) {
+      const projectRoot = process.cwd()
+      const workerTsPath = path.join(projectRoot, 'electron', 'workers', 'usageWorker.ts')
+      const tempDir = join(os.tmpdir(), 'claude-sentinel')
+      try { fs.mkdirSync(tempDir, { recursive: true }) } catch {}
+      const tempFile = join(tempDir, 'usageWorker-dev-bootstrap.js')
+
+      const bootstrap = `const ts = require(${JSON.stringify(require.resolve('typescript'))});\n` +
+        `const fs = require('fs');\n` +
+        `require.extensions['.ts'] = (module, filename) => {\n` +
+        `  const source = fs.readFileSync(filename, 'utf8');\n` +
+        `  const out = ts.transpileModule(source, {\n` +
+        `    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true, skipLibCheck: true },\n` +
+        `    fileName: filename\n` +
+        `  }).outputText;\n` +
+        `  module._compile(out, filename);\n` +
+        `};\n` +
+        `require(${JSON.stringify(workerTsPath)});\n`
+
+      fs.writeFileSync(tempFile, bootstrap)
+      workerScript = tempFile
+    } else {
+      // Find the actual worker file with hash
+      const assetsDir = join(__dirname, 'assets')
+      const workerFiles = fs.readdirSync(assetsDir).filter((f: string) => f.startsWith('usageWorker-') && f.endsWith('.js'))
+      if (workerFiles.length === 0) {
+        throw new Error('Usage worker file not found')
+      }
+      workerScript = join(assetsDir, workerFiles[0])
+    }
+
+    usageWorker = new Worker(workerScript, workerOptions)
     usageWorker.on('message', (msg: any) => {
       workerBusy = false
       if (msg?.ok && msg.data) {
@@ -73,18 +111,26 @@ const initUsageWorker = () => {
   }
 }
 
-const scheduleBackgroundRefresh = (hard = false) => {
+const scheduleBackgroundRefresh = async (hard = false) => {
   initUsageWorker()
   if (!usageWorker) return
   if (workerBusy) { pendingRefresh = true; return }
   workerBusy = true
-  usageWorker.postMessage({ type: hard ? 'hard-refresh' : 'refresh' })
+  const userPlan = await getUserClaudePlan()
+  usageWorker.postMessage({ 
+    type: hard ? 'hard-refresh' : 'refresh',
+    userPlan: userPlan
+  })
 }
 
 // Request a refresh and return the worker's payload once it's ready
-const requestUsageRefresh = (hard = false): Promise<any> => {
+const requestUsageRefresh = async (hard = false): Promise<any> => {
   initUsageWorker()
   if (!usageWorker) return Promise.reject(new Error('Worker not initialized'))
+  
+  // Get user's Claude plan to pass to worker
+  const userPlan = await getUserClaudePlan()
+  
   return new Promise((resolve) => {
     workerResolvers.push((payload) => resolve(payload))
     if (workerBusy) {
@@ -92,7 +138,10 @@ const requestUsageRefresh = (hard = false): Promise<any> => {
       pendingRefresh = true
     } else {
       workerBusy = true
-      usageWorker!.postMessage({ type: hard ? 'hard-refresh' : 'refresh' })
+      usageWorker!.postMessage({ 
+        type: hard ? 'hard-refresh' : 'refresh',
+        userPlan: userPlan
+      })
     }
   })
 }
@@ -367,7 +416,8 @@ const formatTokens = (tokens: number) => {
 
 const getUsagePercent = async () => {
   try {
-    const block = await getCurrentBlockInfo()
+    const userPlan = await getUserClaudePlan()
+    const block = await getCurrentBlockInfo(userPlan)
     if (!block || !block.limit || block.limit <= 0) return { percent: null as number | null, block }
     const percent = Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100)))
     return { percent, block }
@@ -378,7 +428,7 @@ const getUsagePercent = async () => {
 
 const updateTrayUsage = async () => {
   if (!tray) return
-  const { percent } = await getUsagePercent()
+  const { percent, block } = await getUsagePercent()
 
   // Use battery icon to show REMAINING tokens (100 - used percentage)
   try {
@@ -892,12 +942,19 @@ app.on('activate', () => {
 })
 
 app.on('window-all-closed', () => {
-  // Keep app running in menu bar/system tray on all platforms
-  // The app should only quit when explicitly requested from the tray menu
-  return
+  // On macOS, keep app running in system tray unless explicitly quit
+  if (process.platform !== 'darwin') {
+    app.quit()
+  }
 })
 
 app.on('before-quit', () => {
+  // Clean up worker
+  if (usageWorker) {
+    usageWorker.terminate()
+    usageWorker = null
+  }
+  
   // Clean up tray
   if (tray) {
     tray.destroy()
@@ -1156,8 +1213,11 @@ const forceStopAllTimers = () => {
 const updateTrayMenu = async () => {
   if (!tray) return
 
+  console.log('Updating tray menu...')
   const status = await getRenewalStatus()
-  const block = await getCurrentBlockInfo()
+  console.log('Renewal status for tray menu:', status)
+  const userPlan = await getUserClaudePlan()
+  const block = await getCurrentBlockInfo(userPlan)
   const percent = block && block.limit > 0 ? Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100))) : null
   const usageLine = percent === null ? 'Usage: unknown' : `Usage: ${percent}% (${formatTokens(block.usage)} / ${formatTokens(block.limit)})`
   const timeLine = `Time remaining: ${formatMinutes(block?.timeRemaining ?? null)}`
@@ -1251,17 +1311,24 @@ const updateTrayMenu = async () => {
       checked: status.enabled,
       click: async (menuItem) => {
         try {
+          console.log(`Tray auto-renewal toggle clicked: checked=${menuItem.checked}`)
+          
           if (menuItem.checked) {
+            console.log('Starting renewal service from tray...')
             await startRenewalService()
             startRenewalMonitoring()
+            console.log('Renewal service started from tray')
           } else {
+            console.log('Stopping renewal service from tray...')
             await stopRenewalService()
             stopRenewalMonitoring()
+            console.log('Renewal service stopped from tray')
           }
           
           // Notify renderer
           if (mainWindow && !mainWindow.isDestroyed()) {
             getRenewalStatus().then(status => {
+              console.log('Sending renewal status update to renderer:', status)
               mainWindow.webContents.send('renewal-status-update', status)
             }).catch(console.error)
           }
@@ -1296,8 +1363,9 @@ ipcMain.handle('app-version', () => {
 
 ipcMain.handle('get-usage-data', async () => {
   try {
-    const recentData = await getRecentUsage(30) // Last 30 days
-    const blockInfo = await getCurrentBlockInfo()
+    const userPlan = await getUserClaudePlan()
+    const recentData = await getRecentUsage(30, userPlan) // Last 30 days
+    const blockInfo = await getCurrentBlockInfo(userPlan)
     
     return {
       daily: recentData.daily.map(day => ({
@@ -2139,11 +2207,12 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
 
     // Trigger usage cache rebuild by resetting cache then pushing updated usage
     try {
-      const { resetUsageCache } = require('../src/lib/ccusage-integration')
+      const { resetUsageCache } = require('./services/ccusage-integration')
       resetUsageCache()
       setTimeout(async () => {
         try {
-          const data = await getRecentUsage(30)
+          const userPlan = await getUserClaudePlan()
+          const data = await getRecentUsage(30, userPlan)
           const usageUpdateData = {
             daily: data.daily.map(day => ({
               date: day.date,
@@ -2160,7 +2229,7 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
               totalSessions: data.totalSessions,
               averageTokensPerSession: data.totalSessions > 0 ? data.totalTokens / data.totalSessions : 0
             },
-            currentBlock: await getCurrentBlockInfo()
+            currentBlock: await getCurrentBlockInfo(userPlan)
           }
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('usage-update', usageUpdateData)
@@ -2227,6 +2296,24 @@ const getDefaultSettings = () => ({
   }
 })
 
+// Helper function to get user's Claude plan from settings
+async function getUserClaudePlan(): Promise<string> {
+  try {
+    const settingsFile = getSettingsFilePath()
+    
+    if (fs.existsSync(settingsFile)) {
+      const fileContent = fs.readFileSync(settingsFile, 'utf8')
+      const savedSettings = JSON.parse(fileContent)
+      return normalizeClaudePlan(savedSettings.claudePlan)
+    }
+
+    return 'auto'
+  } catch (error) {
+    console.warn('Failed to get Claude plan from settings:', error)
+    return 'auto'
+  }
+}
+
 ipcMain.handle('get-settings', async () => {
   try {
     const settingsFile = getSettingsFilePath()
@@ -2265,9 +2352,27 @@ ipcMain.handle('get-settings', async () => {
 
 ipcMain.handle('save-settings', async (_, settings: any) => {
   try {
-    // Save all settings to the main settings file
+    // Load existing settings to compare Claude plan
+    let oldSettings: any = {}
     const settingsFile = getSettingsFilePath()
     
+    try {
+      console.log(`Loading existing settings from: ${settingsFile}`)
+      if (fs.existsSync(settingsFile)) {
+        oldSettings = JSON.parse(fs.readFileSync(settingsFile, 'utf8'))
+        console.log(`Loaded existing settings:`, oldSettings)
+      } else {
+        console.log(`Settings file does not exist yet: ${settingsFile}`)
+      }
+    } catch (error) {
+      console.warn('Could not load existing settings for comparison:', error)
+    }
+    
+    // Check if Claude plan changed
+    const claudePlanChanged = oldSettings.claudePlan !== settings.claudePlan
+    console.log(`Plan change detection: oldPlan='${oldSettings.claudePlan}', newPlan='${settings.claudePlan}', changed=${claudePlanChanged}`)
+    
+    // Save all settings to the main settings file
     try {
       fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2))
       console.log('Settings saved to:', settingsFile)
@@ -2302,6 +2407,41 @@ ipcMain.handle('save-settings', async (_, settings: any) => {
       
       fs.writeFileSync(configFile, JSON.stringify(currentConfig, null, 2))
       renewalLogger.info(`Settings saved: checkInterval=${currentConfig.checkInterval}min, enableLogging=${currentConfig.enableLogging}`, 'service')
+    }
+    
+    // If Claude plan changed, trigger hard refresh to apply new limits immediately
+    if (claudePlanChanged) {
+      console.log(`Claude plan changed from '${oldSettings.claudePlan || 'auto'}' to '${settings.claudePlan}' - triggering hard refresh`)
+      
+      try {
+        // Reset cache and trigger hard refresh
+        resetUsageCache()
+        
+        // Trigger hard refresh with new plan
+        setTimeout(async () => {
+          try {
+            const result = await requestUsageRefresh(true)
+            
+            // Send updated usage data to renderer
+            if (result?.ok && result.data && mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('usage-update', result.data)
+            }
+            
+            // Update tray with new limits after refresh completes
+            // Add small delay to ensure new data is processed
+            setTimeout(() => {
+              updateTrayUsage()
+              updateTrayMenu()
+            }, 200)
+            
+          } catch (error) {
+            console.error('Error during automatic hard refresh after plan change:', error)
+          }
+        }, 100) // Small delay to ensure settings are fully saved
+        
+      } catch (error) {
+        console.error('Error triggering hard refresh after plan change:', error)
+      }
     }
     
     console.log('Settings saved:', settings)
@@ -2350,7 +2490,7 @@ ipcMain.handle('show-notification', async (_, message: string) => {
 // Session status and management IPC handlers
 ipcMain.handle('get-session-status', async () => {
   try {
-    const { getSessionStatus } = await import('../src/lib/auto-renewal-integration')
+    const { getSessionStatus } = await import('./services/auto-renewal-integration')
     return getSessionStatus()
   } catch (error) {
     console.error('Error getting session status:', error)
@@ -2360,12 +2500,12 @@ ipcMain.handle('get-session-status', async () => {
 
 ipcMain.handle('force-start-new-session', async () => {
   try {
-    const { forceStartNewSession } = await import('../src/lib/auto-renewal-integration')
+    const { forceStartNewSession } = await import('./services/auto-renewal-integration')
     const result = forceStartNewSession()
     
     // Send status update to renderer after forcing new session
     if (mainWindow && !mainWindow.isDestroyed()) {
-      const { getSessionStatus } = await import('../src/lib/auto-renewal-integration')
+      const { getSessionStatus } = await import('./services/auto-renewal-integration')
       mainWindow.webContents.send('session-status-update', getSessionStatus())
     }
     
@@ -2379,7 +2519,7 @@ ipcMain.handle('force-start-new-session', async () => {
 // Block tracking IPC handlers
 ipcMain.handle('get-block-events', async (_, hours: number = 24) => {
   try {
-    const { getRecentBlockEvents } = await import('../src/lib/block-tracker')
+    const { getRecentBlockEvents } = await import('./services/block-tracker')
     return getRecentBlockEvents(hours)
   } catch (error) {
     console.error('Error getting block events:', error)
@@ -2389,7 +2529,7 @@ ipcMain.handle('get-block-events', async (_, hours: number = 24) => {
 
 ipcMain.handle('get-block-snapshot', async () => {
   try {
-    const { loadBlockSnapshot } = await import('../src/lib/block-tracker')
+    const { loadBlockSnapshot } = await import('./services/block-tracker')
     return loadBlockSnapshot()
   } catch (error) {
     console.error('Error getting block snapshot:', error)
@@ -2400,7 +2540,8 @@ ipcMain.handle('get-block-snapshot', async () => {
 ipcMain.handle('get-daily-blocks', async (_, date?: string) => {
   try {
     const { getCurrentBlockInfo } = await import('./services/ccusage-service')
-    const blockInfo = await getCurrentBlockInfo()
+    const userPlan = await getUserClaudePlan()
+    const blockInfo = await getCurrentBlockInfo(userPlan)
     
     // For now, return current block info. This could be enhanced to filter by date
     return blockInfo ? [blockInfo] : []
@@ -2509,12 +2650,13 @@ ipcMain.handle('clear-claude-usage-data', async (_, daysToKeep: number = 0) => {
     
     // Reset cache and refresh UI
     try {
-      const { resetUsageCache } = require('../src/lib/ccusage-integration')
+      const { resetUsageCache } = require('./services/ccusage-integration')
       resetUsageCache()
       
       setTimeout(async () => {
         try {
-          const data = await getRecentUsage(30)
+          const userPlan = await getUserClaudePlan()
+          const data = await getRecentUsage(30, userPlan)
           const usageUpdateData = {
             daily: data.daily.map(day => ({
               date: day.date,
@@ -2531,7 +2673,7 @@ ipcMain.handle('clear-claude-usage-data', async (_, daysToKeep: number = 0) => {
               totalSessions: data.totalSessions,
               averageTokensPerSession: data.totalSessions > 0 ? data.totalTokens / data.totalSessions : 0
             },
-            currentBlock: await getCurrentBlockInfo()
+            currentBlock: await getCurrentBlockInfo(userPlan)
           }
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('usage-update', usageUpdateData)

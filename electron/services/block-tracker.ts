@@ -3,8 +3,8 @@
  * Logs all detected blocks and their transitions for debugging
  */
 
-import { writeFileSync, readFileSync, existsSync, appendFileSync, mkdirSync } from 'fs'
-import { join } from 'path'
+const { writeFileSync, readFileSync, existsSync, appendFileSync, mkdirSync } = require('fs')
+const { join } = require('path')
 // import { homedir } from 'os' // No longer needed
 
 // Get app data directory - prefer Electron app.getPath if available, fallback to home

@@ -30,8 +30,42 @@ export function DatePicker({ value, onChange, minDate, className }: DatePickerPr
   const [viewDate, setViewDate] = useState<Date>(
     value ? new Date(value) : new Date()
   )
+  const [dropdownPosition, setDropdownPosition] = useState<'left' | 'right'>('left')
   
   const containerRef = useRef<HTMLDivElement>(null)
+
+  // Calculate dropdown position based on available space
+  useEffect(() => {
+    if (isOpen && containerRef.current) {
+      const rect = containerRef.current.getBoundingClientRect()
+      const dropdownWidth = 280 // Reduced from 320 to fit better in modals
+      const spaceToRight = window.innerWidth - rect.right
+      const spaceToLeft = rect.left
+      
+      // Find the closest modal container to respect its boundaries
+      const modalContainer = containerRef.current.closest('[role="dialog"]') || 
+                           containerRef.current.closest('.fixed') ||
+                           containerRef.current.closest('[data-radix-dialog-content]')
+      
+      let availableSpaceToRight = spaceToRight
+      let availableSpaceToLeft = spaceToLeft
+      
+      if (modalContainer) {
+        const modalRect = modalContainer.getBoundingClientRect()
+        availableSpaceToRight = modalRect.right - rect.right
+        availableSpaceToLeft = rect.left - modalRect.left
+      }
+      
+      // In modal contexts, strongly prefer right positioning
+      if (modalContainer) {
+        // Always try right positioning first in modals
+        setDropdownPosition('right')
+      } else {
+        // For dashboard contexts, also use right positioning but with different height
+        setDropdownPosition('right')
+      }
+    }
+  }, [isOpen])
 
   // Close when clicking outside
   useEffect(() => {
@@ -174,7 +208,18 @@ export function DatePicker({ value, onChange, minDate, className }: DatePickerPr
       </Button>
 
       {isOpen && (
-        <div className="absolute top-full left-0 z-50 mt-2 w-80 bg-white/10 dark:bg-black/10 backdrop-blur-xl border border-white/20 dark:border-white/10 rounded-xl shadow-2xl shadow-black/25">
+        <div className={`absolute z-50 bg-white/10 dark:bg-black/10 backdrop-blur-xl border border-white/20 dark:border-white/10 rounded-xl shadow-2xl shadow-black/25 ${
+          dropdownPosition === 'right' ? 'left-full ml-8' : 'top-full left-0 mt-2'
+        }`} style={{ 
+          width: '280px',
+          ...(dropdownPosition === 'right' && {
+            top: containerRef.current?.closest('[role="dialog"]') || 
+                 containerRef.current?.closest('.fixed') ||
+                 containerRef.current?.closest('[data-radix-dialog-content]') 
+                 ? '-240px' // Position higher for modal contexts
+                 : '-180px' // Position slightly lower for dashboard context
+          })
+        }}>
           <div className="p-4">
             {/* Calendar Header */}
             <div className="flex items-center justify-between mb-4">

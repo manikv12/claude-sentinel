@@ -1,9 +1,10 @@
-import { parentPort } from 'node:worker_threads'
-import { getRecentUsage, getCurrentBlockInfo, resetUsageCache } from '../../src/lib/ccusage-integration'
+const { parentPort } = require('node:worker_threads')
+const { getRecentUsage, getCurrentBlockInfo, resetUsageCache } = require('../services/ccusage-integration')
+const { normalizeClaudePlan } = require('../services/plan-utils')
 
 type RefreshMessage =
-  | { type: 'refresh' }
-  | { type: 'hard-refresh' }
+  | { type: 'refresh'; userPlan?: string }
+  | { type: 'hard-refresh'; userPlan?: string }
 
 if (!parentPort) {
   // Should never happen in a worker, but guard just in case
@@ -20,8 +21,13 @@ parentPort.on('message', async (msg: RefreshMessage) => {
     } else if (msg?.type !== 'refresh') {
       return
     }
-    const recentData = await getRecentUsage(30)
-    const blockInfo = await getCurrentBlockInfo()
+    
+    // Use userPlan from message, default to 'auto' if not provided
+    const userPlan = normalizeClaudePlan(msg.userPlan)
+    console.log(`Worker: Using userPlan: ${userPlan}`)
+    
+    const recentData = await getRecentUsage(30, userPlan)
+    const blockInfo = await getCurrentBlockInfo(userPlan)
 
     const data = {
       daily: recentData.daily.map((day: any) => ({

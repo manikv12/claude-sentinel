@@ -25,6 +25,39 @@ export interface RenewalLogEntry {
   category: 'schedule' | 'service' | 'renewal' | 'session'
 }
 
+let consoleStreamsHealthy = true
+let consoleGuardRegistered = false
+
+function ensureConsoleGuards() {
+  if (consoleGuardRegistered) return
+  consoleGuardRegistered = true
+
+  const handleStreamError = (stream: NodeJS.WriteStream | undefined) => {
+    if (!stream || typeof stream.on !== 'function') return
+    stream.on('error', (error: NodeJS.ErrnoException) => {
+      // When the host process closes stdout/stderr (common for background launchers)
+      // subsequent writes throw EIO/EPIPE asynchronously. Disable console logging entirely.
+      if (error?.code === 'EIO' || error?.code === 'EPIPE') {
+        consoleStreamsHealthy = false
+      }
+    })
+  }
+
+  handleStreamError(process.stdout as NodeJS.WriteStream | undefined)
+  handleStreamError(process.stderr as NodeJS.WriteStream | undefined)
+}
+
+function safeConsoleOutput(method: 'log' | 'warn' | 'error', ...args: unknown[]) {
+  if (!consoleStreamsHealthy) return
+  ensureConsoleGuards()
+
+  try {
+    console[method](...args)
+  } catch {
+    consoleStreamsHealthy = false
+  }
+}
+
 class RenewalLogService {
   private logsDir: string
 
@@ -40,11 +73,7 @@ class RenewalLogService {
         require('fs').mkdirSync(this.logsDir, { recursive: true })
       }
     } catch (error) {
-      try {
-        console.error('Failed to create logs directory:', error)
-      } catch {
-        // Silently fail if console is not available
-      }
+      safeConsoleOutput('error', 'Failed to create logs directory:', error)
     }
   }
 
@@ -67,21 +96,11 @@ class RenewalLogService {
 
       // Also log to console in development - with error handling
       if (process.env.NODE_ENV === 'development') {
-        try {
-          console.log(`[RENEWAL LOG] ${logEntry.trim()}`)
-        } catch (consoleError) {
-          // Silently fail console logging to prevent EIO errors from crashing the app
-          // The file logging above is the primary mechanism
-        }
+        safeConsoleOutput('log', `[RENEWAL LOG] ${logEntry.trim()}`)
       }
     } catch (error) {
       // Only try console.error if we can safely do so
-      try {
-        console.error('Failed to write to renewal log:', error)
-      } catch {
-        // If even console.error fails, there's nothing more we can do
-        // The application should continue running
-      }
+      safeConsoleOutput('error', 'Failed to write to renewal log:', error)
     }
   }
 
@@ -126,11 +145,7 @@ class RenewalLogService {
         }
       }
     } catch (error) {
-      try {
-        console.error('Failed to read logs:', error)
-      } catch {
-        // Silently fail if console is not available
-      }
+      safeConsoleOutput('error', 'Failed to read logs:', error)
     }
     
     // Sort by timestamp (newest first)
@@ -185,11 +200,7 @@ class RenewalLogService {
         }
       }
     } catch (error) {
-      try {
-        console.error('Failed to clean old logs:', error)
-      } catch {
-        // Silently fail if console is not available
-      }
+      safeConsoleOutput('error', 'Failed to clean old logs:', error)
     }
   }
 
@@ -212,11 +223,7 @@ class RenewalLogService {
         }
       }
     } catch (error) {
-      try {
-        console.error('Failed to clear logs:', error)
-      } catch {
-        // Silently fail if console is not available
-      }
+      safeConsoleOutput('error', 'Failed to clear logs:', error)
     }
   }
 

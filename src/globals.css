@@ -33,32 +33,65 @@
   }
 
   .dark {
-    /* Dark mode with deep blue background */
-    --background: 220 50% 8%;
-    --foreground: 220 20% 90%;
-    --card: 0 0% 100% / 0.05;
-    --card-foreground: 220 20% 90%;
-    --popover: 220 30% 8% / 0.95;
-    --popover-foreground: 220 20% 90%;
-    --primary: 220 91% 65%;
-    --primary-foreground: 220 30% 5%;
-    --secondary: 0 0% 100% / 0.03;
-    --secondary-foreground: 220 20% 80%;
-    --muted: 0 0% 100% / 0.02;
-    --muted-foreground: 220 10% 55%;
-    --accent: 0 0% 100% / 0.05;
-    --accent-foreground: 220 20% 85%;
+    /* Dark mode with metallic chrome theme */
+    --background: 218 23% 5%;
+    --foreground: 0 0% 95%;
+    --card: 0 0% 100% / 0.08;
+    --card-foreground: 0 0% 92%;
+    --popover: 218 23% 8% / 0.95;
+    --popover-foreground: 0 0% 90%;
+    --primary: 208 7% 46%;
+    --primary-foreground: 0 0% 98%;
+    --secondary: 0 0% 100% / 0.05;
+    --secondary-foreground: 0 0% 85%;
+    --muted: 0 0% 100% / 0.03;
+    --muted-foreground: 0 0% 65%;
+    --accent: 0 0% 100% / 0.08;
+    --accent-foreground: 0 0% 88%;
     --destructive: 0 70% 60%;
     --destructive-foreground: 0 0% 100%;
-    --border: 0 0% 100% / 0.1;
-    --input: 0 0% 100% / 0.05;
-    --ring: 220 91% 65%;
+    --border: 0 0% 100% / 0.12;
+    --input: 0 0% 100% / 0.08;
+    --ring: 208 7% 46%;
     
-    /* Dark glass effect variables */
-    --glass-bg: rgba(255, 255, 255, 0.08);
-    --glass-border: rgba(255, 255, 255, 0.15);
-    --glass-shadow: rgba(0, 0, 0, 0.5);
+    /* Metallic glass effect variables */
+    --glass-bg: rgba(255, 255, 255, 0.12);
+    --glass-border: rgba(255, 255, 255, 0.2);
+    --glass-shadow: rgba(0, 0, 0, 0.6);
     --glass-blur: 25px;
+  }
+}
+
+/* Metallic gradient utilities */
+@layer utilities {
+  .metallic-chrome-bg {
+    background: linear-gradient(180deg, #f8f9fa 0%, #e9ecef 15%, #adb5bd 45%, #6c757d 65%, #495057 85%, #343a40 100%);
+  }
+  
+  .metallic-silver-bg {
+    background: linear-gradient(180deg, #ffffff 0%, #f1f3f4 20%, #bdc1c6 50%, #80868b 75%, #5f6368 100%);
+  }
+  
+  .metallic-steel-bg {
+    background: linear-gradient(180deg, #f5f5f5 0%, #eeeeee 25%, #bdbdbd 50%, #757575 75%, #424242 100%);
+  }
+  
+  .metallic-chrome-text {
+    background: linear-gradient(180deg, #f8f9fa 0%, #e9ecef 15%, #adb5bd 45%, #6c757d 65%, #495057 85%, #343a40 100%);
+    background-clip: text;
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  
+  .metallic-border {
+    border-color: #adb5bd;
+  }
+  
+  .glass-metallic {
+    background: rgba(173, 181, 189, 0.1);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(173, 181, 189, 0.2);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
   }
 }
 

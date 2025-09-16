@@ -12,10 +12,10 @@ import {
   startRenewalService as startRenewalServiceLib,
   stopRenewalService as stopRenewalServiceLib,
   startClaudeSession
-} from '../../src/lib/auto-renewal-integration'
+} from './auto-renewal-integration'
 import { renewalLogger } from './log-service'
 
-import { getCurrentBlockInfo as getCurrentBlockInfoLib } from '../../src/lib/ccusage-integration'
+import { getCurrentBlockInfo as getCurrentBlockInfoLib } from './ccusage-integration'
 
 const USER_DATA = app.getPath('userData')
 const PID_FILE = join(USER_DATA, 'renewal.pid')
@@ -36,6 +36,19 @@ type SimpleConfig = {
 // Exported so the main process can auto-start monitoring on launch
 export function loadConfig(): SimpleConfig {
   try {
+    // Read from main settings file instead of separate renewal config
+    const SETTINGS_FILE = join(USER_DATA, 'settings.json')
+    if (existsSync(SETTINGS_FILE)) {
+      const settings = JSON.parse(readFileSync(SETTINGS_FILE, 'utf8'))
+      const autoRenewal = settings.autoRenewal || {}
+      return { 
+        enabled: !!autoRenewal.enabled, 
+        checkInterval: autoRenewal.checkInterval || 5, 
+        enableLogging: autoRenewal.enableLogging !== false
+      }
+    }
+    
+    // Fallback to old renewal config file for backwards compatibility
     if (existsSync(CONFIG_FILE)) {
       const cfg = JSON.parse(readFileSync(CONFIG_FILE, 'utf8'))
       return { 
@@ -439,7 +452,7 @@ export async function getRenewalStatus() {
 }
 
 // Decide renewal using current block info to avoid shelling out
-export function performRenewalCheck(): { success: boolean; action?: string; error?: string } {
+export async function performRenewalCheck(): Promise<{ success: boolean; action?: string; error?: string }> {
   try {
     // Check if auto-renewal is enabled first
     const cfg = loadConfig()

@@ -1,12 +1,15 @@
 /**
- * Auto-renewal service integrationits 
+ * Auto-renewal service integration
  * Extracted from ClaudeCodeAutoRenew for integration into Claude Sentinel
  */
 
-import * as fs from 'fs'
-import * as childProcess from 'child_process'
-import * as path from 'path'
-import * as os from 'os'
+const fs = require('fs')
+const childProcess = require('child_process')
+const path = require('path')
+const os = require('os')
+
+// Import ccusage-integration at the top
+import { getCurrentBlockInfo as getCurrentBlockInfoLib } from './ccusage-integration'
 
 const { existsSync, readFileSync, writeFileSync, unlinkSync, appendFileSync, mkdirSync } = fs
 const { spawn, spawnSync } = childProcess
@@ -61,7 +64,7 @@ function ensureAppDataDir() {
 // Import renewal logger (dynamic import to avoid circular dependency)
 let renewalLogger: any = null
 try {
-  renewalLogger = require('../../electron/services/log-service').renewalLogger
+  renewalLogger = require('./log-service').renewalLogger
 } catch (error) {
   console.warn('Renewal logger not available in this context')
 }
@@ -106,9 +109,7 @@ function getCcUsageCommand(): string | null {
  */
 function getMinutesUntilReset(): number | null {
   try {
-    // Import here to avoid circular dependencies
-    const { getCurrentBlockInfo } = require('./ccusage-integration')
-    const blockInfo = getCurrentBlockInfo()
+    const blockInfo = getCurrentBlockInfoLib()
     
     if (blockInfo && blockInfo.isActive && blockInfo.timeRemaining !== null) {
       return blockInfo.timeRemaining
@@ -318,8 +319,34 @@ export function loadConfig(): RenewalConfig {
 export function saveConfig(config: RenewalConfig): void {
   try {
     ensureAppDataDir()
+    
+    // Save to legacy config file for backwards compatibility
     writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2))
-    log(`Configuration saved: enabled=${config.enabled}`)
+    
+    // Also save to main settings file to keep them synchronized
+    const SETTINGS_FILE = join(APP_DATA_DIR, 'settings.json')
+    let settings = {}
+    try {
+      if (existsSync(SETTINGS_FILE)) {
+        settings = JSON.parse(readFileSync(SETTINGS_FILE, 'utf8'))
+      }
+    } catch (error) {
+      log(`Warning: Could not read main settings file: ${error}`, 'warn', 'service')
+    }
+    
+    // Update autoRenewal section in main settings
+    settings = {
+      ...settings,
+      autoRenewal: {
+        ...(settings as any).autoRenewal || {},
+        enabled: config.enabled,
+        checkInterval: config.checkInterval || 5,
+        enableLogging: config.enableLogging !== false
+      }
+    }
+    
+    writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2))
+    log(`Configuration saved to both files: enabled=${config.enabled}`)
   } catch (error) {
     log(`Error saving config: ${error}`)
     throw error
@@ -376,8 +403,7 @@ export function getRenewalStatus(): RenewalStatus {
   let lastActivity: Date | undefined
   let block: any = null
   try {
-    const { getCurrentBlockInfo } = require('./ccusage-integration')
-    block = getCurrentBlockInfo()
+    block = getCurrentBlockInfoLib()
     lastActivity = block && block.startTime ? new Date(block.startTime) : undefined
   } catch (error) {
     // Fallback if ccusage-integration is not available
@@ -551,8 +577,7 @@ export function getSessionStatus(): {
   // Use block data instead of lastActivity file for session status
   let block: any = null
   try {
-    const { getCurrentBlockInfo } = require('./ccusage-integration')
-    block = getCurrentBlockInfo()
+    block = getCurrentBlockInfoLib()
   } catch (error) {
     // Fallback if ccusage-integration is not available
     block = null

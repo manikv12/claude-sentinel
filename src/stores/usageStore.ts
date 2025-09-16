@@ -82,7 +82,7 @@ export const useUsageStore = create<UsageStore>((set, get) => ({
   refreshData: async () => {
     set({ isLoading: true, error: null })
     try {
-      if (!window.electronAPI?.getUsageData) {
+      if (!window.electronAPI?.hardRefreshUsageData) {
         console.warn('Running in development mode - Electron API not available')
         set({ isLoading: false })
         return
@@ -93,8 +93,9 @@ export const useUsageStore = create<UsageStore>((set, get) => ({
         setTimeout(() => reject(new Error('Request timeout')), 8000) // 8 second timeout
       })
 
+      // Always use hardRefreshUsageData to ensure we get current plan limits
       const data = await Promise.race([
-        window.electronAPI.getUsageData(),
+        window.electronAPI.hardRefreshUsageData(),
         timeoutPromise
       ])
 

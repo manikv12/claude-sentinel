@@ -3,16 +3,17 @@
  * Based on ccusage with custom naming and billing block support
  */
 
-import { readFileSync, existsSync, readdirSync, statSync } from 'fs'
-import { join } from 'path'
+const { readFileSync, existsSync, readdirSync, statSync } = require('fs')
+const { join } = require('path')
 // import { homedir } from 'os' // No longer used - moved to userData
-import { 
-  logBlockEvent, 
-  saveBlockSnapshot, 
-  loadBlockSnapshot, 
+import {
+  logBlockEvent,
+  saveBlockSnapshot,
+  loadBlockSnapshot,
   createBlockId,
   detectBlockChanges
 } from './block-tracker'
+import { normalizeClaudePlan, ClaudePlan } from './plan-utils'
 
 // Toggle verbose logging via env var (default off for performance)
 const DEBUG = process.env.SENTINEL_DEBUG === '1'
@@ -393,8 +394,10 @@ function findAllHistoricalBlocks(entries: SentinelUsageEntry[]): HistoricalBlock
  * Identify current billing block using the unified algorithm
  * Now uses the same logic as findAllHistoricalBlocks for consistency
  */
-async function identifyBillingBlocks(entries: SentinelUsageEntry[]): Promise<SentinelBillingBlock[]> {
+async function identifyBillingBlocks(entries: SentinelUsageEntry[], userPlan: string = 'auto'): Promise<SentinelBillingBlock[]> {
   if (entries.length === 0) return []
+
+  const plan = normalizeClaudePlan(userPlan)
   
   // Use the unified block detection algorithm
   const allBlocks = findAllHistoricalBlocks(entries)
@@ -451,47 +454,42 @@ async function identifyBillingBlocks(entries: SentinelUsageEntry[]): Promise<Sen
   // Reference: Claude Pro ~45 messages per 5-hour block, Max 5x ~225 messages, Max 20x ~900 messages
   // Estimated token equivalents: Pro ~400K, Max 5x ~880K, Max 20x ~3.5M tokens per block
   
-  // Get user's Claude plan preference from settings
-  // Default to 'auto' if not available
-  let userPlan: 'pro' | 'max-5x' | 'max-20x' | 'auto' = 'auto'
-  
-  // Try to get user plan from settings if available (browser/renderer context only)
-  try {
-    const globalThis_: any = globalThis
-    if (globalThis_.window?.electronAPI?.getSettings) {
-      const settings = await globalThis_.window.electronAPI.getSettings()
-      if (settings?.claudePlan) {
-        userPlan = settings.claudePlan
-      }
-    }
-  } catch (error) {
-    if (DEBUG) console.log('Could not load user plan setting, using auto-detect')
-  }
-  
+  // Use userPlan parameter passed to function
+  if (DEBUG) console.log(`Sentinel: Using user plan: ${plan}`)
+
   // Define plan-specific limits (based on actual Claude limits from ccusage)
-  const PLAN_LIMITS = {
-    'pro': 51_376_961,        // ~51M tokens (base plan limit)
-    'max-5x': 256_884_805,    // ~257M tokens (5x base plan)
-    'max-20x': 1_027_539_220  // ~1B tokens (20x base plan)
+  const PLAN_LIMITS: Record<Exclude<ClaudePlan, 'auto'>, number> = {
+    'pro': 31_000_000,        // 31M tokens (base plan limit)
+    'max-5x': 155_000_000,    // 155M tokens (5x base plan)
+    'max-20x': 620_000_000    // 620M tokens (20x base plan)
   }
-  
+
   let stableLimit: number
-  
-  if (userPlan === 'pro' || userPlan === 'max-5x' || userPlan === 'max-20x') {
+
+  if (plan === 'pro' || plan === 'max-5x' || plan === 'max-20x') {
     // User explicitly set their plan - use that limit
-    stableLimit = Math.max(PLAN_LIMITS[userPlan], usage * 1.05)
-    if (DEBUG) console.log(`Sentinel: Using user-configured ${userPlan} plan limit: ${stableLimit.toLocaleString()} tokens`)
-    
+    stableLimit = Math.max(PLAN_LIMITS[plan], usage * 1.05)
+    if (DEBUG) console.log(`Sentinel: Using user-configured ${plan} plan limit: ${stableLimit.toLocaleString()} tokens`)
+
   } else if (topBlocks.length >= 3) {
     // Auto-detect: Calculate stable limit from top 3 historical blocks with reasonable bounds
     const top3Average = Math.round((topBlocks[0].usage + topBlocks[1].usage + topBlocks[2].usage) / 3)
     
-    // Apply reasonable bounds based on Claude plan limits (400K to 3.5M tokens)
+    // Apply reasonable bounds based on Claude plan limits
     const MIN_REASONABLE_LIMIT = PLAN_LIMITS['pro']
     const MAX_REASONABLE_LIMIT = PLAN_LIMITS['max-20x']
     
+    // Use the smaller of: plan limits or historical average (don't exceed plan limits)
     const boundedLimit = Math.min(Math.max(top3Average, MIN_REASONABLE_LIMIT), MAX_REASONABLE_LIMIT)
-    stableLimit = Math.max(boundedLimit, usage * 1.05) // Ensure limit is at least 5% above current usage
+    
+    // Respect plan limits - don't exceed them even if current usage is higher
+    if (usage > MAX_REASONABLE_LIMIT) {
+      stableLimit = MAX_REASONABLE_LIMIT // Cap at max plan limit
+    } else if (usage > boundedLimit) {
+      stableLimit = Math.min(usage * 1.05, MAX_REASONABLE_LIMIT) // 5% above usage but capped at plan limit
+    } else {
+      stableLimit = boundedLimit
+    }
     
   } else if (topBlocks.length > 0) {
     // Single historical block - apply same bounds
@@ -499,8 +497,16 @@ async function identifyBillingBlocks(entries: SentinelUsageEntry[]): Promise<Sen
     const MAX_REASONABLE_LIMIT = PLAN_LIMITS['max-20x']
     
     const boundedLimit = Math.min(Math.max(topBlocks[0].usage, MIN_REASONABLE_LIMIT), MAX_REASONABLE_LIMIT)
-    stableLimit = Math.max(boundedLimit, usage * 1.05)
     
+    // Respect plan limits - don't exceed them even if current usage is higher
+    if (usage > MAX_REASONABLE_LIMIT) {
+      stableLimit = MAX_REASONABLE_LIMIT // Cap at max plan limit
+    } else if (usage > boundedLimit) {
+      stableLimit = Math.min(usage * 1.05, MAX_REASONABLE_LIMIT) // 5% above usage but capped at plan limit
+    } else {
+      stableLimit = boundedLimit
+    }
+
   } else {
     // No historical data - use intelligent default based on current usage
     if (usage > 3_500_000) {
@@ -587,15 +593,16 @@ function loadIncrementalUpdates(): SentinelUsageEntry[] | null {
 /**
  * Load and analyze Claude usage data with Sentinel enhancements
  */
-export async function loadSentinelUsageData(): Promise<SentinelUsageAnalysis> {
+export async function loadSentinelUsageData(userPlan: string = 'auto'): Promise<SentinelUsageAnalysis> {
   const now = Date.now()
+  const plan = normalizeClaudePlan(userPlan)
   
   // If we have cached data, try incremental updates first
   if (cachedData && (now - lastCacheTime) < CACHE_DURATION) {
     // For very recent requests, return cached analysis immediately
     if (cachedAnalysis) return cachedAnalysis
     // Fallback: compute once and cache
-    cachedAnalysis = await processUsageEntries(cachedData)
+    cachedAnalysis = await processUsageEntries(cachedData, plan)
     return cachedAnalysis
   }
   
@@ -613,13 +620,13 @@ export async function loadSentinelUsageData(): Promise<SentinelUsageAnalysis> {
       lastCacheTime = now
       if (DEBUG) console.log(`Sentinel: Added ${incrementalEntries.length} new entries via incremental update`)
       // Recompute analysis once and cache
-      cachedAnalysis = await processUsageEntries(uniqueEntries)
+      cachedAnalysis = await processUsageEntries(uniqueEntries, plan)
       return cachedAnalysis
     }
     // No updates found, return cached analysis if present
     if (cachedAnalysis) return cachedAnalysis
     // Fallback: compute once and cache
-    cachedAnalysis = await processUsageEntries(cachedData)
+    cachedAnalysis = await processUsageEntries(cachedData, plan)
     return cachedAnalysis
   }
   
@@ -643,12 +650,14 @@ export async function loadSentinelUsageData(): Promise<SentinelUsageAnalysis> {
   // Cache the loaded data and processed analysis
   cachedData = allEntries
   lastCacheTime = now
-  cachedAnalysis = await processUsageEntries(allEntries)
+  cachedAnalysis = await processUsageEntries(allEntries, plan)
   return cachedAnalysis
 }
 
-async function processUsageEntries(allEntries: SentinelUsageEntry[]): Promise<SentinelUsageAnalysis> {
+async function processUsageEntries(allEntries: SentinelUsageEntry[], userPlan: string = 'auto'): Promise<SentinelUsageAnalysis> {
   if (DEBUG) console.log(`🔍 SENTINEL DEBUG: processUsageEntries called with ${allEntries.length} entries`)
+
+  const plan = normalizeClaudePlan(userPlan)
 
   // Work on a sorted copy to avoid mutating cached arrays
   const sortedEntries = [...allEntries].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
@@ -737,7 +746,7 @@ async function processUsageEntries(allEntries: SentinelUsageEntry[]): Promise<Se
   })
 
   // Identify billing blocks
-  const blocks = await identifyBillingBlocks(sortedEntries)
+  const blocks = await identifyBillingBlocks(sortedEntries, plan)
   const currentBlock = blocks.find(block => block.isActive) || null
 
   // Date range
@@ -761,8 +770,9 @@ async function processUsageEntries(allEntries: SentinelUsageEntry[]): Promise<Se
 /**
  * Get usage data for the last N days with Sentinel enhancements
  */
-export async function getRecentSentinelUsage(days: number = 30): Promise<SentinelUsageAnalysis> {
-  const analysis = await loadSentinelUsageData()
+export async function getRecentSentinelUsage(days: number = 30, userPlan: string = 'auto'): Promise<SentinelUsageAnalysis> {
+  const plan = normalizeClaudePlan(userPlan)
+  const analysis = await loadSentinelUsageData(plan)
   const cutoffDate = new Date()
   cutoffDate.setDate(cutoffDate.getDate() - days)
   const cutoffString = cutoffDate.toISOString().split('T')[0]
@@ -784,8 +794,9 @@ export async function getRecentSentinelUsage(days: number = 30): Promise<Sentine
 /**
  * Get current billing block information with enhanced tracking
  */
-export async function getCurrentSentinelBlockInfo() {
-  const analysis = await loadSentinelUsageData()
+export async function getCurrentSentinelBlockInfo(userPlan: string = 'auto') {
+  const plan = normalizeClaudePlan(userPlan)
+  const analysis = await loadSentinelUsageData(plan)
   const currentBlock = analysis.currentBlock
   
   // Save snapshot of current state for debugging
@@ -847,8 +858,8 @@ export async function loadUsageData() {
   }
 }
 
-export async function getRecentUsage(days: number = 30) {
-  const sentinelData = await getRecentSentinelUsage(days)
+export async function getRecentUsage(days: number = 30, userPlan: string = 'auto') {
+  const sentinelData = await getRecentSentinelUsage(days, userPlan)
   return {
     daily: sentinelData.daily.map(day => ({
       ...day,
@@ -862,12 +873,13 @@ export async function getRecentUsage(days: number = 30) {
   }
 }
 
-export async function getCurrentBlockInfo() {
-  return await getCurrentSentinelBlockInfo()
+export async function getCurrentBlockInfo(userPlan: string = 'auto') {
+  return await getCurrentSentinelBlockInfo(userPlan)
 }
 
 // Allow external invalidation (e.g., after importing logs)
 export function resetUsageCache() {
+  console.log('🔄 Resetting usage cache - will recalculate with new plan limits')
   cachedData = null
   cachedAnalysis = null
   fileModTimes = new Map()

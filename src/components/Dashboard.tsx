@@ -816,15 +816,22 @@ export function Dashboard() {
 
             {/* Date/Time Picker for Scheduled Mode */}
             {selectedMode === 'scheduled' && (
-              <div className="space-y-3 border-l-2 border-primary/20 pl-4 ml-4">
-                <label className="text-sm font-medium">Select start date and time:</label>
-                <div className="relative overflow-visible">
-                  <DatePicker
-                    value={scheduledTime}
-                    onChange={setScheduledTime}
-                    minDate={new Date()}
-                    className="w-full"
-                  />
+              <div className="border-t-2 border-primary/20 pt-4 mt-4">
+                <div className="flex flex-col lg:flex-row lg:items-start space-y-3 lg:space-y-0 lg:space-x-4">
+                  <div className="flex-1">
+                    <label className="text-sm font-medium">Select start date and time:</label>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Choose when to begin auto-renewal monitoring
+                    </p>
+                  </div>
+                  <div className="relative overflow-visible w-full lg:w-72 lg:flex-shrink-0">
+                    <DatePicker
+                      value={scheduledTime}
+                      onChange={setScheduledTime}
+                      minDate={new Date()}
+                      className="w-full"
+                    />
+                  </div>
                 </div>
               </div>
             )}
