@@ -36,59 +36,50 @@ import {
 import { Skeleton } from './ui/skeleton'
 import { UsageChart } from './UsageChart'
 
-function DashboardSkeleton() {
+// Individual component skeletons for granular loading
+function StatCardSkeleton() {
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="h-8 w-40"><Skeleton className="h-8 w-40" /></div>
-        <div className="flex items-center space-x-4">
-          <Skeleton className="h-8 w-28" />
-          <Skeleton className="h-9 w-9" />
-        </div>
+    <div className="p-4 border rounded-lg">
+      <div className="flex items-center justify-between mb-4">
+        <Skeleton className="h-4 w-24" />
+        <Skeleton className="h-4 w-4" />
       </div>
+      <Skeleton className="h-7 w-24 mb-2" />
+      <Skeleton className="h-3 w-20" />
+    </div>
+  )
+}
 
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-        {[...Array(4)].map((_, i) => (
-          <div key={i} className="p-4 border rounded-lg">
-            <div className="flex items-center justify-between mb-4">
-              <Skeleton className="h-4 w-24" />
-              <Skeleton className="h-4 w-4" />
-            </div>
-            <Skeleton className="h-7 w-24 mb-2" />
-            <Skeleton className="h-3 w-20" />
-          </div>
-        ))}
+function CurrentBlockSkeleton() {
+  return (
+    <div className="p-4 border rounded-lg">
+      <div className="flex items-center space-x-2 mb-4">
+        <Skeleton className="h-5 w-5" />
+        <Skeleton className="h-5 w-40" />
       </div>
-
-      <div className="grid gap-6 md:grid-cols-2">
-        {[...Array(2)].map((_, i) => (
-          <div key={i} className="p-4 border rounded-lg">
-            <div className="flex items-center space-x-2 mb-4">
-              <Skeleton className="h-5 w-5" />
-              <Skeleton className="h-5 w-40" />
-            </div>
-            <div className="space-y-3">
-              <Skeleton className="h-4 w-full" />
-              <Skeleton className="h-4 w-3/4" />
-              <Skeleton className="h-4 w-2/3" />
-            </div>
-          </div>
-        ))}
-      </div>
-
-      <div className="p-4 border rounded-lg">
-        <div className="mb-2">
-          <Skeleton className="h-5 w-24" />
-        </div>
-        <Skeleton className="h-5 w-32 mb-4" />
-        <Skeleton className="h-64 w-full" />
+      <div className="space-y-3">
+        <Skeleton className="h-4 w-full" />
+        <Skeleton className="h-4 w-3/4" />
+        <Skeleton className="h-4 w-2/3" />
       </div>
     </div>
   )
 }
 
+function ChartSkeleton() {
+  return (
+    <div className="p-4 border rounded-lg">
+      <div className="mb-2">
+        <Skeleton className="h-5 w-24" />
+      </div>
+      <Skeleton className="h-5 w-32 mb-4" />
+      <Skeleton className="h-64 w-full" />
+    </div>
+  )
+}
+
 export function Dashboard() {
-  const { summary, currentBlock, isLoading: usageLoading, refreshData, usageData } = useUsageStore()
+  const { summary, currentBlock, usageData, loadingStates, loadDataInBackground, refreshData } = useUsageStore()
   const {
     status,
     isLoading: renewalLoading,
@@ -98,6 +89,7 @@ export function Dashboard() {
 
   const [autoRefresh, setAutoRefresh] = useState(false)
   const [autoRefreshInterval, setAutoRefreshInterval] = useState(60) // Align with cache window
+  const [initialLoad, setInitialLoad] = useState(false)
   const [isInitialLoad, setIsInitialLoad] = useState(true)
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [showUsageDetails, setShowUsageDetails] = useState(false)
@@ -145,13 +137,18 @@ export function Dashboard() {
     loadUserPlan()
   }, [])
 
-  // Load data when Dashboard component mounts
+  // Start background data loading immediately, don't block UI
   useEffect(() => {
-    const loadInitialData = async () => {
-      await Promise.all([refreshData(), refreshStatus()])
-      setIsInitialLoad(false)
-    }
-    loadInitialData()
+    // Show UI immediately, load data in background
+    setIsInitialLoad(false)
+    
+    // Start background loading after a brief delay for UI to render
+    const timeoutId = setTimeout(() => {
+      loadDataInBackground()
+      refreshStatus()
+    }, 100)
+    
+    return () => clearTimeout(timeoutId)
   }, [])
 
   // Auto-refresh functionality - respects cache window and window focus
@@ -317,8 +314,8 @@ export function Dashboard() {
 
   return (
     <div className="space-y-6">
-      {isInitialLoad && (usageLoading || renewalLoading) && <DashboardSkeleton />}
-      {!(isInitialLoad && (usageLoading || renewalLoading)) && (
+      {/* Never show full skeleton - always show UI immediately */}
+      {(
         <>
           {/* Header with auto-refresh controls */}
           <div className="flex items-center justify-between">
@@ -344,7 +341,7 @@ export function Dashboard() {
               </div>
               <Button
                 onClick={handleRefresh}
-                disabled={isRefreshing || usageLoading || renewalLoading}
+                disabled={isRefreshing || renewalLoading}
                 variant="outline"
                 size="icon"
                 title="Refresh"

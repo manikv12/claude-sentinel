@@ -84,7 +84,7 @@ const initUsageWorker = () => {
         if (floatingWindow && !floatingWindow.isDestroyed()) {
           floatingWindow.webContents.send('usage-update', data)
         }
-        updateTrayUsage()
+        updateTrayUsage(data.currentBlock)
       }
       // Resolve any pending Promises waiting for this result
       if (workerResolvers.length > 0) {
@@ -426,9 +426,20 @@ const getUsagePercent = async () => {
   }
 }
 
-const updateTrayUsage = async () => {
+const updateTrayUsage = async (blockData?: any) => {
   if (!tray) return
-  const { percent, block } = await getUsagePercent()
+  
+  let block, percent
+  if (blockData) {
+    // Use data passed from worker
+    block = blockData
+    percent = block && block.limit > 0 ? Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100))) : null
+  } else {
+    // Fallback to direct fetch (for periodic updates)
+    const result = await getUsagePercent()
+    percent = result.percent
+    block = result.block
+  }
 
   // Use battery icon to show REMAINING tokens (100 - used percentage)
   try {
@@ -626,10 +637,14 @@ const createWindow = () => {
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     trafficLightPosition: process.platform === 'darwin' ? { x: 20, y: 10 } : undefined,
     icon: process.platform !== 'darwin' ? createActivityIcon({ size: 256, color: '#3b82f6' }) : undefined,
+    // Show window immediately for faster perceived startup
+    show: true,
     webPreferences: {
       preload: join(__dirname, '../preload/preload.js'),
       nodeIntegration: false,
       contextIsolation: true,
+      // Enable background throttling for better performance
+      backgroundThrottling: false,
     },
   })
 
@@ -905,31 +920,46 @@ const createTray = () => {
 }
 
 // App event handlers
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  // Create window first for fast UI display
   createWindow()
-  createTray()
-  // Prepare background worker
-  initUsageWorker()
-  // Ensure Dock icon is explicitly set and shown on macOS
+  
+  // Defer heavy operations to avoid blocking main thread
+  setImmediate(() => {
+    createTray()
+  })
+  
+  // Defer worker initialization until after window is shown
+  setTimeout(() => {
+    initUsageWorker()
+  }, 100)
+  
+  // Defer dock icon setup (macOS)
   if (process.platform === 'darwin' && app.dock) {
-    try {
-      const icnsPath = path.join(process.resourcesPath, 'icon.icns')
-      if (fs.existsSync(icnsPath)) {
-        app.dock.setIcon(icnsPath)
-      } else {
-        // Fallback to generated colored icon
-        const dockIcon = createActivityIcon({ size: 256, color: '#3b82f6' })
-        app.dock.setIcon(dockIcon)
+    setTimeout(() => {
+      try {
+        const icnsPath = path.join(process.resourcesPath, 'icon.icns')
+        if (fs.existsSync(icnsPath)) {
+          app.dock.setIcon(icnsPath)
+        } else {
+          // Fallback to generated colored icon
+          const dockIcon = createActivityIcon({ size: 256, color: '#3b82f6' })
+          app.dock.setIcon(dockIcon)
+        }
+        app.dock.show()
+      } catch {
+        // Best-effort; ignore failures
       }
-      app.dock.show()
-    } catch {
-      // Best-effort; ignore failures
-    }
+    }, 50)
   }
-  try {
-    const cfg = loadConfig()
-    if (cfg.enabled) startRenewalMonitoring()
-  } catch {}
+  
+  // Defer renewal monitoring startup
+  setTimeout(() => {
+    try {
+      const cfg = loadConfig()
+      if (cfg.enabled) startRenewalMonitoring()
+    } catch {}
+  }, 200)
 })
 
 app.on('activate', () => {

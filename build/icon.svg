@@ -1,43 +1,135 @@
 <svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#000000"/>
-      <stop offset="50%" style="stop-color:#111111"/>
-      <stop offset="100%" style="stop-color:#1a1a1a"/>
-    </linearGradient>
-    <linearGradient id="pulseGradient" x1="0%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" style="stop-color:#3b82f6"/>
-      <stop offset="50%" style="stop-color:#1d4ed8"/>
-      <stop offset="100%" style="stop-color:#1e3a8a"/>
-    </linearGradient>
-    <radialGradient id="dotGradient" cx="50%" cy="50%">
-      <stop offset="0%" style="stop-color:#ffffff;stop-opacity:0.9"/>
-      <stop offset="100%" style="stop-color:#ffffff;stop-opacity:0.3"/>
-    </radialGradient>
-    <filter id="glow">
-      <feGaussianBlur stdDeviation="8" result="coloredBlur"/>
-      <feMerge> 
-        <feMergeNode in="coloredBlur"/>
-        <feMergeNode in="SourceGraphic"/>
-      </feMerge>
-    </filter>
-  </defs>
-  
-  <!-- Background -->
-  <rect width="512" height="512" rx="113" fill="url(#bgGradient)"/>
-  
-  <!-- Pulsation rings (more spaced out) -->
-  <circle cx="256" cy="256" r="46" fill="none" stroke="rgba(255,255,255,0.20)" stroke-width="2"/>
-  <circle cx="256" cy="256" r="102" fill="none" stroke="rgba(255,255,255,0.16)" stroke-width="2"/>
-  <circle cx="256" cy="256" r="158" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="2"/>
-  <circle cx="256" cy="256" r="214" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="2"/>
-  
-  <!-- Pulse waveform (thinner wave) -->
-  <path d="M 61 256 L 128 256 L 154 307 L 179 179 L 215 384 L 256 102 L 297 384 L 333 256 L 451 256" 
-        stroke="url(#pulseGradient)" 
-        stroke-width="20" 
-        stroke-linecap="round" 
-        stroke-linejoin="round"
-        fill="none"
-        filter="url(#glow)"/>
+    <defs>
+        <linearGradient id="bgGradient" x1="15%" y1="5%" x2="85%" y2="95%">
+            <stop offset="0%" stop-color="#0b0b0b" />
+            <stop offset="40%" stop-color="#050505" />
+            <stop offset="100%" stop-color="#000000" />
+        </linearGradient>
+        <radialGradient id="bgGlow" cx="50%" cy="45%" r="60%">
+            <stop offset="0%" stop-color="#2d3748" stop-opacity="0.20" />
+            <stop offset="55%" stop-color="#1a202c" stop-opacity="0.03" />
+            <stop offset="100%" stop-color="#1a202c" stop-opacity="0" />
+        </radialGradient>
+        <!-- Metallic chrome gradients -->
+        <linearGradient id="layer1" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="#f8f9fa" />
+            <stop offset="15%" stop-color="#e9ecef" />
+            <stop offset="45%" stop-color="#adb5bd" />
+            <stop offset="65%" stop-color="#6c757d" />
+            <stop offset="85%" stop-color="#495057" />
+            <stop offset="100%" stop-color="#343a40" />
+        </linearGradient>
+        <linearGradient id="layer2" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="#ffffff" />
+            <stop offset="20%" stop-color="#f1f3f4" />
+            <stop offset="50%" stop-color="#bdc1c6" />
+            <stop offset="75%" stop-color="#80868b" />
+            <stop offset="100%" stop-color="#5f6368" />
+        </linearGradient>
+        <linearGradient id="layer3" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="#f5f5f5" />
+            <stop offset="25%" stop-color="#eeeeee" />
+            <stop offset="50%" stop-color="#bdbdbd" />
+            <stop offset="75%" stop-color="#757575" />
+            <stop offset="100%" stop-color="#424242" />
+        </linearGradient>
+        <linearGradient id="layer4" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="#fafafa" />
+            <stop offset="10%" stop-color="#f0f0f0" />
+            <stop offset="40%" stop-color="#c4c4c4" />
+            <stop offset="70%" stop-color="#8a8a8a" />
+            <stop offset="100%" stop-color="#4a4a4a" />
+        </linearGradient>
+        <linearGradient id="layer5" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="#ffffff" />
+            <stop offset="30%" stop-color="#e8e8e8" />
+            <stop offset="60%" stop-color="#b8b8b8" />
+            <stop offset="100%" stop-color="#6d6d6d" />
+        </linearGradient>
+        <radialGradient id="pulseAura" cx="50%" cy="52%" r="48%">
+            <stop offset="0%" stop-color="#adb5bd" stop-opacity="0.15" />
+            <stop offset="40%" stop-color="#6c757d" stop-opacity="0.08" />
+            <stop offset="70%" stop-color="#495057" stop-opacity="0.03" />
+            <stop offset="100%" stop-color="#343a40" stop-opacity="0" />
+        </radialGradient>
+        <filter id="pulseGlow" x="-20%" y="-20%" width="140%" height="140%">
+            <feGaussianBlur in="SourceGraphic" stdDeviation="8" result="blur" />
+            <feGaussianBlur in="SourceGraphic" stdDeviation="3" result="innerBlur" />
+            <feMerge>
+                <feMergeNode in="blur" />
+                <feMergeNode in="innerBlur" />
+                <feMergeNode in="SourceGraphic" />
+            </feMerge>
+        </filter>
+        <!-- Professional enterprise-grade gradient -->
+        <linearGradient id="outlineGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#1e40af" />
+            <stop offset="25%" stop-color="#0891b2" />
+            <stop offset="50%" stop-color="#059669" />
+            <stop offset="75%" stop-color="#ca8a04" />
+            <stop offset="100%" stop-color="#dc2626" />
+        </linearGradient>
+
+        <!-- Enhanced gradient with better smoothing -->
+        <linearGradient id="outlineGradientSmooth" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#1d4ed8" />
+            <stop offset="25%" stop-color="#0284c7" />
+            <stop offset="50%" stop-color="#047857" />
+            <stop offset="75%" stop-color="#b45309" />
+            <stop offset="100%" stop-color="#b91c1c" />
+        </linearGradient>
+    </defs>
+
+    <g transform="translate(256 256) scale(0.84) translate(-256 -256)">
+        <rect width="512" height="512" rx="120" fill="url(#bgGradient)" />
+        <rect width="512" height="512" rx="120" fill="url(#bgGlow)" />
+
+        <!-- Professional gradient border with enhanced styling -->
+        <rect x="6" y="6" width="500" height="500" rx="114" fill="none"
+            stroke="url(#outlineGradientSmooth)"
+            stroke-width="4"
+            opacity="0.9" />
+
+        <!-- Secondary inner border for depth -->
+        <rect x="10" y="10" width="492" height="492" rx="110" fill="none"
+            stroke="url(#outlineGradient)"
+            stroke-width="2"
+            opacity="0.6" />
+
+        <!-- Block Code AI Logo Design -->
+        <g filter="url(#pulseGlow)">
+            <!-- Central AI cube with gradient -->
+            <rect x="220" y="220" width="72" height="72" rx="12"
+                fill="url(#outlineGradient)" opacity="0.9" />
+
+            <!-- Inner processing core -->
+            <rect x="235" y="235" width="42" height="42" rx="8"
+                fill="url(#bgGradient)" stroke="url(#outlineGradientSmooth)" stroke-width="2" />
+
+            <!-- Code block elements - minimalist design -->
+            <g fill="#ffffff" opacity="0.8">
+                <!-- Binary/code pattern inside -->
+                <rect x="245" y="245" width="4" height="4" rx="1" />
+                <rect x="253" y="245" width="4" height="4" rx="1" />
+                <rect x="261" y="245" width="4" height="4" rx="1" />
+
+                <rect x="245" y="256" width="4" height="4" rx="1" />
+                <rect x="261" y="256" width="4" height="4" rx="1" />
+
+                <rect x="245" y="267" width="4" height="4" rx="1" />
+                <rect x="253" y="267" width="4" height="4" rx="1" />
+                <rect x="261" y="267" width="4" height="4" rx="1" />
+            </g>
+
+            <!-- Floating data blocks around the core -->
+            <rect x="180" y="180" width="20" height="20" rx="4"
+                fill="url(#outlineGradientSmooth)" opacity="0.6" />
+            <rect x="312" y="180" width="20" height="20" rx="4"
+                fill="url(#outlineGradientSmooth)" opacity="0.6" />
+            <rect x="180" y="312" width="20" height="20" rx="4"
+                fill="url(#outlineGradientSmooth)" opacity="0.6" />
+            <rect x="312" y="312" width="20" height="20" rx="4"
+                fill="url(#outlineGradientSmooth)" opacity="0.6" />
+        </g>
+    </g>
 </svg>
