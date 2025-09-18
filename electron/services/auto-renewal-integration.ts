@@ -81,6 +81,12 @@ try {
   console.warn('Renewal logger not available in this context')
 }
 
+function applyLoggingPreference(enableLogging: boolean) {
+  if (renewalLogger && typeof renewalLogger.setLogLevel === 'function') {
+    renewalLogger.setLogLevel(enableLogging ? 'info' : 'warn')
+  }
+}
+
 /**
  * Log a message using the renewal log service
  */
@@ -318,18 +324,25 @@ export function loadConfig(): RenewalConfig {
   const defaultConfig: RenewalConfig = {
     enabled: false,
     checkInterval: 5,
-    enableLogging: true
+    enableLogging: false
   }
   
   try {
     if (existsSync(CONFIG_FILE)) {
       const configData = JSON.parse(readFileSync(CONFIG_FILE, 'utf8'))
-      return { ...defaultConfig, ...configData }
+      const config: RenewalConfig = {
+        ...defaultConfig,
+        ...configData,
+        enableLogging: configData.enableLogging === true
+      }
+      applyLoggingPreference(config.enableLogging)
+      return config
     }
   } catch (error) {
     log(`Error loading config: ${error}`)
   }
   
+  applyLoggingPreference(defaultConfig.enableLogging)
   return defaultConfig
 }
 
@@ -361,7 +374,7 @@ export function saveConfig(config: RenewalConfig): void {
         ...(settings as any).autoRenewal || {},
         enabled: config.enabled,
         checkInterval: config.checkInterval || 5,
-        enableLogging: config.enableLogging !== false
+        enableLogging: config.enableLogging === true
       }
     }
     

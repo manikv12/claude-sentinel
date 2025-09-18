@@ -18,9 +18,17 @@ function getLogDir(): string {
   return LOG_DIR
 }
 
+export type RenewalLogLevel = 'info' | 'warn' | 'error'
+
+const levelOrder: Record<RenewalLogLevel, number> = {
+  info: 0,
+  warn: 1,
+  error: 2
+}
+
 export interface RenewalLogEntry {
   timestamp: string
-  level: 'info' | 'warn' | 'error'
+  level: RenewalLogLevel
   message: string
   category: 'schedule' | 'service' | 'renewal' | 'session'
 }
@@ -60,11 +68,16 @@ function safeConsoleOutput(method: 'log' | 'warn' | 'error', ...args: unknown[])
 
 class RenewalLogService {
   private logsDir: string
+  private minLevel: RenewalLogLevel = 'warn'
 
   constructor() {
     this.logsDir = getLogDir()
     this.ensureLogDirectory()
     this.cleanOldLogs()
+  }
+
+  setLogLevel(level: RenewalLogLevel) {
+    this.minLevel = level
   }
 
   private ensureLogDirectory() {
@@ -75,6 +88,10 @@ class RenewalLogService {
     } catch (error) {
       safeConsoleOutput('error', 'Failed to create logs directory:', error)
     }
+  }
+
+  private shouldLog(level: RenewalLogLevel): boolean {
+    return levelOrder[level] >= levelOrder[this.minLevel]
   }
 
   private getTodayLogFile(): string {
@@ -88,6 +105,8 @@ class RenewalLogService {
   }
 
   log(level: RenewalLogEntry['level'], message: string, category: RenewalLogEntry['category'] = 'service') {
+    if (!this.shouldLog(level)) return
+
     try {
       const logFile = this.getTodayLogFile()
       const logEntry = this.formatLogEntry(level, message, category)

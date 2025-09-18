@@ -60,7 +60,7 @@ export function Settings() {
     autoRenewal: {
       enabled: false,
       checkInterval: 5,
-      enableLogging: true,
+      enableLogging: false,
       notifyOnRenewal: true,
       waitTimeBeforeSession: 60
     }
@@ -157,7 +157,7 @@ export function Settings() {
       autoRenewal: {
         enabled: false,
         checkInterval: 5,
-        enableLogging: true,
+        enableLogging: false,
         notifyOnRenewal: true,
         waitTimeBeforeSession: 60
       }

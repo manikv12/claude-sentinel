@@ -48,7 +48,7 @@ export const useRenewalStore = create<RenewalStore>((set, get) => ({
   error: null,
   settings: {
     checkInterval: 5,
-    enableLogging: true,
+    enableLogging: false,
     notifyOnRenewal: true,
     autoRefresh: false,
     autoRefreshInterval: 120

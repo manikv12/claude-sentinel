@@ -33,32 +33,48 @@ type SimpleConfig = {
   enableLogging?: boolean;
 }
 
+function applyLoggingPreference(enableLogging?: boolean) {
+  renewalLogger.setLogLevel(enableLogging ? 'info' : 'warn')
+}
+
 // Exported so the main process can auto-start monitoring on launch
 export function loadConfig(): SimpleConfig {
+  const defaultConfig: SimpleConfig = {
+    enabled: false,
+    checkInterval: 5,
+    enableLogging: false
+  }
+
   try {
     // Read from main settings file instead of separate renewal config
     const SETTINGS_FILE = join(USER_DATA, 'settings.json')
     if (existsSync(SETTINGS_FILE)) {
       const settings = JSON.parse(readFileSync(SETTINGS_FILE, 'utf8'))
       const autoRenewal = settings.autoRenewal || {}
-      return { 
-        enabled: !!autoRenewal.enabled, 
-        checkInterval: autoRenewal.checkInterval || 5, 
-        enableLogging: autoRenewal.enableLogging !== false
+      const config: SimpleConfig = {
+        enabled: !!autoRenewal.enabled,
+        checkInterval: typeof autoRenewal.checkInterval === 'number' ? autoRenewal.checkInterval : defaultConfig.checkInterval,
+        enableLogging: autoRenewal.enableLogging === true
       }
+      applyLoggingPreference(config.enableLogging)
+      return config
     }
-    
+
     // Fallback to old renewal config file for backwards compatibility
     if (existsSync(CONFIG_FILE)) {
       const cfg = JSON.parse(readFileSync(CONFIG_FILE, 'utf8'))
-      return { 
-        enabled: !!cfg.enabled, 
-        checkInterval: cfg.checkInterval, 
-        enableLogging: cfg.enableLogging
+      const config: SimpleConfig = {
+        enabled: !!cfg.enabled,
+        checkInterval: typeof cfg.checkInterval === 'number' ? cfg.checkInterval : defaultConfig.checkInterval,
+        enableLogging: cfg.enableLogging === true
       }
+      applyLoggingPreference(config.enableLogging)
+      return config
     }
   } catch {}
-  return { enabled: false }
+
+  applyLoggingPreference(defaultConfig.enableLogging)
+  return defaultConfig
 }
 
 function isProcessRunning(): { running: boolean; pid?: number } {

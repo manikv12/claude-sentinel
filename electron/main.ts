@@ -1299,8 +1299,20 @@ const updateTrayMenu = async () => {
   console.log('Updating tray menu...')
   const status = await getRenewalStatus()
   console.log('Renewal status for tray menu:', status)
-  const userPlan = await getUserClaudePlan()
-  const block = await getCurrentBlockInfo(userPlan)
+  
+  // Use worker data if available and fresh, otherwise fetch from service
+  let block
+  if (lastWorkerBlock && lastWorkerBlock.limit > 0) {
+    // Use consistent data from worker (same as tooltip)
+    block = lastWorkerBlock
+    console.log('Tray menu using worker data with limit:', formatTokens(block.limit))
+  } else {
+    // Fallback to service call
+    const userPlan = await getUserClaudePlan()
+    block = await getCurrentBlockInfo(userPlan)
+    console.log('Tray menu fetching fresh data with limit:', formatTokens(block?.limit || 0))
+  }
+  
   const percent = block && block.limit > 0 ? Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100))) : null
   const usageLine = percent === null ? 'Usage: unknown' : `Usage: ${percent}% (${formatTokens(block.usage)} / ${formatTokens(block.limit)})`
   const timeLine = `Time remaining: ${formatMinutes(block?.timeRemaining ?? null)}`
@@ -2386,7 +2398,7 @@ const getDefaultSettings = () => ({
   autoRenewal: {
     enabled: false,
     checkInterval: 5,
-    enableLogging: true,
+    enableLogging: false,
     notifyOnRenewal: true,
     waitTimeBeforeSession: 60
   }
@@ -2510,23 +2522,43 @@ ipcMain.handle('save-settings', async (_, settings: any) => {
       console.log(`Claude plan changed from '${oldSettings.claudePlan || 'auto'}' to '${settings.claudePlan}' - triggering hard refresh`)
       
       try {
-        // Reset cache and trigger hard refresh
+        // Reset cache and clear cached worker data
         resetUsageCache()
+        lastWorkerBlock = null // Clear cached worker data to force fresh data
+        
+        // Force tray menu to fetch fresh data (since lastWorkerBlock is cleared)
+        setTimeout(async () => {
+          try {
+            await updateTrayMenu()
+          } catch (error) {
+            console.error('Error updating tray menu after plan change:', error)
+          }
+        }, 50) // Very short delay to allow settings to be fully saved
         
         // Trigger hard refresh with new plan
         setTimeout(async () => {
           try {
             const result = await requestUsageRefresh(true)
             
-            // Send updated usage data to renderer
-            if (result?.ok && result.data && mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('usage-update', result.data)
+            // Send updated usage data to all renderer windows
+            if (result?.ok && result.data) {
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('usage-update', result.data)
+              }
+              if (floatingWindow && !floatingWindow.isDestroyed()) {
+                floatingWindow.webContents.send('usage-update', result.data)
+              }
             }
             
             // Update tray with new limits after refresh completes
             // Add small delay to ensure new data is processed
             setTimeout(() => {
-              updateTrayUsage()
+              // Force tray to use fresh data from worker instead of cached data
+              if (result?.ok && result.data?.currentBlock) {
+                updateTrayUsage(result.data.currentBlock)
+              } else {
+                updateTrayUsage()
+              }
               updateTrayMenu()
             }, 200)
             
