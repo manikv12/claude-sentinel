@@ -8,7 +8,7 @@ import * as os from 'os'
 import ts from 'typescript'
 import { isDev } from './utils'
 import { loadUsageData, getRecentUsage, getCurrentBlockInfo, resetUsageCache } from './services/ccusage-service'
-import { normalizeClaudePlan } from './services/plan-utils'
+import { normalizeClaudePlan, ClaudePlan } from './services/plan-utils'
 import { 
   getRenewalStatus, 
   startRenewalService, 
@@ -19,6 +19,13 @@ import {
 } from './services/renewal-service'
 import { renewalLogger } from './services/log-service'
 import { specService } from './services/spec-service'
+
+// Claude plan limits mapping (matches ccusage-integration.ts)
+const PLAN_LIMITS: Record<Exclude<ClaudePlan, 'auto'>, number> = {
+  'pro': 31_000_000,        // 31M tokens (base plan limit)
+  'max-5x': 155_000_000,    // 155M tokens (5x base plan)
+  'max-20x': 620_000_000    // 620M tokens (20x base plan)
+}
 
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'] || 'http://localhost:5173'
 
@@ -441,52 +448,91 @@ const getUsagePercent = async () => {
 }
 
 const updateTrayUsage = async (blockData?: any) => {
-  if (!tray) return
+  if (!tray || tray.isDestroyed()) return
   
   let block, percent
   if (blockData) {
     // Use data passed from worker
     block = blockData
-    percent = block && block.limit > 0 ? Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100))) : null
-  } else {
-    // Use last worker-provided data to keep tray consistent with dashboard/floating
+  } else if (lastWorkerBlock) {
+    // Use last worker-provided data
     block = lastWorkerBlock
-    percent = block && block.limit > 0 ? Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100))) : null
+  } else {
+    // No block data available
+    block = null
+  }
+  
+  // Apply user's plan override to ensure tooltip matches dashboard
+  if (block) {
+    try {
+      const userPlan = await getUserClaudePlan()
+      if (userPlan && userPlan !== 'auto') {
+        const normalizedPlan = normalizeClaudePlan(userPlan)
+        if (normalizedPlan !== 'auto' && PLAN_LIMITS[normalizedPlan]) {
+          // Override the limit with user's plan setting
+          block = {
+            ...block,
+            limit: PLAN_LIMITS[normalizedPlan]
+          }
+        }
+      }
+    } catch (planError) {
+      console.error('Error applying plan override to tray tooltip:', planError)
+    }
+  }
+  
+  // Calculate percentage only if block is active and has a limit
+  if (block && block.isActive && block.limit > 0) {
+    percent = Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100)))
+  } else {
+    percent = null
   }
 
   // Use battery icon to show REMAINING tokens (100 - used percentage)
   try {
-    const usedPercentage = percent || 0
-    const remainingPercentage = Math.max(0, 100 - usedPercentage) // Invert to show remaining
+    if (tray && !tray.isDestroyed()) {
+      const usedPercentage = percent || 0
+      const remainingPercentage = Math.max(0, 100 - usedPercentage) // Invert to show remaining
 
-    const batteryIcon = createBatteryIcon({
-      size: 16,
-      percentage: remainingPercentage
-    })
-    tray.setImage(batteryIcon)
-    if (process.env.SENTINEL_DEBUG === '1') {
-      console.log(`Updated tray battery icon: ${remainingPercentage}% remaining (${usedPercentage}% used)`)
+      const batteryIcon = createBatteryIcon({
+        size: 16,
+        percentage: remainingPercentage
+      })
+      tray.setImage(batteryIcon)
+      if (process.env.SENTINEL_DEBUG === '1') {
+        console.log(`Updated tray battery icon: ${remainingPercentage}% remaining (${usedPercentage}% used)`)
+      }
     }
   } catch (error) {
     console.warn('Failed to update tray battery icon:', error)
     // Fallback to text if icon fails
     try {
-      tray.setImage(nativeImage.createEmpty())
-      const displayText = percent === null ? '—' : `${100 - percent}%`
-      tray.setTitle(displayText)
-    } catch {}
+      if (tray && !tray.isDestroyed()) {
+        tray.setImage(nativeImage.createEmpty())
+        const displayText = percent === null ? '—' : `${100 - percent}%`
+        tray.setTitle(displayText)
+      }
+    } catch (fallbackError) {
+      console.warn('Failed to update tray fallback:', fallbackError)
+    }
   }
 
   // Clear title since we're using icon
   if (process.platform === 'darwin') {
     try {
-      tray.setTitle('')
-    } catch {}
+      if (tray && !tray.isDestroyed()) {
+        tray.setTitle('')
+      }
+    } catch (titleError) {
+      console.warn('Failed to clear tray title:', titleError)
+    }
   }
 
   // Tooltip with details including next renewal time
   const timeLeft = block?.timeRemaining ?? null
-  const usageText = block ? `${formatTokens(block.usage)} / ${formatTokens(block.limit || 0)} tokens` : 'Usage unavailable'
+  const usageText = (block && block.isActive) 
+    ? `${formatTokens(block.usage)} / ${formatTokens(block.limit || 0)} tokens` 
+    : 'No active session'
   
   // Get next renewal time from the renewal service
   let renewalInfo = ''
@@ -610,7 +656,13 @@ const updateTrayUsage = async (blockData?: any) => {
   }
 
   // Set the tooltip
-  tray.setToolTip(tooltipLines.join('\n'))
+  try {
+    if (tray && !tray.isDestroyed()) {
+      tray.setToolTip(tooltipLines.join('\n'))
+    }
+  } catch (tooltipError) {
+    console.warn('Failed to set tray tooltip:', tooltipError)
+  }
 
   // Refresh tray context menu to reflect latest usage
   // Avoid rebuilding the menu while it is open to prevent UI freeze
@@ -618,7 +670,7 @@ const updateTrayUsage = async (blockData?: any) => {
     try {
       await updateTrayMenu()
     } catch (menuError) {
-      console.error(menuError)
+      console.error('Failed to update tray menu:', menuError)
     }
   }
 }
@@ -1223,10 +1275,39 @@ const scheduleNextRenewal = async (): Promise<void> => {
         // Schedule immediate check
         renewalTimer = setTimeout(async () => {
           await performRenewalCheck()
-          await scheduleNextRenewal()
+          // Don't reschedule immediately - let the renewal check result determine next action
         }, 1000)
       }
     } else {
+      // Check if auto-renewal is enabled but no active block - trigger immediate check
+      if (status.enabled && (!status.currentBlock || !status.currentBlock.startTime)) {
+        renewalLogger.info('⚡ Auto-renewal enabled with no active session - triggering immediate renewal check', 'schedule')
+        renewalTimer = setTimeout(async () => {
+          try {
+            const result = await performRenewalCheck()
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('renewal-status-update', await getRenewalStatus())
+            }
+            if (result.success && result.action && tray) {
+              try { await updateTrayMenu() } catch (trayError) { console.error(trayError) }
+              try { await updateTrayUsage() } catch (trayError) { console.error(trayError) }
+            }
+            // Only reschedule if the renewal check didn't queue a session
+            if (result.success && result.action && result.action.includes('queued')) {
+              renewalLogger.info('Renewal queued successfully - monitoring will resume after session starts', 'schedule')
+            } else {
+              // If renewal didn't queue a session, try again with longer interval
+              renewalLogger.info('Renewal check completed without queuing session - will retry in 30 seconds', 'schedule')
+              reschedule(30000)
+            }
+          } catch (error) {
+            renewalLogger.error(`Error in immediate renewal check: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+            reschedule(60000)
+          }
+        }, 2000) // Small delay to avoid rapid firing
+        return
+      }
+      
       // No valid target time - only use emergency fallback if system is in unknown state
       const currentStatus = await getRenewalStatus()
       if (!currentStatus.currentBlock && currentStatus.enabled && currentStatus.running) {
@@ -1237,7 +1318,8 @@ const scheduleNextRenewal = async (): Promise<void> => {
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('renewal-status-update', await getRenewalStatus())
             }
-            await scheduleNextRenewal() // Reschedule once to see if we now have valid timing
+            // Don't immediately reschedule to avoid infinite loops
+            // The usage monitoring system will handle rescheduling when block state changes
           } catch (error) {
             renewalLogger.error(`Error in emergency fallback renewal check: ${error instanceof Error ? error.message : String(error)}`, 'renewal')
           }
@@ -1253,6 +1335,43 @@ const scheduleNextRenewal = async (): Promise<void> => {
     reschedule(60000)
   }
 }
+
+// Handle internal events from renewal service
+ipcMain.on('internal-session-started', async () => {
+  try {
+    renewalLogger.info('🔄 Session started event received - updating UI and tray', 'service')
+    
+    // Force refresh usage data to detect new block
+    const result = await requestUsageRefresh(true)
+    
+    // Update all UI components
+    if (result?.ok && result.data) {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('usage-update', result.data)
+      }
+      if (floatingWindow && !floatingWindow.isDestroyed()) {
+        floatingWindow.webContents.send('usage-update', result.data)
+      }
+      
+      // Update tray with fresh data - let updateTrayMenu() handle plan adjustments
+      try {
+        await updateTrayUsage(result.data.currentBlock)
+        await updateTrayMenu()
+      } catch (trayError) {
+        renewalLogger.error(`Failed to update tray after session start: ${trayError}`, 'service')
+      }
+      
+      renewalLogger.info('✅ UI and tray updated after session start', 'service')
+    }
+    
+    // Send renewal status update
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('renewal-status-update', await getRenewalStatus())
+    }
+  } catch (error) {
+    renewalLogger.error(`Error handling session started event: ${error instanceof Error ? error.message : String(error)}`, 'service')
+  }
+})
 
 // Start renewal monitoring when app starts
 const startRenewalMonitoring = () => {
@@ -1294,28 +1413,47 @@ const forceStopAllTimers = () => {
 }
 
 const updateTrayMenu = async () => {
-  if (!tray) return
+  if (!tray || tray.isDestroyed()) return
 
   console.log('Updating tray menu...')
   const status = await getRenewalStatus()
   console.log('Renewal status for tray menu:', status)
   
-  // Use worker data if available and fresh, otherwise fetch from service
-  let block
-  if (lastWorkerBlock && lastWorkerBlock.limit > 0) {
-    // Use consistent data from worker (same as tooltip)
-    block = lastWorkerBlock
-    console.log('Tray menu using worker data with limit:', formatTokens(block.limit))
-  } else {
-    // Fallback to service call
-    const userPlan = await getUserClaudePlan()
-    block = await getCurrentBlockInfo(userPlan)
-    console.log('Tray menu fetching fresh data with limit:', formatTokens(block?.limit || 0))
+  // Get the user's manual plan setting and apply it consistently
+  const userPlan = await getUserClaudePlan()
+  let block = await getCurrentBlockInfo(userPlan)
+  
+  // Apply user's plan override to ensure tray matches dashboard
+  if (block && userPlan && userPlan !== 'auto') {
+    const normalizedPlan = normalizeClaudePlan(userPlan)
+    if (normalizedPlan !== 'auto' && PLAN_LIMITS[normalizedPlan]) {
+      // Override the limit with user's plan setting
+      block = {
+        ...block,
+        limit: PLAN_LIMITS[normalizedPlan]
+      }
+      console.log(`Tray menu: Using manual plan ${userPlan} (${normalizedPlan}) with limit: ${formatTokens(block.limit)}`)
+    } else {
+      console.log('Tray menu: Active block with auto-detected limit:', formatTokens(block.limit))
+    }
   }
   
-  const percent = block && block.limit > 0 ? Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100))) : null
-  const usageLine = percent === null ? 'Usage: unknown' : `Usage: ${percent}% (${formatTokens(block.usage)} / ${formatTokens(block.limit)})`
-  const timeLine = `Time remaining: ${formatMinutes(block?.timeRemaining ?? null)}`
+  // If no active block, show appropriate message
+  if (!block || !block.isActive) {
+    console.log('Tray menu: No active block detected')
+  }
+  
+  const percent = (block && block.isActive && block.limit > 0) 
+    ? Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100))) 
+    : null
+    
+  const usageLine = (block && block.isActive) 
+    ? (percent !== null ? `Usage: ${percent}% (${formatTokens(block.usage)} / ${formatTokens(block.limit)})` : 'Usage: calculating...')
+    : 'No active session'
+    
+  const timeLine = (block && block.isActive) 
+    ? `Time remaining: ${formatMinutes(block.timeRemaining ?? null)}`
+    : 'Time remaining: —'
 
   // Get next session time
   let nextSessionLine = null
@@ -1570,13 +1708,15 @@ ipcMain.handle('set-scheduled-start-time', async (_, isoTime: string | null) => 
   try {
     const result = setScheduledStartTime(isoTime)
     if (result.success) {
-      // Reschedule with new time
+      // Only reschedule if absolutely necessary and no immediate renewal is queued
       const status = await getRenewalStatus()
-      if (status.enabled && status.running) {
-        renewalLogger.info('Scheduled time changed, rescheduling renewal', 'schedule')
+      if (status.enabled && status.running && !status.nextRenewal) {
+        renewalLogger.info('Scheduled time changed and no renewal queued, rescheduling', 'schedule')
         scheduleNextRenewal().catch(error => {
           renewalLogger.error(`Error rescheduling renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
         })
+      } else {
+        renewalLogger.info('Scheduled time changed but renewal already active/queued, not rescheduling', 'schedule')
       }
     }
     return result
@@ -1659,14 +1799,8 @@ ipcMain.handle('perform-renewal-check', async () => {
           try { await updateTrayUsage() } catch (trayError) { console.error(trayError) }
         }
         
-        const status = await getRenewalStatus()
-        if (status.enabled && status.running) {
-          setTimeout(() => {
-            scheduleNextRenewal().catch(err => {
-              renewalLogger.error(`Error scheduling next renewal: ${err instanceof Error ? err.message : String(err)}`, 'schedule')
-            })
-          }, 2000)
-        }
+        // Don't reschedule after manual renewal checks to avoid timer conflicts
+        // The automatic renewal monitoring will handle scheduling properly
       } catch (error) {
         console.error('Error in manual renewal check:', error)
       }

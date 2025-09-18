@@ -383,15 +383,77 @@ export function Dashboard() {
 
         <Card className="glass-card">
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Time Remaining</CardTitle>
-            <Clock className="h-4 w-4 text-muted-foreground" />
+            <CardTitle className="text-sm font-medium">
+              {currentBlock && currentBlock.isActive ? 'Time Remaining' : 'Next Session'}
+            </CardTitle>
+            {currentBlock && currentBlock.isActive ? (
+              <Clock className="h-4 w-4 text-muted-foreground" />
+            ) : (
+              <Calendar className="h-4 w-4 text-muted-foreground" />
+            )}
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">
-              {formatTimeRemaining(status.timeRemaining)}
+              {currentBlock && currentBlock.isActive ? (
+                formatTimeRemaining(status.timeRemaining)
+              ) : status.nextRenewal ? (
+                (() => {
+                  const now = new Date()
+                  const nextRenewal = new Date(status.nextRenewal)
+                  const diffMs = nextRenewal.getTime() - now.getTime()
+                  const diffMinutes = Math.max(0, Math.floor(diffMs / (1000 * 60)))
+                  
+                  if (diffMinutes < 60) {
+                    return diffMinutes <= 1 ? 'Soon' : `${diffMinutes}m`
+                  } else if (diffMinutes < 24 * 60) {
+                    const hours = Math.floor(diffMinutes / 60)
+                    const mins = diffMinutes % 60
+                    return mins === 0 ? `${hours}h` : `${hours}h ${mins}m`
+                  } else {
+                    const isToday = nextRenewal.toDateString() === now.toDateString()
+                    const isTomorrow = nextRenewal.toDateString() === new Date(now.getTime() + 24 * 60 * 60 * 1000).toDateString()
+                    
+                    if (isToday) {
+                      return nextRenewal.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                    } else if (isTomorrow) {
+                      return `Tomorrow`
+                    } else {
+                      return nextRenewal.toLocaleDateString([], { month: 'short', day: 'numeric' })
+                    }
+                  }
+                })()
+              ) : (
+                'Unknown'
+              )}
             </div>
             <p className="text-xs text-muted-foreground">
-              Until next reset
+              {currentBlock && currentBlock.isActive 
+                ? 'Until next reset' 
+                : status.nextRenewal 
+                  ? (() => {
+                      const nextRenewal = new Date(status.nextRenewal)
+                      const now = new Date()
+                      const isToday = nextRenewal.toDateString() === now.toDateString()
+                      const isTomorrow = nextRenewal.toDateString() === new Date(now.getTime() + 24 * 60 * 60 * 1000).toDateString()
+                      
+                      if (isToday) {
+                        return `Today at ${nextRenewal.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+                      } else if (isTomorrow) {
+                        return `Tomorrow at ${nextRenewal.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+                      } else {
+                        return nextRenewal.toLocaleDateString([], { 
+                          weekday: 'short', 
+                          month: 'short', 
+                          day: 'numeric',
+                          hour: '2-digit', 
+                          minute: '2-digit' 
+                        })
+                      }
+                    })()
+                  : status.enabled 
+                    ? 'Auto-renewal will start soon'
+                    : 'Enable auto-renewal to schedule'
+              }
             </p>
           </CardContent>
         </Card>

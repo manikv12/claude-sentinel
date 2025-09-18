@@ -61,7 +61,10 @@ export interface RenewalStatus {
 }
 
 const APP_DATA_DIR = getAppDataDir()
-const PID_FILE = join(APP_DATA_DIR, 'renewal.pid')
+// Use same PID file path as renewal-service.ts to avoid mismatch
+const { app } = require('electron')
+const USER_DATA = app.getPath('userData')
+const PID_FILE = join(USER_DATA, 'renewal.pid')
 const CONFIG_FILE = join(APP_DATA_DIR, 'config.json')
 const LAST_ACTIVITY_FILE = join(APP_DATA_DIR, 'last-activity')
 const START_TIME_FILE = join(APP_DATA_DIR, 'auto-renew-start-time')

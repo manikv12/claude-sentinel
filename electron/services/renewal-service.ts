@@ -418,7 +418,7 @@ export async function getRenewalStatus() {
   let nextRenewal: Date | null = null
   
   // Debug logging for next renewal calculation
-  renewalLogger.debug(`Next renewal calculation: scheduledStartTime=${scheduledStartTime}, block=${block ? `active=${block.isActive}, startTime=${block.startTime}, endTime=${block.endTime}` : 'null'}`, 'renewal')
+  renewalLogger.debug(`Next renewal calculation: enabled=${cfg.enabled}, scheduledStartTime=${scheduledStartTime}, block=${block ? `active=${block.isActive}, startTime=${block.startTime}, endTime=${block.endTime}` : 'null'}`, 'renewal')
   
   if (scheduledStartTime) {
     // If user has scheduled a time, that's the next renewal
@@ -428,6 +428,10 @@ export async function getRenewalStatus() {
     // Next renewal is when current block ends
     nextRenewal = new Date(block.endTime)
     renewalLogger.debug(`Using active block end time: ${nextRenewal.toISOString()}`, 'renewal')
+  } else if (cfg.enabled && (!block || !block.isActive)) {
+    // Auto-renewal is enabled but no active block - should start immediately
+    nextRenewal = new Date(Date.now() + 60000) // 1 minute from now to indicate immediate start
+    renewalLogger.debug(`Auto-renewal enabled with no active block - immediate start: ${nextRenewal.toISOString()}`, 'renewal')
   } else if (block && block.startTime) {
     // Fallback: 5 hours after block start time
     nextRenewal = new Date(new Date(block.startTime).getTime() + 5 * 60 * 60 * 1000)
@@ -525,6 +529,22 @@ export async function performRenewalCheck(): Promise<{ success: boolean; action?
               if (result) {
                 renewalLogger.info(`🎯 ${label}Session started successfully`, 'session')
                 recordSuccessfulRenewal()
+                
+                // Trigger tray and UI updates after successful session start
+                // Small delay to allow new block to be detected
+                setTimeout(async () => {
+                  try {
+                    // Import main process functions to update UI
+                    const { ipcMain } = require('electron')
+                    if (ipcMain) {
+                      // Trigger usage data refresh and tray update
+                      ipcMain.emit('internal-session-started')
+                    }
+                  } catch (updateError) {
+                    renewalLogger.error(`Failed to trigger UI updates after session start: ${updateError}`, 'session')
+                  }
+                }, 3000) // 3 second delay to allow block detection
+                
                 return
               }
 
