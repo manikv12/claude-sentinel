@@ -91,7 +91,7 @@ function readScheduledStart(): string | null {
 interface BlockState {
   isActive: boolean
   startTime: string | null
-  blockId?: string
+  blockId: string | null
   lastLoggedAt?: number  // Add timestamp tracking for rate limiting
 }
 
@@ -122,7 +122,7 @@ function writeBlockState(state: BlockState) {
  * Normalize timestamp to floored hour format for consistent block ID comparison
  * This matches Claude's actual 5-hour block behavior (blocks start at floored hours)
  */
-function normalizeBlockTimestamp(timestamp: string | null): string | null {
+function normalizeBlockTimestamp(timestamp?: string | null): string | null {
   if (!timestamp) return null
   try {
     const date = new Date(timestamp)
@@ -330,10 +330,10 @@ function canPerformRenewal(): { allowed: boolean; reason?: string; hoursRemainin
   return { allowed: true }
 }
 
-// Generate random delay between 1-5 minutes (60-300 seconds)
+// Generate random delay between 1-2 minutes (60-120 seconds)
 function getRandomRenewalDelay(): number {
   const minSeconds = 60   // 1 minute
-  const maxSeconds = 300  // 5 minutes
+  const maxSeconds = 120  // 2 minutes
   const randomDelay = Math.floor(Math.random() * (maxSeconds - minSeconds + 1)) + minSeconds
   renewalLogger.info(`Generated random renewal delay: ${randomDelay}s (${(randomDelay / 60).toFixed(1)} minutes)`, 'renewal')
   return randomDelay
@@ -454,19 +454,16 @@ export async function getRenewalStatus() {
 // Decide renewal using current block info to avoid shelling out
 export async function performRenewalCheck(): Promise<{ success: boolean; action?: string; error?: string }> {
   try {
-    // Check if auto-renewal is enabled first
     const cfg = loadConfig()
     if (!cfg.enabled) {
       return { success: true }
     }
 
-    // Rate limiting check
     if (!canPerformRenewalCheck()) {
       renewalLogger.info('⏱️ Rate limiting: renewal check too frequent, skipping', 'renewal')
       return { success: true }
     }
 
-    // Try to acquire lock to prevent concurrent checks
     if (!acquireLock()) {
       renewalLogger.info('🔒 Another renewal check in progress, skipping', 'renewal')
       return { success: true }
@@ -475,202 +472,119 @@ export async function performRenewalCheck(): Promise<{ success: boolean; action?
     try {
       renewalLogger.info('Starting renewal check...', 'renewal')
       recordRenewalCheck()
-      
-      // Check if enough time has passed since last renewal (4-hour minimum)
+
       const renewalCheck = canPerformRenewal()
       if (!renewalCheck.allowed) {
         renewalLogger.info(`🚫 RENEWAL BLOCKED: ${renewalCheck.reason}`, 'renewal')
         return { success: true, action: `Renewal blocked: ${renewalCheck.hoursRemaining?.toFixed(1)} hours remaining` }
       }
-      
+
       const block = await getCurrentBlockInfoLib()
-      
-      // Detect and log any block state changes during renewal check
       detectAndLogBlockChanges(block)
-      
+
       const scheduledStartTime = readScheduledStart()
       const now = new Date()
 
       renewalLogger.info(`Renewal check state: block=${block ? `${block.isActive ? 'ACTIVE' : 'EXPIRED'} (${block.startTime})` : 'NONE'}, scheduledStartTime=${scheduledStartTime}`, 'renewal')
 
-      let shouldRenew = false
-      let reason = ''
-
-      // SCHEDULE-AWARE RENEWAL LOGIC
-      
-      // 1. Check if user has scheduled a future start time
-      if (scheduledStartTime) {
-        const scheduledTime = new Date(scheduledStartTime)
-        
-        if (scheduledTime > now) {
-          // Scheduled time is in the future - wait until then
-          const hoursUntilScheduled = (scheduledTime.getTime() - now.getTime()) / (1000 * 60 * 60)
-          renewalLogger.info(`⏰ SCHEDULED RENEWAL: Waiting for scheduled time in ${hoursUntilScheduled.toFixed(1)} hours`, 'renewal')
-          return { success: true }
-        } else {
-          // Check if this scheduled renewal was already executed
-          if (wasScheduledRenewalExecuted(scheduledStartTime)) {
-            renewalLogger.info(`⏰ SCHEDULED RENEWAL: Already executed for time ${scheduledStartTime}, clearing schedule`, 'renewal')
-            setScheduledStartTime(null) // Clear the schedule
-            renewalLogger.info(`⏰ SCHEDULED RENEWAL: Proceeding to block-based renewal check`, 'renewal')
-            // Continue with normal block-based renewal logic below
-          } else {
-            // Scheduled time has passed - IMMEDIATELY clear schedule to prevent duplicates
-            renewalLogger.info(`⏰ SCHEDULED TIME REACHED: Processing renewal for ${scheduledStartTime}`, 'renewal')
-
-            // Clear scheduled time IMMEDIATELY to prevent duplicate executions
-            setScheduledStartTime(null)
-            markScheduledRenewalExecuted(scheduledStartTime)
-
-            // Use random delay between 1-5 minutes
-            const delaySeconds = getRandomRenewalDelay()
-
-            // Force renewal regardless of block state when scheduled time is reached
-            shouldRenew = true
-            reason = `Scheduled time has been reached - starting renewal in ${(delaySeconds / 60).toFixed(1)} minutes`
-            renewalLogger.info(`🚀 SCHEDULED SESSION START FORCED: ${reason}`, 'renewal')
-            renewalLogger.info(`⏰ Applying random ${delaySeconds}s (${(delaySeconds / 60).toFixed(1)} min) delay before starting Claude session...`, 'renewal')
-
-            // Start session with random delay (non-blocking) and retry logic
-            setTimeout(async () => {
-              let retryCount = 0
-              const maxRetries = 2
-              let sessionSuccess = false
-
-              while (retryCount <= maxRetries && !sessionSuccess) {
-                try {
-                  if (retryCount > 0) {
-                    renewalLogger.info(`🔄 Scheduled renewal retry attempt ${retryCount}/${maxRetries}`, 'session')
-                    // Add exponential backoff for retries
-                    await new Promise(resolve => setTimeout(resolve, retryCount * 5000))
-                  }
-
-                  renewalLogger.info(`⏳ ${retryCount === 0 ? 'Random delay complete' : 'Retrying scheduled'} - calling startClaudeSession() now`, 'renewal')
-                  renewalLogger.info('📞 CALLING startClaudeSession() NOW (SCHEDULED)', 'session')
-                  const result = await startClaudeSession()
-                  renewalLogger.info(`✅ SCHEDULED SESSION START RESULT: ${result}`, 'session')
-
-                  if (result) {
-                    renewalLogger.info('🎯 NEW CLAUDE SESSION STARTED SUCCESSFULLY (SCHEDULED)', 'session')
-                    recordSuccessfulRenewal() // Record the successful renewal
-                    sessionSuccess = true
-                  } else {
-                    renewalLogger.error(`❌ SCHEDULED SESSION START FAILED (attempt ${retryCount + 1}/${maxRetries + 1})`, 'session')
-                    retryCount++
-                  }
-                } catch (sessionError) {
-                  renewalLogger.error(`💥 Error in scheduled session start attempt ${retryCount + 1}: ${sessionError instanceof Error ? sessionError.message : String(sessionError)}`, 'renewal')
-                  retryCount++
-                }
-              }
-
-              if (!sessionSuccess) {
-                renewalLogger.error(`💥 ALL SCHEDULED SESSION START ATTEMPTS FAILED after ${maxRetries + 1} attempts`, 'session')
-                renewalLogger.warn(`🔧 Scheduled renewal failed, system will rely on block-based renewal`, 'renewal')
-              }
-            }, delaySeconds * 1000) // Convert seconds to milliseconds
-
-            return { success: true, action: reason }
-          }
-        }
-      }
-
-      // 2. Base renewal decision on block state instead of lastActivity
-      if (!block) {
-        // No block data - check if we recently started a session
-        const lastRenewal = getLastSuccessfulRenewal()
-        const now = Math.floor(Date.now() / 1000)
-
-        if (lastRenewal) {
-          const hoursSinceLastRenewal = (now - lastRenewal) / 3600
-          if (hoursSinceLastRenewal < 0.5) { // Less than 30 minutes
-            renewalLogger.info(`⏳ WAITING: No block data but recently started session ${(hoursSinceLastRenewal * 60).toFixed(1)} minutes ago`, 'renewal')
-            shouldRenew = false
-          } else {
-            shouldRenew = true
-            reason = 'No current block detected and sufficient time passed - starting fresh session'
-            renewalLogger.info(`✅ TRIGGER: No block data and last renewal was ${hoursSinceLastRenewal.toFixed(1)} hours ago`, 'renewal')
-          }
-        } else {
-          shouldRenew = true
-          reason = 'No current block detected - starting first session'
-          renewalLogger.info(`✅ TRIGGER: No block data and no previous renewal recorded`, 'renewal')
-        }
-      }
-      else if (!block.isActive) {
-        // Block has expired - check if we should start new session
-        const timeRemainingHours = (block.timeRemaining || 0) / 60
-        if (timeRemainingHours <= 0) {
-          shouldRenew = true
-          reason = 'Current block has expired - starting new session'
-          renewalLogger.info(`✅ TRIGGER: Block expired`, 'renewal')
-        } else {
-          // Block shows as inactive but has time remaining - wait
-          renewalLogger.info(`⏳ WAITING: Block inactive but has ${timeRemainingHours.toFixed(1)} hours remaining`, 'renewal')
-          shouldRenew = false
-        }
-      }
-      else {
-        // Block is still active - wait for it to expire
-        const timeRemainingHours = (block.timeRemaining || 0) / 60
-        renewalLogger.info(`⏳ WAITING: Block still active, ${timeRemainingHours.toFixed(1)} hours remaining`, 'renewal')
-        shouldRenew = false
-      }
-
-      if (shouldRenew) {
-        // Use random delay between 1-5 minutes for all renewals
+      const triggerRenewal = (reason: string, source: 'scheduled' | 'automatic') => {
         const delaySeconds = getRandomRenewalDelay()
+        const delayMinutes = (delaySeconds / 60).toFixed(1)
+        const label = source === 'scheduled' ? 'SCHEDULED ' : ''
 
-        renewalLogger.info(`🚀 SESSION START TRIGGERED: ${reason}`, 'renewal')
-        renewalLogger.info(`⏰ Applying random ${delaySeconds}s (${(delaySeconds / 60).toFixed(1)} min) delay before starting Claude session...`, 'renewal')
+        renewalLogger.info(`🚀 ${label}SESSION START QUEUED: ${reason}`, 'renewal')
+        renewalLogger.info(`⏰ Applying random ${delaySeconds}s (${delayMinutes} min) delay before starting Claude session...`, 'renewal')
 
-        // Start session with random delay (non-blocking) and retry logic
         setTimeout(async () => {
-          let retryCount = 0
-          const maxRetries = 2
-          let sessionSuccess = false
-
-          while (retryCount <= maxRetries && !sessionSuccess) {
+          const maxAttempts = 3
+          for (let attempt = 0; attempt < maxAttempts; attempt++) {
             try {
-              if (retryCount > 0) {
-                renewalLogger.info(`🔄 Retry attempt ${retryCount}/${maxRetries} for Claude session start`, 'session')
-                // Add exponential backoff for retries
-                await new Promise(resolve => setTimeout(resolve, retryCount * 5000))
+              if (attempt > 0) {
+                renewalLogger.info(`🔄 ${label}Retry ${attempt}/${maxAttempts - 1}`, 'session')
+                await new Promise(resolve => setTimeout(resolve, attempt * 5000))
               }
 
-              renewalLogger.info(`⏳ ${retryCount === 0 ? 'Random delay complete' : 'Retrying'} - calling startClaudeSession() now`, 'renewal')
-              renewalLogger.info('📞 CALLING startClaudeSession() NOW', 'session')
+              renewalLogger.info('📞 Calling startClaudeSession()', 'session')
               const result = await startClaudeSession()
-              renewalLogger.info(`✅ SESSION START RESULT: ${result}`, 'session')
-
               if (result) {
-                renewalLogger.info('🎯 NEW CLAUDE SESSION STARTED SUCCESSFULLY', 'session')
-                recordSuccessfulRenewal() // Record the successful renewal
-                sessionSuccess = true
-              } else {
-                renewalLogger.error(`❌ SESSION START FAILED (attempt ${retryCount + 1}/${maxRetries + 1})`, 'session')
-                retryCount++
+                renewalLogger.info(`🎯 ${label}Session started successfully`, 'session')
+                recordSuccessfulRenewal()
+                return
               }
+
+              renewalLogger.error(`❌ ${label}Session start failed (attempt ${attempt + 1})`, 'session')
             } catch (sessionError) {
-              renewalLogger.error(`💥 Error in session start attempt ${retryCount + 1}: ${sessionError instanceof Error ? sessionError.message : String(sessionError)}`, 'renewal')
-              retryCount++
+              renewalLogger.error(`💥 ${label}Error during session start attempt ${attempt + 1}: ${sessionError instanceof Error ? sessionError.message : String(sessionError)}`, 'session')
             }
           }
 
-          if (!sessionSuccess) {
-            renewalLogger.error(`💥 ALL SESSION START ATTEMPTS FAILED after ${maxRetries + 1} attempts`, 'session')
-            renewalLogger.warn(`🔧 Consider checking Claude CLI installation and authentication`, 'session')
+          renewalLogger.error(`💥 ${label}All session start attempts failed`, 'session')
+          if (source === 'scheduled') {
+            renewalLogger.warn('🔧 Scheduled renewal failed; system will rely on block-based renewal', 'renewal')
           }
-        }, delaySeconds * 1000) // Convert seconds to milliseconds
+        }, delaySeconds * 1000)
 
-        return { success: true, action: reason }
-      } else {
-        renewalLogger.info('✋ NO SESSION STARTED - conditions not met', 'renewal')
+        const sourceLabel = source === 'scheduled' ? 'Scheduled renewal queued' : 'Auto renewal queued'
+        return { success: true, action: `${sourceLabel}: ${reason}` }
       }
-      
+
+      if (scheduledStartTime) {
+        const scheduledTime = new Date(scheduledStartTime)
+        if (scheduledTime > now) {
+          const hoursUntilScheduled = (scheduledTime.getTime() - now.getTime()) / (1000 * 60 * 60)
+          renewalLogger.info(`⏰ SCHEDULED RENEWAL: Waiting for scheduled time in ${hoursUntilScheduled.toFixed(1)} hours`, 'renewal')
+          return { success: true }
+        }
+
+        if (!wasScheduledRenewalExecuted(scheduledStartTime)) {
+          renewalLogger.info(`⏰ Scheduled time reached for ${scheduledStartTime}`, 'schedule')
+          setScheduledStartTime(null)
+          markScheduledRenewalExecuted(scheduledStartTime)
+          return triggerRenewal('Scheduled time reached', 'scheduled')
+        }
+
+        renewalLogger.info(`⏰ Scheduled renewal already executed for ${scheduledStartTime}, clearing schedule`, 'schedule')
+        setScheduledStartTime(null)
+      }
+
+      let renewalReason: string | null = null
+
+      if (!block) {
+        const lastRenewal = getLastSuccessfulRenewal()
+        const nowSeconds = Math.floor(Date.now() / 1000)
+
+        if (!lastRenewal) {
+          renewalReason = 'No current block detected - starting first session'
+          renewalLogger.info('✅ TRIGGER: No block data and no previous renewal recorded', 'renewal')
+        } else {
+          const hoursSinceLastRenewal = (nowSeconds - lastRenewal) / 3600
+          if (hoursSinceLastRenewal < 0.5) {
+            renewalLogger.info(`⏳ WAITING: No block data but session started ${(hoursSinceLastRenewal * 60).toFixed(1)} minutes ago`, 'renewal')
+          } else {
+            renewalReason = `No block data for ${hoursSinceLastRenewal.toFixed(1)} hours`
+            renewalLogger.info(`✅ TRIGGER: ${renewalReason}`, 'renewal')
+          }
+        }
+      } else if (!block.isActive) {
+        const timeRemainingHours = (block.timeRemaining || 0) / 60
+        if (timeRemainingHours <= 0) {
+          renewalReason = 'Current block has expired'
+          renewalLogger.info('✅ TRIGGER: Block expired', 'renewal')
+        } else {
+          renewalLogger.info(`⏳ WAITING: Block inactive but has ${timeRemainingHours.toFixed(1)} hours remaining`, 'renewal')
+        }
+      } else {
+        const timeRemainingHours = (block.timeRemaining || 0) / 60
+        renewalLogger.info(`⏳ WAITING: Block still active, ${timeRemainingHours.toFixed(1)} hours remaining`, 'renewal')
+      }
+
+      if (renewalReason) {
+        return triggerRenewal(renewalReason, 'automatic')
+      }
+
+      renewalLogger.info('✋ NO SESSION STARTED - conditions not met', 'renewal')
       return { success: true }
     } finally {
-      // Always release the lock
       releaseLock()
     }
   } catch (error) {

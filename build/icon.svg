@@ -80,56 +80,31 @@
         </linearGradient>
     </defs>
 
-    <g transform="translate(256 256) scale(0.84) translate(-256 -256)">
-        <rect width="512" height="512" rx="120" fill="url(#bgGradient)" />
-        <rect width="512" height="512" rx="120" fill="url(#bgGlow)" />
+    <!-- Large icon filling most of the canvas -->
+    <g filter="url(#pulseGlow)">
+        <!-- Central AI cube with gradient - much larger -->
+        <rect x="64" y="64" width="384" height="384" rx="80"
+            fill="url(#outlineGradient)" opacity="0.9" />
 
-        <!-- Professional gradient border with enhanced styling -->
-        <rect x="6" y="6" width="500" height="500" rx="114" fill="none"
-            stroke="url(#outlineGradientSmooth)"
-            stroke-width="4"
-            opacity="0.9" />
+        <!-- Inner processing core -->
+        <rect x="96" y="96" width="320" height="320" rx="64"
+            fill="url(#bgGradient)" stroke="url(#outlineGradientSmooth)" stroke-width="8" />
 
-        <!-- Secondary inner border for depth -->
-        <rect x="10" y="10" width="492" height="492" rx="110" fill="none"
-            stroke="url(#outlineGradient)"
-            stroke-width="2"
-            opacity="0.6" />
+        <!-- Code block elements - large and visible -->
+        <g fill="#ffffff" opacity="0.9">
+            <!-- Row 1 -->
+            <rect x="160" y="160" width="32" height="32" rx="8" />
+            <rect x="240" y="160" width="32" height="32" rx="8" />
+            <rect x="320" y="160" width="32" height="32" rx="8" />
 
-        <!-- Block Code AI Logo Design -->
-        <g filter="url(#pulseGlow)">
-            <!-- Central AI cube with gradient -->
-            <rect x="220" y="220" width="72" height="72" rx="12"
-                fill="url(#outlineGradient)" opacity="0.9" />
+            <!-- Row 2 (middle row with gaps) -->
+            <rect x="160" y="240" width="32" height="32" rx="8" />
+            <rect x="320" y="240" width="32" height="32" rx="8" />
 
-            <!-- Inner processing core -->
-            <rect x="235" y="235" width="42" height="42" rx="8"
-                fill="url(#bgGradient)" stroke="url(#outlineGradientSmooth)" stroke-width="2" />
-
-            <!-- Code block elements - minimalist design -->
-            <g fill="#ffffff" opacity="0.8">
-                <!-- Binary/code pattern inside -->
-                <rect x="245" y="245" width="4" height="4" rx="1" />
-                <rect x="253" y="245" width="4" height="4" rx="1" />
-                <rect x="261" y="245" width="4" height="4" rx="1" />
-
-                <rect x="245" y="256" width="4" height="4" rx="1" />
-                <rect x="261" y="256" width="4" height="4" rx="1" />
-
-                <rect x="245" y="267" width="4" height="4" rx="1" />
-                <rect x="253" y="267" width="4" height="4" rx="1" />
-                <rect x="261" y="267" width="4" height="4" rx="1" />
-            </g>
-
-            <!-- Floating data blocks around the core -->
-            <rect x="180" y="180" width="20" height="20" rx="4"
-                fill="url(#outlineGradientSmooth)" opacity="0.6" />
-            <rect x="312" y="180" width="20" height="20" rx="4"
-                fill="url(#outlineGradientSmooth)" opacity="0.6" />
-            <rect x="180" y="312" width="20" height="20" rx="4"
-                fill="url(#outlineGradientSmooth)" opacity="0.6" />
-            <rect x="312" y="312" width="20" height="20" rx="4"
-                fill="url(#outlineGradientSmooth)" opacity="0.6" />
+            <!-- Row 3 -->
+            <rect x="160" y="320" width="32" height="32" rx="8" />
+            <rect x="240" y="320" width="32" height="32" rx="8" />
+            <rect x="320" y="320" width="32" height="32" rx="8" />
         </g>
     </g>
 </svg>

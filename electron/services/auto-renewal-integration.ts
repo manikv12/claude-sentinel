@@ -15,6 +15,18 @@ const { existsSync, readFileSync, writeFileSync, unlinkSync, appendFileSync, mkd
 const { spawn, spawnSync } = childProcess
 const { join } = path
 const { homedir } = os
+// Track any spawned child PIDs so we can ensure cleanup on app quit
+const RENEWAL_CHILD_PIDS: Set<number> = new Set()
+
+export function killAllRenewalChildren(): void {
+  try {
+    for (const pid of Array.from(RENEWAL_CHILD_PIDS)) {
+      try { process.kill(pid, 'SIGTERM') } catch {}
+      RENEWAL_CHILD_PIDS.delete(pid)
+    }
+  } catch {}
+}
+
 
 // Get app data directory - prefer Electron app.getPath if available, fallback to home
 function getAppDataDir(): string {
@@ -158,6 +170,9 @@ export function startClaudeSession(): Promise<boolean> {
     }
     
     log(`Child process spawned with PID: ${child.pid}`, 'info', 'session')
+    if (typeof child.pid === 'number') {
+      RENEWAL_CHILD_PIDS.add(child.pid)
+    }
     
     let completed = false
     let stdoutData = ''
@@ -220,6 +235,11 @@ export function startClaudeSession(): Promise<boolean> {
       } else {
         log(`❌ Claude session failed with exit code ${code}`, 'error', 'session')
         log(`Failed session stderr: "${stderrData.trim()}"`, 'error', 'session')
+      }
+
+      // Remove from tracking set
+      if (typeof child.pid === 'number') {
+        RENEWAL_CHILD_PIDS.delete(child.pid)
       }
     })
     

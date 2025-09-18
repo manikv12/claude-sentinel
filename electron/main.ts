@@ -30,10 +30,15 @@ let isTrayMenuOpen = false
 let trayUsageInterval: NodeJS.Timeout | null = null
 // Background worker for usage refresh to keep main thread responsive
 let usageWorker: Worker | null = null
+let usageWorkerReady = false
 let workerBusy = false
 let pendingRefresh = false
 // Resolve Promises waiting for the next worker result
 let workerResolvers: Array<(payload: any) => void> = []
+let lastWorkerBlock: any = null
+let pendingMenuRefreshFromClick = false
+
+type RenewalStatusResult = ReturnType<typeof getRenewalStatus> extends Promise<infer T> ? T : ReturnType<typeof getRenewalStatus>
 
 const initUsageWorker = () => {
   if (usageWorker) return
@@ -76,6 +81,7 @@ const initUsageWorker = () => {
     usageWorker = new Worker(workerScript, workerOptions)
     usageWorker.on('message', (msg: any) => {
       workerBusy = false
+      usageWorkerReady = true
       if (msg?.ok && msg.data) {
         const data = msg.data
         if (mainWindow && !mainWindow.isDestroyed()) {
@@ -84,7 +90,13 @@ const initUsageWorker = () => {
         if (floatingWindow && !floatingWindow.isDestroyed()) {
           floatingWindow.webContents.send('usage-update', data)
         }
+        lastWorkerBlock = data.currentBlock
         updateTrayUsage(data.currentBlock)
+        if (pendingMenuRefreshFromClick) {
+          pendingMenuRefreshFromClick = false
+          // Refresh tray menu with the freshest data immediately on click
+          Promise.resolve().then(() => updateTrayMenu()).catch((e) => console.error(e))
+        }
       }
       // Resolve any pending Promises waiting for this result
       if (workerResolvers.length > 0) {
@@ -99,11 +111,13 @@ const initUsageWorker = () => {
     })
     usageWorker.on('error', (err) => {
       workerBusy = false
+      usageWorkerReady = false
       console.error('Usage worker error:', err)
     })
     usageWorker.on('exit', (code) => {
       workerBusy = false
       usageWorker = null
+      usageWorkerReady = false
       if (code !== 0) console.warn('Usage worker exited unexpectedly')
     })
   } catch (e) {
@@ -435,10 +449,9 @@ const updateTrayUsage = async (blockData?: any) => {
     block = blockData
     percent = block && block.limit > 0 ? Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100))) : null
   } else {
-    // Fallback to direct fetch (for periodic updates)
-    const result = await getUsagePercent()
-    percent = result.percent
-    block = result.block
+    // Use last worker-provided data to keep tray consistent with dashboard/floating
+    block = lastWorkerBlock
+    percent = block && block.limit > 0 ? Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100))) : null
   }
 
   // Use battery icon to show REMAINING tokens (100 - used percentage)
@@ -477,16 +490,14 @@ const updateTrayUsage = async (blockData?: any) => {
   
   // Get next renewal time from the renewal service
   let renewalInfo = ''
+  let renewalStatus: RenewalStatusResult | null = null
   try {
-    const renewalStatus = getRenewalStatus()
+    renewalStatus = await getRenewalStatus()
     if (renewalStatus.enabled) {
       renewalInfo = '\nAuto-renewal: ON'
 
-      // Use the actual next renewal time from the service
       if (renewalStatus.nextRenewal) {
         const nextRenewalTime = new Date(renewalStatus.nextRenewal)
-
-        // Format the time in a readable way
         const timeOptions: Intl.DateTimeFormatOptions = {
           hour: '2-digit',
           minute: '2-digit',
@@ -500,7 +511,7 @@ const updateTrayUsage = async (blockData?: any) => {
 
         const now = new Date()
         const isToday = nextRenewalTime.toDateString() === now.toDateString()
-        const isTomorrow = nextRenewalTime.toDateString() === new Date(now.getTime() + 24*60*60*1000).toDateString()
+        const isTomorrow = nextRenewalTime.toDateString() === new Date(now.getTime() + 24 * 60 * 60 * 1000).toDateString()
 
         let timeStr
         if (isToday) {
@@ -513,7 +524,6 @@ const updateTrayUsage = async (blockData?: any) => {
 
         renewalInfo += `\nNext session: ${timeStr}`
       } else if (renewalStatus.timeRemaining) {
-        // If no specific next renewal time, show time remaining in current block
         renewalInfo += `\nTime remaining: ${renewalStatus.timeRemaining}`
       } else {
         renewalInfo += '\nNext session: TBD'
@@ -553,8 +563,7 @@ const updateTrayUsage = async (blockData?: any) => {
   }
 
   // Add renewal status info
-  try {
-    const renewalStatus = getRenewalStatus()
+  if (renewalStatus) {
     if (renewalStatus.enabled) {
       tooltipLines.push('')
       tooltipLines.push('Auto-renewal: ON')
@@ -563,7 +572,7 @@ const updateTrayUsage = async (blockData?: any) => {
         const nextRenewalTime = new Date(renewalStatus.nextRenewal)
         const now = new Date()
         const isToday = nextRenewalTime.toDateString() === now.toDateString()
-        const isTomorrow = nextRenewalTime.toDateString() === new Date(now.getTime() + 24*60*60*1000).toDateString()
+        const isTomorrow = nextRenewalTime.toDateString() === new Date(now.getTime() + 24 * 60 * 60 * 1000).toDateString()
 
         const timeOptions: Intl.DateTimeFormatOptions = {
           hour: '2-digit',
@@ -595,7 +604,7 @@ const updateTrayUsage = async (blockData?: any) => {
       tooltipLines.push('')
       tooltipLines.push('Auto-renewal: OFF')
     }
-  } catch (configError) {
+  } else {
     tooltipLines.push('')
     tooltipLines.push('Auto-renewal: Status unknown')
   }
@@ -606,16 +615,22 @@ const updateTrayUsage = async (blockData?: any) => {
   // Refresh tray context menu to reflect latest usage
   // Avoid rebuilding the menu while it is open to prevent UI freeze
   if (!isTrayMenuOpen) {
-    try { updateTrayMenu().catch(console.error) } catch {}
+    try {
+      await updateTrayMenu()
+    } catch (menuError) {
+      console.error(menuError)
+    }
   }
 }
 
 const startTrayUsageUpdates = () => {
-  // Immediately update once tray exists
-  updateTrayUsage()
-  // Refresh every minute
+  // Kick off a worker refresh so tray receives consistent data
+  scheduleBackgroundRefresh().catch(() => {})
+  // Refresh via worker every minute
   if (trayUsageInterval) { clearInterval(trayUsageInterval); trayUsageInterval = null }
-  trayUsageInterval = setInterval(updateTrayUsage, 60 * 1000)
+  trayUsageInterval = setInterval(() => {
+    scheduleBackgroundRefresh().catch(() => {})
+  }, 60 * 1000)
 }
 
 const createWindow = () => {
@@ -656,7 +671,7 @@ const createWindow = () => {
   }
 
   // Open DevTools for debugging
-  if (isDev) {
+  if (isDev && mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.openDevTools()
   }
 
@@ -664,7 +679,9 @@ const createWindow = () => {
   mainWindow.webContents.on('before-input-event', (event, input) => {
     if (input.key === 'F12' ||
         (input.key === 'i' && input.meta && input.alt)) {
-      mainWindow.webContents.toggleDevTools()
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.toggleDevTools()
+      }
     }
   })
 
@@ -911,12 +928,22 @@ const createTray = () => {
   tray.on('click', () => {
     // Defer just a bit, but always refresh in background (hard) when clicked
     setTimeout(() => {
-      scheduleBackgroundRefresh(true)
+      try {
+        pendingMenuRefreshFromClick = true
+        scheduleBackgroundRefresh(true)
+      } catch {}
     }, 300)
   })
 
-  // Start periodic usage updates for tray title/tooltip
-  startTrayUsageUpdates()
+  // Start periodic usage updates for tray title/tooltip only after worker is ready
+  const startWhenReady = () => {
+    if (usageWorkerReady) {
+      startTrayUsageUpdates()
+    } else {
+      setTimeout(startWhenReady, 250)
+    }
+  }
+  startWhenReady()
 }
 
 // App event handlers
@@ -929,10 +956,6 @@ app.whenReady().then(async () => {
     createTray()
   })
   
-  // Defer worker initialization until after window is shown
-  setTimeout(() => {
-    initUsageWorker()
-  }, 100)
   
   // Defer dock icon setup (macOS)
   if (process.platform === 'darwin' && app.dock) {
@@ -993,6 +1016,13 @@ app.on('before-quit', () => {
     clearInterval(trayUsageInterval)
     trayUsageInterval = null
   }
+
+  // Stop renewal timers and kill any renewal child processes
+  try { stopRenewalMonitoring() } catch {}
+  try {
+    const { killAllRenewalChildren } = require('./services/renewal-service')
+    if (killAllRenewalChildren) killAllRenewalChildren()
+  } catch {}
 })
 
 
@@ -1019,7 +1049,7 @@ const addGracePeriod = (targetTime: Date) => {
 }
 
 // Smart timer-based renewal scheduling
-const scheduleNextRenewal = () => {
+const scheduleNextRenewal = async (): Promise<void> => {
   // Clear block-based renewal timer
   if (renewalTimer) {
     clearTimeout(renewalTimer)
@@ -1028,13 +1058,33 @@ const scheduleNextRenewal = () => {
 
   // Only clear scheduled timer if we're about to set a new one
   // This preserves running scheduled timers when just doing block-based scheduling
-  const status = getRenewalStatus()
+  let status: RenewalStatusResult
+  try {
+    status = await getRenewalStatus()
+  } catch (error) {
+    renewalLogger.error(`Failed to load renewal status for scheduling: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+    setTimeout(() => {
+      scheduleNextRenewal().catch(err => {
+        renewalLogger.error(`Error scheduling next renewal: ${err instanceof Error ? err.message : String(err)}`, 'schedule')
+      })
+    }, 60000)
+    return
+  }
+
   const hasScheduledTime = !!status.scheduledStartTime
 
   if (hasScheduledTime && scheduledRenewalTimer) {
     // There's already a scheduled timer running - clear it to set new one
     clearTimeout(scheduledRenewalTimer)
     scheduledRenewalTimer = null
+  }
+
+  const reschedule = (delay: number) => {
+    setTimeout(() => {
+      scheduleNextRenewal().catch(err => {
+        renewalLogger.error(`Error scheduling next renewal: ${err instanceof Error ? err.message : String(err)}`, 'schedule')
+      })
+    }, delay)
   }
 
   try {
@@ -1044,35 +1094,56 @@ const scheduleNextRenewal = () => {
     if (status.scheduledStartTime) {
       const scheduledTime = new Date(status.scheduledStartTime)
 
-      if (scheduledTime > now) {
-        // Add 1-2 minute random delay to scheduled renewals
-        const baseDelay = scheduledTime.getTime() - now.getTime()
-        const randomDelayMs = (60 + Math.random() * 60) * 1000 // 1-2 minutes in milliseconds
-        const totalDelay = baseDelay + randomDelayMs
-        const actualTriggerTime = new Date(now.getTime() + totalDelay)
-
-        renewalLogger.info(`🕐 SCHEDULED RENEWAL SET: Will trigger at ${actualTriggerTime.toISOString()} (scheduled for ${scheduledTime.toISOString()} + ${(randomDelayMs / 60000).toFixed(1)} min delay)`, 'schedule')
-
-        scheduledRenewalTimer = setTimeout(() => {
+      const runScheduledRenewalImmediately = (type: 'late' | 'overdue') => {
+        setTimeout(async () => {
           try {
-            renewalLogger.info(`🚀 EXECUTING SCHEDULED RENEWAL at ${new Date().toISOString()}`, 'schedule')
-            const result = performRenewalCheck()
+            const actionLabel = type === 'overdue'
+              ? '🚀 EXECUTING OVERDUE SCHEDULED RENEWAL'
+              : '🚀 EXECUTING LATE SCHEDULED RENEWAL'
+            renewalLogger.info(actionLabel, 'schedule')
+            const result = await performRenewalCheck()
 
-            // Send status updates
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
+              mainWindow.webContents.send('renewal-status-update', await getRenewalStatus())
             }
             if (result.success && result.action && tray) {
-              updateTrayMenu().catch(console.error)
-              updateTrayUsage()
+              try { await updateTrayMenu() } catch (trayError) { console.error(trayError) }
+              try { await updateTrayUsage() } catch (trayError) { console.error(trayError) }
             }
 
-            // Schedule next renewal after scheduled execution
-            setTimeout(() => scheduleNextRenewal(), 2000)
+            reschedule(2000)
+          } catch (error) {
+            const errorLabel = type === 'overdue'
+              ? '❌ Error in overdue scheduled renewal'
+              : '❌ Error in late scheduled renewal'
+            renewalLogger.error(`${errorLabel}: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+          }
+        }, 1000)
+      }
+
+      if (scheduledTime > now) {
+        const totalDelay = scheduledTime.getTime() - now.getTime()
+        const actualTriggerTime = new Date(now.getTime() + totalDelay)
+
+        renewalLogger.info(`🕐 SCHEDULED RENEWAL SET: Will trigger at ${actualTriggerTime.toISOString()} (exact scheduled time ${scheduledTime.toISOString()})`, 'schedule')
+
+        scheduledRenewalTimer = setTimeout(async () => {
+          try {
+            renewalLogger.info(`🚀 EXECUTING SCHEDULED RENEWAL at ${new Date().toISOString()}`, 'schedule')
+            const result = await performRenewalCheck()
+
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('renewal-status-update', await getRenewalStatus())
+            }
+            if (result.success && result.action && tray) {
+              try { await updateTrayMenu() } catch (trayError) { console.error(trayError) }
+              try { await updateTrayUsage() } catch (trayError) { console.error(trayError) }
+            }
+
+            reschedule(2000)
           } catch (error) {
             renewalLogger.error(`❌ Error in scheduled renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
-            // Retry in 1 minute
-            setTimeout(() => scheduleNextRenewal(), 60000)
+            reschedule(60000)
           }
         }, totalDelay)
 
@@ -1084,31 +1155,15 @@ const scheduleNextRenewal = () => {
 
         if (timeSinceScheduled <= fiveMinutesInMs) {
           renewalLogger.info(`⚡ Scheduled time recently passed (${Math.round(timeSinceScheduled / 1000)}s ago), triggering immediate renewal`, 'schedule')
-
-          // Trigger immediate renewal
-          setTimeout(() => {
-            try {
-              renewalLogger.info('🚀 EXECUTING LATE SCHEDULED RENEWAL', 'schedule')
-              const result = performRenewalCheck()
-
-              // Send status updates
-              if (mainWindow && !mainWindow.isDestroyed()) {
-                mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
-              }
-              if (result.success && result.action && tray) {
-                updateTrayMenu()
-                updateTrayUsage()
-              }
-
-              // Schedule next renewal after immediate execution
-              setTimeout(() => scheduleNextRenewal(), 2000)
-            } catch (error) {
-              renewalLogger.error(`❌ Error in late scheduled renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
-            }
-          }, 1000) // Small delay to ensure proper execution
-
+          runScheduledRenewalImmediately('late')
           return // Exit early after scheduling immediate renewal
         }
+
+        // If we miss by more than 5 minutes, fall back to an immediate catch-up renewal
+        const minutesLate = (timeSinceScheduled / 60000).toFixed(1)
+        renewalLogger.warn(`⚠️ Scheduled renewal missed by ${minutesLate} minutes, running immediately`, 'schedule')
+        runScheduledRenewalImmediately('overdue')
+        return
       }
     }
 
@@ -1139,54 +1194,50 @@ const scheduleNextRenewal = () => {
     }
 
     if (targetTime && targetTime > now) {
-      const { renewalTime, gracePeriodSeconds } = addGracePeriod(targetTime)
-      const delay = renewalTime.getTime() - now.getTime()
+      const delay = targetTime.getTime() - now.getTime()
 
       if (delay > 0) {
-        renewalTimer = setTimeout(() => {
+        renewalTimer = setTimeout(async () => {
           try {
             renewalLogger.info(`Executing scheduled renewal (${reason})`, 'renewal')
-            const result = performRenewalCheck()
+            const result = await performRenewalCheck()
             
-            // Send status updates
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
+              mainWindow.webContents.send('renewal-status-update', await getRenewalStatus())
             }
             if (result.success && result.action && tray) {
-              updateTrayMenu().catch(console.error)
-              updateTrayUsage()
+              try { await updateTrayMenu() } catch (trayError) { console.error(trayError) }
+              try { await updateTrayUsage() } catch (trayError) { console.error(trayError) }
             }
 
-            // Schedule next renewal
-            setTimeout(() => scheduleNextRenewal(), 2000) // Brief delay before rescheduling
+            reschedule(2000)
           } catch (error) {
             renewalLogger.error(`Error in scheduled renewal: ${error instanceof Error ? error.message : String(error)}`, 'renewal')
-            // Retry scheduling in 1 minute
-            renewalTimer = setTimeout(() => scheduleNextRenewal(), 60000)
+            reschedule(60000)
           }
         }, delay)
 
-        renewalLogger.info(`Next ${reason} at ${targetTime.toISOString()}, renewal scheduled for ${renewalTime.toISOString()} (${gracePeriodSeconds}s grace period)`, 'schedule')
+        renewalLogger.info(`Next ${reason} at ${targetTime.toISOString()}, renewal scheduled exactly at target time`, 'schedule')
       } else {
         renewalLogger.warn(`Target time ${targetTime.toISOString()} is in the past, checking immediately`, 'schedule')
         // Schedule immediate check
-        renewalTimer = setTimeout(() => {
-          performRenewalCheck()
-          scheduleNextRenewal()
+        renewalTimer = setTimeout(async () => {
+          await performRenewalCheck()
+          await scheduleNextRenewal()
         }, 1000)
       }
     } else {
       // No valid target time - only use emergency fallback if system is in unknown state
-      const currentStatus = getRenewalStatus()
+      const currentStatus = await getRenewalStatus()
       if (!currentStatus.currentBlock && currentStatus.enabled && currentStatus.running) {
         renewalLogger.warn(`No current block detected and no renewal time available, using emergency fallback check in ${RENEWAL_CONFIG.fallbackCheckInterval / 60000} minutes`, 'schedule')
-        renewalTimer = setTimeout(() => {
+        renewalTimer = setTimeout(async () => {
           try {
-            performRenewalCheck()
+            await performRenewalCheck()
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
+              mainWindow.webContents.send('renewal-status-update', await getRenewalStatus())
             }
-            scheduleNextRenewal() // Reschedule once to see if we now have valid timing
+            await scheduleNextRenewal() // Reschedule once to see if we now have valid timing
           } catch (error) {
             renewalLogger.error(`Error in emergency fallback renewal check: ${error instanceof Error ? error.message : String(error)}`, 'renewal')
           }
@@ -1199,7 +1250,7 @@ const scheduleNextRenewal = () => {
   } catch (error) {
     renewalLogger.error(`Error scheduling next renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
     // Retry in 1 minute
-    renewalTimer = setTimeout(() => scheduleNextRenewal(), 60000)
+    reschedule(60000)
   }
 }
 
@@ -1211,7 +1262,9 @@ const startRenewalMonitoring = () => {
   }
 
   renewalLogger.info('Starting timer-based renewal monitoring', 'service')
-  scheduleNextRenewal()
+  scheduleNextRenewal().catch(error => {
+    renewalLogger.error(`Error starting renewal monitoring: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+  })
 }
 
 const stopRenewalMonitoring = () => {
@@ -1357,14 +1410,21 @@ const updateTrayMenu = async () => {
           
           // Notify renderer
           if (mainWindow && !mainWindow.isDestroyed()) {
-            getRenewalStatus().then(status => {
-              console.log('Sending renewal status update to renderer:', status)
-              mainWindow.webContents.send('renewal-status-update', status)
-            }).catch(console.error)
+            try {
+              const latestStatus = await getRenewalStatus()
+              console.log('Sending renewal status update to renderer:', latestStatus)
+              mainWindow.webContents.send('renewal-status-update', latestStatus)
+            } catch (statusError) {
+              console.error(statusError)
+            }
           }
           
           // Update tray menu
-          updateTrayMenu().catch(console.error)
+          try {
+            await updateTrayMenu()
+          } catch (menuError) {
+            console.error(menuError)
+          }
         } catch (error) {
           console.error('Error toggling auto-renewal from tray:', error)
         }
@@ -1429,7 +1489,7 @@ ipcMain.handle('get-usage-data', async () => {
 
 ipcMain.handle('get-renewal-status', async () => {
   try {
-    return getRenewalStatus()
+    return await getRenewalStatus()
   } catch (error) {
     console.error('Error getting renewal status:', error)
     return { 
@@ -1454,16 +1514,15 @@ ipcMain.handle('toggle-auto-renewal', async (_, enabled: boolean, scheduledTime?
         // When auto-renewal is first turned on, perform immediate check with random delay
         // This ensures we start a session if needed without waiting for the next scheduled check
         renewalLogger.info('🚀 AUTO-RENEWAL ENABLED: Performing immediate renewal check with delay', 'service')
-        setTimeout(() => {
+        setTimeout(async () => {
           try {
-            const renewalResult = performRenewalCheck()
+            const renewalResult = await performRenewalCheck()
             if (renewalResult.success && renewalResult.action) {
               renewalLogger.info(`✅ Initial renewal check completed: ${renewalResult.action}`, 'service')
             }
             
-            // Update status after initial check
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
+              mainWindow.webContents.send('renewal-status-update', await getRenewalStatus())
             }
           } catch (error) {
             renewalLogger.error(`❌ Error in initial renewal check: ${error instanceof Error ? error.message : String(error)}`, 'service')
@@ -1478,7 +1537,11 @@ ipcMain.handle('toggle-auto-renewal', async (_, enabled: boolean, scheduledTime?
     }
     
     // Update tray menu
-    updateTrayMenu().catch(console.error)
+    try {
+      await updateTrayMenu()
+    } catch (menuError) {
+      console.error(menuError)
+    }
     
     return { success: result.success, enabled, error: result.error }
   } catch (error) {
@@ -1496,10 +1559,12 @@ ipcMain.handle('set-scheduled-start-time', async (_, isoTime: string | null) => 
     const result = setScheduledStartTime(isoTime)
     if (result.success) {
       // Reschedule with new time
-      const status = getRenewalStatus()
+      const status = await getRenewalStatus()
       if (status.enabled && status.running) {
         renewalLogger.info('Scheduled time changed, rescheduling renewal', 'schedule')
-        scheduleNextRenewal()
+        scheduleNextRenewal().catch(error => {
+          renewalLogger.error(`Error rescheduling renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+        })
       }
     }
     return result
@@ -1569,25 +1634,26 @@ ipcMain.handle('hard-refresh-usage-data', async () => {
 ipcMain.handle('perform-renewal-check', async () => {
   try {
     // Return immediately to avoid blocking the UI
-    setImmediate(() => {
+    setImmediate(async () => {
       try {
-        const result = performRenewalCheck()
+        const result = await performRenewalCheck()
         
-        // Send status update to renderer after check completes
         if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
+          mainWindow.webContents.send('renewal-status-update', await getRenewalStatus())
         }
         
-        // Update tray menu if needed
         if (result.success && result.action && tray) {
-          updateTrayMenu()
-          updateTrayUsage()
+          try { await updateTrayMenu() } catch (trayError) { console.error(trayError) }
+          try { await updateTrayUsage() } catch (trayError) { console.error(trayError) }
         }
         
-        // Reschedule next renewal after manual check (in case block state changed)
-        const status = getRenewalStatus()
+        const status = await getRenewalStatus()
         if (status.enabled && status.running) {
-          setTimeout(() => scheduleNextRenewal(), 2000)
+          setTimeout(() => {
+            scheduleNextRenewal().catch(err => {
+              renewalLogger.error(`Error scheduling next renewal: ${err instanceof Error ? err.message : String(err)}`, 'schedule')
+            })
+          }, 2000)
         }
       } catch (error) {
         console.error('Error in manual renewal check:', error)
@@ -2000,9 +2066,9 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
           .filter((name: string) => name.startsWith('-Users-'))
           .map((name: string) => {
             const match = name.match(/^(-Users-[^-]+-)/)
-            return match ? match[1] : null
+            return (match ? match[1] : null) as string | null
           })
-          .filter((pattern): pattern is string => Boolean(pattern))
+          .filter((pattern: string | null): pattern is string => Boolean(pattern))
         
         if (userPatterns.length > 0) {
           const currentPattern = userPatterns[0]
