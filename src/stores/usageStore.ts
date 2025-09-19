@@ -61,6 +61,7 @@ interface UsageStore {
   loadDataInBackground: () => void
   loadCachedData: () => Promise<void>
   refreshData: () => Promise<void>
+  loadDataForDays: (days: number) => Promise<void>
 }
 
 export const useUsageStore = create<UsageStore>((set, get) => ({
@@ -220,6 +221,34 @@ export const useUsageStore = create<UsageStore>((set, get) => ({
       set({ error: error instanceof Error ? error.message : 'Failed to load usage data' })
     } finally {
       set({ isLoading: false })
+    }
+  },
+
+  loadDataForDays: async (days: number) => {
+    const { setComponentLoading, setUsageData, setError } = get()
+    
+    setComponentLoading('chart', true)
+    
+    try {
+      if (!window.electronAPI?.getUsageDataRange) {
+        console.warn('Running in development mode - Electron API not available')
+        setComponentLoading('chart', false)
+        return
+      }
+
+      console.log(`🔄 Loading ${days} days of usage data...`)
+      
+      const data = await Promise.race([
+        window.electronAPI.getUsageDataRange(days),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Request timeout')), 15000))
+      ])
+
+      setUsageData(data)
+      console.log(`✅ Successfully loaded ${days} days of usage data`)
+    } catch (error) {
+      console.error(`❌ Failed to load ${days} days of data:`, error)
+      setError(error instanceof Error ? error.message : 'Failed to load usage data')
+      setComponentLoading('chart', false)
     }
   }
 }))

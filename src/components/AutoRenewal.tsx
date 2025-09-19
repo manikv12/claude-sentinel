@@ -172,9 +172,15 @@ export function AutoRenewal() {
   useEffect(() => {
     if (!settings.autoRefresh) return
 
+    // Use minimum 120s interval to reduce CPU usage and add visibility check
+    const effectiveInterval = Math.max(settings.autoRefreshInterval, 120)
+    
     const interval = setInterval(() => {
-      refreshStatus()
-    }, settings.autoRefreshInterval * 1000)
+      // Only refresh if document is visible
+      if (!document.hidden) {
+        refreshStatus()
+      }
+    }, effectiveInterval * 1000)
 
     return () => clearInterval(interval)
   }, [settings.autoRefresh, settings.autoRefreshInterval, refreshStatus])

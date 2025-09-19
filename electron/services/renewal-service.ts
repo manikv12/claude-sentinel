@@ -426,6 +426,7 @@ export async function getRenewalStatus() {
     nextRenewal = new Date(block.endTime)
   } else if (cfg.enabled && (!block || !block.isActive)) {
     // Auto-renewal is enabled but no active block - should start immediately
+    // But only if no scheduled renewal is pending
     nextRenewal = new Date(Date.now() + 60000) // 1 minute from now to indicate immediate start
   } else if (block && block.startTime) {
     // Fallback: 5 hours after block start time
@@ -560,7 +561,7 @@ export async function performRenewalCheck(): Promise<{ success: boolean; action?
         const scheduledTime = new Date(scheduledStartTime)
         if (scheduledTime > now) {
           const hoursUntilScheduled = (scheduledTime.getTime() - now.getTime()) / (1000 * 60 * 60)
-          renewalLogger.info(`⏰ SCHEDULED RENEWAL: Waiting for scheduled time in ${hoursUntilScheduled.toFixed(1)} hours`, 'renewal')
+          renewalLogger.info(`⏰ SCHEDULED RENEWAL: Waiting for scheduled time in ${hoursUntilScheduled.toFixed(1)} hours - blocking automatic renewals`, 'renewal')
           return { success: true }
         }
 
@@ -573,6 +574,12 @@ export async function performRenewalCheck(): Promise<{ success: boolean; action?
 
         renewalLogger.info(`⏰ Scheduled renewal already executed for ${scheduledStartTime}, clearing schedule`, 'schedule')
         setScheduledStartTime(null)
+      }
+
+      // Check if there's still a scheduled renewal pending (backup check)
+      if (scheduledStartTime) {
+        renewalLogger.info(`⏰ SCHEDULED RENEWAL still pending: ${scheduledStartTime} - skipping automatic renewal checks`, 'renewal')
+        return { success: true }
       }
 
       let renewalReason: string | null = null
@@ -593,17 +600,20 @@ export async function performRenewalCheck(): Promise<{ success: boolean; action?
             renewalLogger.info(`✅ TRIGGER: ${renewalReason}`, 'renewal')
           }
         }
-      } else if (!block.isActive) {
-        const timeRemainingHours = (block.timeRemaining || 0) / 60
-        if (timeRemainingHours <= 0) {
-          renewalReason = 'Current block has expired'
-          renewalLogger.info('✅ TRIGGER: Block expired', 'renewal')
-        } else {
-          renewalLogger.info(`⏳ WAITING: Block inactive but has ${timeRemainingHours.toFixed(1)} hours remaining`, 'renewal')
-        }
       } else {
         const timeRemainingHours = (block.timeRemaining || 0) / 60
-        renewalLogger.info(`⏳ WAITING: Block still active, ${timeRemainingHours.toFixed(1)} hours remaining`, 'renewal')
+        
+        if (timeRemainingHours <= 0) {
+          // Block has expired (time remaining is 0 or negative)
+          renewalReason = 'Current block has expired'
+          renewalLogger.info(`✅ TRIGGER: Block expired (${timeRemainingHours.toFixed(1)} hours remaining, active=${block.isActive})`, 'renewal')
+        } else if (!block.isActive) {
+          // Block is inactive but still has time remaining (unusual case)
+          renewalLogger.info(`⏳ WAITING: Block inactive but has ${timeRemainingHours.toFixed(1)} hours remaining`, 'renewal')
+        } else {
+          // Block is active and has time remaining
+          renewalLogger.info(`⏳ WAITING: Block still active, ${timeRemainingHours.toFixed(1)} hours remaining`, 'renewal')
+        }
       }
 
       if (renewalReason) {

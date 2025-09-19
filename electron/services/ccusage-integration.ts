@@ -177,9 +177,9 @@ function loadUsageFile(filePath: string, projectName?: string): SentinelUsageEnt
 /**
  * Find all JSONL files in Claude data directories
  */
-function findUsageFiles(dataPaths: string[]): Array<{ path: string; project: string; mtime: number }> {
+function findUsageFiles(dataPaths: string[], maxDays: number = 7): Array<{ path: string; project: string; mtime: number }> {
   const files: Array<{ path: string; project: string; mtime: number }> = []
-  const cutoffMs = Date.now() - (7 * 24 * 60 * 60 * 1000) // 7 days
+  const cutoffMs = Date.now() - (maxDays * 24 * 60 * 60 * 1000)
 
   for (const basePath of dataPaths) {
     if (!existsSync(basePath)) continue
@@ -220,21 +220,25 @@ function findUsageFiles(dataPaths: string[]): Array<{ path: string; project: str
   const recentFiles = sortedFiles.filter(file => file.mtime >= cutoffMs)
   let selected: Array<{ path: string; project: string; mtime: number }>
 
+  // Calculate file limits based on requested days
+  const recentLimit = Math.max(20, maxDays * 2) // At least 20, or 2 files per day
+  const fallbackLimit = Math.max(10, maxDays) // At least 10, or 1 file per day
+
   if (recentFiles.length > 0) {
-    selected = recentFiles.slice(0, 20)
+    selected = recentFiles.slice(0, recentLimit)
   } else {
-    selected = sortedFiles.slice(0, 10)
+    selected = sortedFiles.slice(0, fallbackLimit)
   }
 
   if (selected.length === 0) {
-    selected = files.slice(0, Math.min(files.length, 10))
+    selected = files.slice(0, Math.min(files.length, fallbackLimit))
   }
 
   if (DEBUG) {
     const oldestSelected = selected[selected.length - 1]
     const oldestLabel = oldestSelected ? new Date(oldestSelected.mtime).toISOString() : 'n/a'
     console.log(
-      `Sentinel: Filtered usage files - total=${files.length}, recent=${recentFiles.length}, selected=${selected.length}, oldestSelected=${oldestLabel}`
+      `Sentinel: Filtered usage files (${maxDays}d) - total=${files.length}, recent=${recentFiles.length}, selected=${selected.length}, oldestSelected=${oldestLabel}`
     )
   }
 
@@ -573,7 +577,7 @@ async function identifyBillingBlocks(entries: SentinelUsageEntry[], userPlan: st
 /**
  * Check for new/modified files and update incrementally
  */
-function loadIncrementalUpdates(): SentinelUsageEntry[] | null {
+function loadIncrementalUpdates(maxDays: number = 7): SentinelUsageEntry[] | null {
   // Avoid checking too frequently
   const now = Date.now()
   if (now - lastIncrementalCheck < INCREMENTAL_CHECK_INTERVAL) {
@@ -582,7 +586,7 @@ function loadIncrementalUpdates(): SentinelUsageEntry[] | null {
   lastIncrementalCheck = now
 
   const dataPaths = getClaudeDataPaths()
-  const usageFiles = findUsageFiles(dataPaths)
+  const usageFiles = findUsageFiles(dataPaths, maxDays)
   
   let hasUpdates = false
   const newEntries: SentinelUsageEntry[] = []
@@ -625,7 +629,7 @@ function loadIncrementalUpdates(): SentinelUsageEntry[] | null {
 /**
  * Load and analyze Claude usage data with Sentinel enhancements
  */
-export async function loadSentinelUsageData(userPlan: string = 'auto'): Promise<SentinelUsageAnalysis> {
+export async function loadSentinelUsageData(userPlan: string = 'auto', maxDays: number = 30): Promise<SentinelUsageAnalysis> {
   const now = Date.now()
   const plan = normalizeClaudePlan(userPlan)
   
@@ -640,7 +644,7 @@ export async function loadSentinelUsageData(userPlan: string = 'auto'): Promise<
   
   // Check for incremental updates if cache is somewhat stale
   if (cachedData && (now - lastCacheTime) < CACHE_DURATION * 3) { // 3 minutes
-    const incrementalEntries = loadIncrementalUpdates()
+    const incrementalEntries = loadIncrementalUpdates(maxDays)
     if (incrementalEntries && incrementalEntries.length > 0) {
       // Merge new entries with cached data, removing duplicates
       const mergedEntries = [...cachedData, ...incrementalEntries]
@@ -664,7 +668,7 @@ export async function loadSentinelUsageData(userPlan: string = 'auto'): Promise<
   
   // Full reload for very stale cache or initial load
   const dataPaths = getClaudeDataPaths()
-  const usageFiles = findUsageFiles(dataPaths)
+  const usageFiles = findUsageFiles(dataPaths, maxDays)
   
   if (DEBUG) console.log(`Sentinel: Full reload - found ${usageFiles.length} usage files in ${dataPaths.length} data directories`)
   
@@ -806,7 +810,7 @@ async function processUsageEntries(allEntries: SentinelUsageEntry[], userPlan: s
  */
 export async function getRecentSentinelUsage(days: number = 30, userPlan: string = 'auto'): Promise<SentinelUsageAnalysis> {
   const plan = normalizeClaudePlan(userPlan)
-  const analysis = await loadSentinelUsageData(plan)
+  const analysis = await loadSentinelUsageData(plan, days)
   const cutoffDate = new Date()
   cutoffDate.setDate(cutoffDate.getDate() - days)
   const cutoffString = cutoffDate.toISOString().split('T')[0]

@@ -72,10 +72,13 @@ export function FloatingUsage() {
     // Load data immediately when component mounts
     handleRefresh()
     
-    // Set up auto-refresh interval
+    // Set up auto-refresh interval - increased to 120s to reduce CPU usage
     const interval = setInterval(() => {
-      handleRefresh()
-    }, 60000)
+      // Only refresh if window is focused and visible
+      if (!document.hidden && document.hasFocus()) {
+        handleRefresh()
+      }
+    }, 120000) // Increased from 60s to 120s
 
     return () => clearInterval(interval)
   }, [])

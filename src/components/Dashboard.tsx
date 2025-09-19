@@ -79,7 +79,7 @@ function ChartSkeleton() {
 }
 
 export function Dashboard() {
-  const { summary, currentBlock, usageData, loadingStates, loadDataInBackground, refreshData } = useUsageStore()
+  const { summary, currentBlock, usageData, loadingStates, refreshData, loadDataForDays } = useUsageStore()
   const {
     status,
     isLoading: renewalLoading,
@@ -137,7 +137,7 @@ export function Dashboard() {
       }
       
       // Start both operations in parallel
-      loadDataInBackground()
+      loadDataForDays(4) // Load only 4 days for faster dashboard loading
       refreshStatus()
       loadUserPlan()
     }, 50) // Minimal delay to ensure DOM rendering
@@ -149,12 +149,12 @@ export function Dashboard() {
   useEffect(() => {
     if (!autoRefresh || isRefreshing || !isWindowFocused) return
 
-    // Ensure minimum 60s interval to align with cache window
-    const effectiveInterval = Math.max(autoRefreshInterval, 60)
+    // Increase minimum interval to 120s to reduce CPU usage
+    const effectiveInterval = Math.max(autoRefreshInterval, 120)
     
     const interval = setInterval(() => {
-      // Double-check focus state before refreshing
-      if (document.hasFocus()) {
+      // Double-check focus state and visibility before refreshing
+      if (document.hasFocus() && !document.hidden) {
         handleRefresh()
       }
     }, effectiveInterval * 1000)
@@ -743,7 +743,7 @@ export function Dashboard() {
                   <TrendingUp className="h-5 w-5" />
                   <span>Usage Trends</span>
                 </CardTitle>
-                <CardDescription>Last 7 days activity</CardDescription>
+                <CardDescription>Last 4 days activity</CardDescription>
               </div>
               <div className="flex items-center space-x-2">
                 <Button

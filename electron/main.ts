@@ -5,6 +5,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
 import { isDev } from './utils'
+
 import { loadUsageData, getRecentUsage, getCurrentBlockInfo, resetUsageCache } from './services/ccusage-service'
 import { normalizeClaudePlan, ClaudePlan } from './services/plan-utils'
 import { 
@@ -45,7 +46,7 @@ type RenewalStatusResult = ReturnType<typeof getRenewalStatus> extends Promise<i
 // Cached renewal status to avoid frequent checks
 let cachedRenewalStatus: RenewalStatusResult | null = null
 let renewalStatusCacheTime: number = 0
-const RENEWAL_CACHE_DURATION = 4 * 60 * 1000 // 4 minutes
+const RENEWAL_CACHE_DURATION = 8 * 60 * 1000 // 8 minutes - increased from 4 to reduce CPU usage
 
 // Check if we need to refresh renewal status based on timing
 const shouldRefreshRenewalStatus = (currentBlock?: any): boolean => {
@@ -734,11 +735,14 @@ const updateTrayUsage = async (blockData?: any) => {
 const startTrayUsageUpdates = () => {
   // Kick off a worker refresh so tray receives consistent data
   scheduleBackgroundRefresh().catch(() => {})
-  // Refresh via worker every minute
+  // Refresh via worker every 2 minutes to reduce CPU usage
   if (trayUsageInterval) { clearInterval(trayUsageInterval); trayUsageInterval = null }
   trayUsageInterval = setInterval(() => {
-    scheduleBackgroundRefresh().catch(() => {})
-  }, 60 * 1000)
+    // Only refresh if not already in flight to prevent overlapping requests
+    if (!usageRefreshInFlight) {
+      scheduleBackgroundRefresh().catch(() => {})
+    }
+  }, 120 * 1000) // Increased from 60s to 120s
 }
 
 const createWindow = () => {
@@ -767,7 +771,9 @@ const createWindow = () => {
       nodeIntegration: false,
       contextIsolation: true,
       // Enable background throttling for better performance
-      backgroundThrottling: false,
+      backgroundThrottling: true,
+      webgl: false, // Disable WebGL to reduce GPU usage
+      offscreen: false, // Disable offscreen rendering
     },
   })
 
@@ -913,6 +919,9 @@ const createFloatingWindow = () => {
       preload: join(__dirname, '../preload/preload.js'),
       nodeIntegration: false,
       contextIsolation: true,
+      backgroundThrottling: true,
+      webgl: false, // Disable WebGL to reduce GPU usage
+      offscreen: false, // Disable offscreen rendering
     },
   })
 
@@ -1192,10 +1201,10 @@ let scheduledRenewalTimer: NodeJS.Timeout | null = null
 // Configuration for grace periods
 const RENEWAL_CONFIG = {
   gracePeriod: {
-    min: 30,  // seconds
-    max: 60   // seconds
+    min: 60,  // seconds - increased from 30
+    max: 120  // seconds - increased from 60
   },
-  fallbackCheckInterval: 30 * 60 * 1000, // 30 minutes in ms for emergency fallback only
+  fallbackCheckInterval: 60 * 60 * 1000, // 60 minutes in ms for emergency fallback only - increased from 30
 }
 
 // Helper to add grace period to any time
@@ -1226,7 +1235,7 @@ const scheduleNextRenewal = async (): Promise<void> => {
       scheduleNextRenewal().catch(err => {
         renewalLogger.error(`Error scheduling next renewal: ${err instanceof Error ? err.message : String(err)}`, 'schedule')
       })
-    }, 60000)
+    }, 120000) // Increased from 60s to 120s
     return
   }
 
@@ -1302,7 +1311,7 @@ const scheduleNextRenewal = async (): Promise<void> => {
             reschedule(2000)
           } catch (error) {
             renewalLogger.error(`❌ Error in scheduled renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
-            reschedule(60000)
+            reschedule(120000) // Increased from 60s to 120s
           }
         }, totalDelay)
 
@@ -1372,7 +1381,7 @@ const scheduleNextRenewal = async (): Promise<void> => {
             reschedule(2000)
           } catch (error) {
             renewalLogger.error(`Error in scheduled renewal: ${error instanceof Error ? error.message : String(error)}`, 'renewal')
-            reschedule(60000)
+            reschedule(120000) // Increased from 60s to 120s
           }
         }, delay)
 
@@ -1409,7 +1418,7 @@ const scheduleNextRenewal = async (): Promise<void> => {
             }
           } catch (error) {
             renewalLogger.error(`Error in immediate renewal check: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
-            reschedule(60000)
+            reschedule(120000) // Increased from 60s to 120s
           }
         }, 2000) // Small delay to avoid rapid firing
         return
@@ -1726,6 +1735,24 @@ ipcMain.handle('get-usage-data', async () => {
     return buildUsagePayload(recentData, blockInfo)
   } catch (error) {
     console.error('Error loading usage data:', error)
+    return { 
+      daily: [], 
+      summary: { totalCost: 0, totalTokens: 0, totalSessions: 0, averageTokensPerSession: 0 },
+      currentBlock: null 
+    }
+  }
+})
+
+// Get usage data for specific number of days (for Reports page)
+ipcMain.handle('get-usage-data-range', async (_, days: number = 30) => {
+  try {
+    const userPlan = await getUserClaudePlan()
+    const recentData = await getRecentUsage(days, userPlan)
+    const blockInfo = await getCurrentBlockInfo(userPlan)
+    
+    return buildUsagePayload(recentData, blockInfo)
+  } catch (error) {
+    console.error('Error loading usage data for range:', error)
     return { 
       daily: [], 
       summary: { totalCost: 0, totalTokens: 0, totalSessions: 0, averageTokensPerSession: 0 },
