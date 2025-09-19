@@ -417,33 +417,25 @@ export async function getRenewalStatus() {
   // Calculate next renewal time based on block data instead of lastActivity
   let nextRenewal: Date | null = null
   
-  // Debug logging for next renewal calculation
-  renewalLogger.debug(`Next renewal calculation: enabled=${cfg.enabled}, scheduledStartTime=${scheduledStartTime}, block=${block ? `active=${block.isActive}, startTime=${block.startTime}, endTime=${block.endTime}` : 'null'}`, 'renewal')
   
   if (scheduledStartTime) {
     // If user has scheduled a time, that's the next renewal
     nextRenewal = new Date(scheduledStartTime)
-    renewalLogger.debug(`Using scheduled start time: ${nextRenewal.toISOString()}`, 'renewal')
   } else if (block && block.isActive && block.endTime) {
     // Next renewal is when current block ends
     nextRenewal = new Date(block.endTime)
-    renewalLogger.debug(`Using active block end time: ${nextRenewal.toISOString()}`, 'renewal')
   } else if (cfg.enabled && (!block || !block.isActive)) {
     // Auto-renewal is enabled but no active block - should start immediately
     nextRenewal = new Date(Date.now() + 60000) // 1 minute from now to indicate immediate start
-    renewalLogger.debug(`Auto-renewal enabled with no active block - immediate start: ${nextRenewal.toISOString()}`, 'renewal')
   } else if (block && block.startTime) {
     // Fallback: 5 hours after block start time
     nextRenewal = new Date(new Date(block.startTime).getTime() + 5 * 60 * 60 * 1000)
-    renewalLogger.debug(`Using block start time + 5h: ${nextRenewal.toISOString()}`, 'renewal')
   } else if (block && block.endTime) {
     // Block exists but is not active - next renewal is when it ends
     nextRenewal = new Date(block.endTime)
-    renewalLogger.debug(`Using inactive block end time: ${nextRenewal.toISOString()}`, 'renewal')
   } else {
     // No block data available - estimate next renewal as 5 hours from now
     nextRenewal = new Date(Date.now() + 5 * 60 * 60 * 1000)
-    renewalLogger.debug(`Using fallback time (now + 5h): ${nextRenewal.toISOString()}`, 'renewal')
   }
   
   // Use the current block's time remaining instead of calculating from lastActivity

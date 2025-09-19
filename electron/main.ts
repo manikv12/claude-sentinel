@@ -47,6 +47,50 @@ let pendingMenuRefreshFromClick = false
 
 type RenewalStatusResult = ReturnType<typeof getRenewalStatus> extends Promise<infer T> ? T : ReturnType<typeof getRenewalStatus>
 
+// Cached renewal status to avoid frequent checks
+let cachedRenewalStatus: RenewalStatusResult | null = null
+let renewalStatusCacheTime: number = 0
+const RENEWAL_CACHE_DURATION = 4 * 60 * 1000 // 4 minutes
+
+// Check if we need to refresh renewal status based on timing
+const shouldRefreshRenewalStatus = (currentBlock?: any): boolean => {
+  const now = Date.now()
+  
+  // Always refresh if cache is empty or expired
+  if (!cachedRenewalStatus || (now - renewalStatusCacheTime) > RENEWAL_CACHE_DURATION) {
+    return true
+  }
+  
+  // Refresh if renewal is coming up soon (within 5 minutes)
+  if (cachedRenewalStatus.nextRenewal) {
+    const nextRenewalTime = new Date(cachedRenewalStatus.nextRenewal).getTime()
+    const timeUntilRenewal = nextRenewalTime - now
+    if (timeUntilRenewal <= 5 * 60 * 1000) { // 5 minutes
+      return true
+    }
+  }
+  
+  // Refresh if current block is expiring soon (within 5 minutes)
+  if (currentBlock?.endTime) {
+    const blockEndTime = new Date(currentBlock.endTime).getTime()
+    const timeUntilBlockEnd = blockEndTime - now
+    if (timeUntilBlockEnd <= 5 * 60 * 1000) { // 5 minutes
+      return true
+    }
+  }
+  
+  return false
+}
+
+// Get renewal status with caching
+const getCachedRenewalStatus = async (forceRefresh = false): Promise<RenewalStatusResult> => {
+  if (forceRefresh || shouldRefreshRenewalStatus()) {
+    cachedRenewalStatus = await getRenewalStatus()
+    renewalStatusCacheTime = Date.now()
+  }
+  return cachedRenewalStatus!
+}
+
 const initUsageWorker = () => {
   if (usageWorker) return
   try {
@@ -1339,6 +1383,10 @@ const scheduleNextRenewal = async (): Promise<void> => {
 // Handle internal events from renewal service
 ipcMain.on('internal-session-started', async () => {
   try {
+    // Invalidate renewal status cache when session state changes
+    cachedRenewalStatus = null
+    renewalStatusCacheTime = 0
+    
     renewalLogger.info('🔄 Session started event received - updating UI and tray', 'service')
     
     // Force refresh usage data to detect new block
@@ -1416,12 +1464,17 @@ const updateTrayMenu = async () => {
   if (!tray || tray.isDestroyed()) return
 
   console.log('Updating tray menu...')
-  const status = await getRenewalStatus()
-  console.log('Renewal status for tray menu:', status)
   
   // Get the user's manual plan setting and apply it consistently
   const userPlan = await getUserClaudePlan()
-  let block = await getCurrentBlockInfo(userPlan)
+  // Prefer the worker's freshest block data to keep tray in sync with Dashboard
+  let block = lastWorkerBlock ? { ...lastWorkerBlock } : await getCurrentBlockInfo(userPlan)
+  
+  // Use cached renewal status unless refresh is needed
+  const status = await getCachedRenewalStatus()
+  if (shouldRefreshRenewalStatus(block)) {
+    console.log('Renewal status check needed for tray menu')
+  }
   
   // Apply user's plan override to ensure tray matches dashboard
   if (block && userPlan && userPlan !== 'auto') {
@@ -1653,11 +1706,21 @@ ipcMain.handle('get-renewal-status', async () => {
 
 ipcMain.handle('toggle-auto-renewal', async (_, enabled: boolean, scheduledTime?: string) => {
   try {
+    // Invalidate renewal status cache when settings change
+    cachedRenewalStatus = null
+    renewalStatusCacheTime = 0
+    
     let result
     
     if (enabled) {
       result = startRenewalService()
-      if (scheduledTime) setScheduledStartTime(scheduledTime)
+
+      if (scheduledTime) {
+        setScheduledStartTime(scheduledTime)
+      } else {
+        // Clear any lingering schedule when user requests immediate start
+        setScheduledStartTime(null)
+      }
       if (result.success) {
         startRenewalMonitoring()
         
@@ -1706,10 +1769,14 @@ ipcMain.handle('toggle-auto-renewal', async (_, enabled: boolean, scheduledTime?
 
 ipcMain.handle('set-scheduled-start-time', async (_, isoTime: string | null) => {
   try {
+    // Invalidate renewal status cache when scheduled time changes
+    cachedRenewalStatus = null
+    renewalStatusCacheTime = 0
+    
     const result = setScheduledStartTime(isoTime)
     if (result.success) {
       // Only reschedule if absolutely necessary and no immediate renewal is queued
-      const status = await getRenewalStatus()
+      const status = await getCachedRenewalStatus(true) // Force refresh
       if (status.enabled && status.running && !status.nextRenewal) {
         renewalLogger.info('Scheduled time changed and no renewal queued, rescheduling', 'schedule')
         scheduleNextRenewal().catch(error => {
