@@ -90,6 +90,10 @@ const electronAPI = {
     ipcRenderer.on('usage-update', (_, data) => callback(data))
   },
 
+  onPartialUsageUpdate: (callback: (data: any) => void) => {
+    ipcRenderer.on('usage-partial-update', (_, data) => callback(data))
+  },
+
   onRenewalStatusUpdate: (callback: (status: any) => void) => {
     ipcRenderer.on('renewal-status-update', (_, status) => callback(status))
   },

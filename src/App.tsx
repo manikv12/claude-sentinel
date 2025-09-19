@@ -22,7 +22,7 @@ declare global {
 function App() {
   const [activeView, setActiveView] = useState<'dashboard' | 'reports' | 'settings' | 'auto-renewal' | 'spec-development'>('dashboard')
   const [sidebarVisible, setSidebarVisible] = useState(true)
-  const { setUsageData } = useUsageStore()
+  const { setUsageData, setPartialUsageData } = useUsageStore()
   const { setRenewalStatus, status: renewalStatus } = useRenewalStore()
 
   // Check if we're in floating mode
@@ -34,19 +34,25 @@ function App() {
       setUsageData(data)
     }
 
+    const handlePartialUsageUpdate = (data: any) => {
+      setPartialUsageData(data)
+    }
+
     const handleRenewalStatusUpdate = (status: any) => {
       setRenewalStatus(status)
     }
 
     window.electronAPI.onUsageUpdate(handleUsageUpdate)
+    window.electronAPI.onPartialUsageUpdate?.(handlePartialUsageUpdate)
     window.electronAPI.onRenewalStatusUpdate(handleRenewalStatusUpdate)
 
     // Cleanup listeners on unmount
     return () => {
       window.electronAPI.removeAllListeners('usage-update')
+      window.electronAPI.removeAllListeners('usage-partial-update')
       window.electronAPI.removeAllListeners('renewal-status-update')
     }
-  }, [setUsageData, setRenewalStatus])
+  }, [setUsageData, setPartialUsageData, setRenewalStatus])
 
   // Render floating view if in floating mode
   if (isFloatingMode) {

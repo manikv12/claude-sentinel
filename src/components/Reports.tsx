@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react'
+import React, { useState, useMemo, useEffect } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card'
 import { Button } from './ui/button'
 import { useUsageStore } from '@/stores/usageStore'
@@ -17,10 +17,11 @@ type TimeRange = '7d' | '30d' | '90d' | 'all'
 type GroupBy = 'day' | 'week' | 'month'
 
 export function Reports() {
-  const { usageData, isLoading } = useUsageStore()
+  const { usageData, isLoading, refreshData } = useUsageStore()
   const [timeRange, setTimeRange] = useState<TimeRange>('30d')
   const [groupBy, setGroupBy] = useState<GroupBy>('day')
   const [modelFilter, setModelFilter] = useState<string>('all')
+  const [isFilterLoading, setIsFilterLoading] = useState(false)
 
   const filteredData = useMemo(() => {
     let data = [...usageData.daily]

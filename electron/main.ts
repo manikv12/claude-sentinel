@@ -1,11 +1,9 @@
 import { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, Notification, dialog, shell } from 'electron'
-import { Worker } from 'node:worker_threads'
 import { join } from 'path'
 import { fileURLToPath } from 'url'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
-import ts from 'typescript'
 import { isDev } from './utils'
 import { loadUsageData, getRecentUsage, getCurrentBlockInfo, resetUsageCache } from './services/ccusage-service'
 import { normalizeClaudePlan, ClaudePlan } from './services/plan-utils'
@@ -35,14 +33,11 @@ let tray: Tray | null = null
 // Track when the tray menu is open so we avoid heavy work or menu rebuilds
 let isTrayMenuOpen = false
 let trayUsageInterval: NodeJS.Timeout | null = null
-// Background worker for usage refresh to keep main thread responsive
-let usageWorker: Worker | null = null
-let usageWorkerReady = false
-let workerBusy = false
-let pendingRefresh = false
-// Resolve Promises waiting for the next worker result
-let workerResolvers: Array<(payload: any) => void> = []
-let lastWorkerBlock: any = null
+let usageRefreshInFlight: Promise<UsageRefreshPayload> | null = null
+let queuedHardUsageRefresh = false
+let queuedSoftUsageRefresh = false
+let usageDataReady = false
+let lastUsageBlock: any = null
 let pendingMenuRefreshFromClick = false
 
 type RenewalStatusResult = ReturnType<typeof getRenewalStatus> extends Promise<infer T> ? T : ReturnType<typeof getRenewalStatus>
@@ -91,124 +86,141 @@ const getCachedRenewalStatus = async (forceRefresh = false): Promise<RenewalStat
   return cachedRenewalStatus!
 }
 
-const initUsageWorker = () => {
-  if (usageWorker) return
+type RecentUsageResult = Awaited<ReturnType<typeof getRecentUsage>>
+type UsageBlockResult = Awaited<ReturnType<typeof getCurrentBlockInfo>>
+
+interface UsageRefreshPayload {
+  daily: Array<{
+    date: string
+    inputTokens: number
+    outputTokens: number
+    totalTokens: number
+    cost: number
+    model: string
+    sessionsCount: number
+  }>
+  summary: {
+    totalCost: number
+    totalTokens: number
+    totalSessions: number
+    averageTokensPerSession: number
+  }
+  currentBlock: UsageBlockResult
+}
+
+const buildUsagePayload = (recentData: RecentUsageResult, blockInfo: UsageBlockResult): UsageRefreshPayload => ({
+  daily: recentData.daily.map(day => ({
+    date: day.date,
+    inputTokens: day.inputTokens,
+    outputTokens: day.outputTokens,
+    totalTokens: day.totalTokens,
+    cost: day.cost,
+    model: 'mixed',
+    sessionsCount: Array.from(day.blocks || new Set()).length
+  })),
+  summary: {
+    totalCost: recentData.totalCost,
+    totalTokens: recentData.totalTokens,
+    totalSessions: recentData.totalSessions,
+    averageTokensPerSession: recentData.totalSessions > 0 ?
+      recentData.totalTokens / recentData.totalSessions : 0
+  },
+  currentBlock: blockInfo
+})
+
+const broadcastUsagePayload = async (payload: UsageRefreshPayload, source: string) => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('usage-update', payload)
+  }
+  if (floatingWindow && !floatingWindow.isDestroyed()) {
+    floatingWindow.webContents.send('usage-update', payload)
+  }
+
+  lastUsageBlock = payload.currentBlock
+  usageDataReady = true
+
   try {
-    const usingDevServer = !!process.env.VITE_DEV_SERVER_URL
-    let workerScript: string
-    const workerOptions: ConstructorParameters<typeof Worker>[1] = {}
-
-    if (usingDevServer) {
-      const projectRoot = process.cwd()
-      const workerTsPath = path.join(projectRoot, 'electron', 'workers', 'usageWorker.ts')
-      const tempDir = join(os.tmpdir(), 'claude-sentinel')
-      try { fs.mkdirSync(tempDir, { recursive: true }) } catch {}
-      const tempFile = join(tempDir, 'usageWorker-dev-bootstrap.js')
-
-      const bootstrap = `const ts = require(${JSON.stringify(require.resolve('typescript'))});\n` +
-        `const fs = require('fs');\n` +
-        `require.extensions['.ts'] = (module, filename) => {\n` +
-        `  const source = fs.readFileSync(filename, 'utf8');\n` +
-        `  const out = ts.transpileModule(source, {\n` +
-        `    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true, skipLibCheck: true },\n` +
-        `    fileName: filename\n` +
-        `  }).outputText;\n` +
-        `  module._compile(out, filename);\n` +
-        `};\n` +
-        `require(${JSON.stringify(workerTsPath)});\n`
-
-      fs.writeFileSync(tempFile, bootstrap)
-      workerScript = tempFile
-    } else {
-      // Find the actual worker file with hash
-      const assetsDir = join(__dirname, 'assets')
-      const workerFiles = fs.readdirSync(assetsDir).filter((f: string) => f.startsWith('usageWorker-') && f.endsWith('.js'))
-      if (workerFiles.length === 0) {
-        throw new Error('Usage worker file not found')
-      }
-      workerScript = join(assetsDir, workerFiles[0])
+    await updateTrayUsage(payload.currentBlock)
+    if (pendingMenuRefreshFromClick) {
+      pendingMenuRefreshFromClick = false
+      Promise.resolve().then(() => updateTrayMenu()).catch((err) => console.error(err))
     }
+  } catch (trayError) {
+    console.error('Failed to update tray usage after refresh:', trayError)
+  }
 
-    usageWorker = new Worker(workerScript, workerOptions)
-    usageWorker.on('message', (msg: any) => {
-      workerBusy = false
-      usageWorkerReady = true
-      if (msg?.ok && msg.data) {
-        const data = msg.data
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('usage-update', data)
-        }
-        if (floatingWindow && !floatingWindow.isDestroyed()) {
-          floatingWindow.webContents.send('usage-update', data)
-        }
-        lastWorkerBlock = data.currentBlock
-        updateTrayUsage(data.currentBlock)
-        if (pendingMenuRefreshFromClick) {
-          pendingMenuRefreshFromClick = false
-          // Refresh tray menu with the freshest data immediately on click
-          Promise.resolve().then(() => updateTrayMenu()).catch((e) => console.error(e))
-        }
-      }
-      // Resolve any pending Promises waiting for this result
-      if (workerResolvers.length > 0) {
-        const resolvers = workerResolvers
-        workerResolvers = []
-        resolvers.forEach((r) => r(msg))
-      }
-      if (pendingRefresh) {
-        pendingRefresh = false
-        scheduleBackgroundRefresh()
-      }
-    })
-    usageWorker.on('error', (err) => {
-      workerBusy = false
-      usageWorkerReady = false
-      console.error('Usage worker error:', err)
-    })
-    usageWorker.on('exit', (code) => {
-      workerBusy = false
-      usageWorker = null
-      usageWorkerReady = false
-      if (code !== 0) console.warn('Usage worker exited unexpectedly')
-    })
-  } catch (e) {
-    console.error('Failed to create usage worker:', e)
+  if (process.env.SENTINEL_DEBUG === '1') {
+    console.log(`[UsageRefresh] Broadcast (${source}) → days=${payload.daily.length}, totalTokens=${payload.summary.totalTokens.toLocaleString()}`)
   }
 }
 
-const scheduleBackgroundRefresh = async (hard = false) => {
-  initUsageWorker()
-  if (!usageWorker) return
-  if (workerBusy) { pendingRefresh = true; return }
-  workerBusy = true
-  const userPlan = await getUserClaudePlan()
-  usageWorker.postMessage({ 
-    type: hard ? 'hard-refresh' : 'refresh',
-    userPlan: userPlan
-  })
-}
+const refreshUsageData = async (hard = false, source = 'manual'): Promise<UsageRefreshPayload> => {
+  if (usageRefreshInFlight) {
+    if (hard) {
+      queuedHardUsageRefresh = true
+    } else if (!queuedHardUsageRefresh) {
+      queuedSoftUsageRefresh = true
+    }
+    return usageRefreshInFlight
+  }
 
-// Request a refresh and return the worker's payload once it's ready
-const requestUsageRefresh = async (hard = false): Promise<any> => {
-  initUsageWorker()
-  if (!usageWorker) return Promise.reject(new Error('Worker not initialized'))
-  
-  // Get user's Claude plan to pass to worker
-  const userPlan = await getUserClaudePlan()
-  
-  return new Promise((resolve) => {
-    workerResolvers.push((payload) => resolve(payload))
-    if (workerBusy) {
-      // Coalesce: mark pending and let current run finish
-      pendingRefresh = true
-    } else {
-      workerBusy = true
-      usageWorker!.postMessage({ 
-        type: hard ? 'hard-refresh' : 'refresh',
-        userPlan: userPlan
+  const effectiveHard = hard || queuedHardUsageRefresh
+  queuedHardUsageRefresh = false
+  queuedSoftUsageRefresh = false
+
+  const start = Date.now()
+  if (effectiveHard) {
+    resetUsageCache()
+  }
+
+  const label = effectiveHard ? 'hard' : 'soft'
+  console.log(`[UsageRefresh] Starting ${label} refresh (${source})`)
+
+  usageRefreshInFlight = (async () => {
+    const userPlan = await getUserClaudePlan()
+    const dataStart = Date.now()
+    const recentData = await getRecentUsage(30, userPlan)
+    const loadDuration = Date.now() - dataStart
+    const blockInfo = await getCurrentBlockInfo(userPlan)
+    const payload = buildUsagePayload(recentData, blockInfo)
+    const totalDuration = Date.now() - start
+    console.log(`[UsageRefresh] Completed ${label} refresh (${source}) in ${totalDuration}ms (dataLoad=${loadDuration}ms, daily=${payload.daily.length})`)
+    await broadcastUsagePayload(payload, source)
+    return payload
+  })()
+
+  usageRefreshInFlight.catch((error) => {
+    console.error(`[UsageRefresh] ${label} refresh (${source}) failed:`, error)
+  }).finally(() => {
+    usageRefreshInFlight = null
+    const shouldRequeue = queuedHardUsageRefresh || queuedSoftUsageRefresh
+    const nextHard = queuedHardUsageRefresh
+    if (shouldRequeue) {
+      queuedHardUsageRefresh = false
+      queuedSoftUsageRefresh = false
+      setImmediate(() => {
+        refreshUsageData(nextHard, 'queued').catch((err) => {
+          console.error('[UsageRefresh] Queued refresh failed:', err)
+        })
       })
     }
   })
+
+  return usageRefreshInFlight
+}
+
+const scheduleBackgroundRefresh = async (hard = false) => {
+  return refreshUsageData(hard, hard ? 'background-hard' : 'background')
+}
+
+const requestUsageRefresh = async (hard = false): Promise<{ ok: boolean; data?: UsageRefreshPayload; error?: string }> => {
+  try {
+    const data = await refreshUsageData(hard, hard ? 'hard-request' : 'ipc-request')
+    return { ok: true, data }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return { ok: false, error: message }
+  }
 }
 
 
@@ -496,11 +508,11 @@ const updateTrayUsage = async (blockData?: any) => {
   
   let block, percent
   if (blockData) {
-    // Use data passed from worker
+    // Use data passed from refresh
     block = blockData
-  } else if (lastWorkerBlock) {
-    // Use last worker-provided data
-    block = lastWorkerBlock
+  } else if (lastUsageBlock) {
+    // Use last cached refresh data
+    block = lastUsageBlock
   } else {
     // No block data available
     block = null
@@ -1031,15 +1043,8 @@ const createTray = () => {
     }, 300)
   })
 
-  // Start periodic usage updates for tray title/tooltip only after worker is ready
-  const startWhenReady = () => {
-    if (usageWorkerReady) {
-      startTrayUsageUpdates()
-    } else {
-      setTimeout(startWhenReady, 250)
-    }
-  }
-  startWhenReady()
+  // Kick off periodic usage updates for tray title/tooltip
+  startTrayUsageUpdates()
 }
 
 // App event handlers
@@ -1090,35 +1095,93 @@ app.on('activate', () => {
   }
 })
 
+// Handle Cmd+Q on macOS properly
+app.on('will-quit', (event) => {
+  console.log('🔄 App will quit - preventing default to run cleanup')
+  // Let the before-quit handler run first
+})
+
+// Ensure app quits when all windows are closed on macOS too (if user forces it)
+app.on('quit', () => {
+  console.log('🔄 App quit event triggered')
+})
+
 app.on('window-all-closed', () => {
   // On macOS, keep app running in system tray unless explicitly quit
   if (process.platform !== 'darwin') {
     app.quit()
   }
+  // On macOS, when all windows are closed, hide the dock icon but keep running in tray
+  else if (process.platform === 'darwin') {
+    try { 
+      if (app.dock) app.dock.hide() 
+    } catch {}
+  }
 })
 
 app.on('before-quit', () => {
-  // Clean up worker
-  if (usageWorker) {
-    usageWorker.terminate()
-    usageWorker = null
-  }
+  console.log('🔄 App is quitting - cleaning up background processes...')
   
   // Clean up tray
   if (tray) {
     tray.destroy()
+    tray = null
   }
+  
+  // Clear all intervals and timers
   if (trayUsageInterval) {
     clearInterval(trayUsageInterval)
     trayUsageInterval = null
   }
+  
+  if (renewalTimer) {
+    clearTimeout(renewalTimer)
+    renewalTimer = null
+  }
+  
+  if (scheduledRenewalTimer) {
+    clearTimeout(scheduledRenewalTimer)
+    scheduledRenewalTimer = null
+  }
 
-  // Stop renewal timers and kill any renewal child processes
-  try { stopRenewalMonitoring() } catch {}
+  // Stop renewal monitoring and kill any renewal child processes
+  try { 
+    stopRenewalMonitoring() 
+    console.log('✅ Stopped renewal monitoring')
+  } catch (e) {
+    console.warn('⚠️ Failed to stop renewal monitoring:', e)
+  }
+  
   try {
     const { killAllRenewalChildren } = require('./services/renewal-service')
-    if (killAllRenewalChildren) killAllRenewalChildren()
-  } catch {}
+    if (killAllRenewalChildren) {
+      killAllRenewalChildren()
+      console.log('✅ Killed renewal child processes')
+    }
+  } catch (e) {
+    console.warn('⚠️ Failed to kill renewal children:', e)
+  }
+
+  // Close all windows forcefully
+  try {
+    const allWindows = BrowserWindow.getAllWindows()
+    allWindows.forEach(window => {
+      if (!window.isDestroyed()) {
+        window.destroy()
+      }
+    })
+    console.log('✅ Destroyed all windows')
+  } catch (e) {
+    console.warn('⚠️ Failed to destroy windows:', e)
+  }
+
+  // Force kill all remaining processes after cleanup
+  setTimeout(() => {
+    console.log('🔥 Force quitting all processes...')
+    process.exit(0)
+  }, 1000) // Give 1 second for cleanup, then force quit
+
+  console.log('🔄 Background cleanup completed')
 })
 
 
@@ -1467,8 +1530,8 @@ const updateTrayMenu = async () => {
   
   // Get the user's manual plan setting and apply it consistently
   const userPlan = await getUserClaudePlan()
-  // Prefer the worker's freshest block data to keep tray in sync with Dashboard
-  let block = lastWorkerBlock ? { ...lastWorkerBlock } : await getCurrentBlockInfo(userPlan)
+  // Prefer the freshest block data to keep tray in sync with Dashboard
+  let block = lastUsageBlock ? { ...lastUsageBlock } : await getCurrentBlockInfo(userPlan)
   
   // Use cached renewal status unless refresh is needed
   const status = await getCachedRenewalStatus()
@@ -1660,26 +1723,7 @@ ipcMain.handle('get-usage-data', async () => {
     const recentData = await getRecentUsage(30, userPlan) // Last 30 days
     const blockInfo = await getCurrentBlockInfo(userPlan)
     
-    return {
-      daily: recentData.daily.map(day => ({
-        date: day.date,
-        inputTokens: day.inputTokens,
-        outputTokens: day.outputTokens,
-        totalTokens: day.totalTokens,
-        cost: day.cost,
-        model: 'mixed', // Could be enhanced to show model breakdown
-        // Expose session count for per-day summaries on the dashboard
-        sessionsCount: Array.from(day.blocks || new Set()).length
-      })),
-      summary: {
-        totalCost: recentData.totalCost,
-        totalTokens: recentData.totalTokens,
-        totalSessions: recentData.totalSessions,
-        averageTokensPerSession: recentData.totalSessions > 0 ? 
-          recentData.totalTokens / recentData.totalSessions : 0
-      },
-      currentBlock: blockInfo
-    }
+    return buildUsagePayload(recentData, blockInfo)
   } catch (error) {
     console.error('Error loading usage data:', error)
     return { 
@@ -1831,9 +1875,9 @@ ipcMain.handle('refresh-usage-data', async () => {
   try {
     const result = await requestUsageRefresh(false)
     if (result?.ok && result.data) return result.data
-    throw new Error(result?.error || 'Worker refresh failed')
+    throw new Error(result?.error || 'Usage refresh failed')
   } catch (error) {
-    console.error('Error refreshing usage data (worker):', error)
+    console.error('Error refreshing usage data:', error)
     throw error
   }
 })
@@ -1841,11 +1885,43 @@ ipcMain.handle('refresh-usage-data', async () => {
 // Force reset usage cache and perform a fresh usage read (hard refresh)
 ipcMain.handle('hard-refresh-usage-data', async () => {
   try {
+    // First, immediately send any cached data to show something quickly
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      try {
+        const userPlan = await getUserClaudePlan()
+        const cachedData = await getRecentUsage(30, userPlan) // Use cached data first
+        const cachedBlockInfo = await getCurrentBlockInfo(userPlan)
+        const cachedPayload = buildUsagePayload(cachedData, cachedBlockInfo)
+        
+        // Send cached data immediately as a "partial update"
+        mainWindow.webContents.send('usage-partial-update', {
+          ...cachedPayload,
+          isPartial: true,
+          source: 'cache'
+        })
+        console.log('📦 Sent cached data for immediate display')
+      } catch (cacheError) {
+        console.warn('Could not load cached data for quick display:', cacheError)
+      }
+    }
+
+    // Now perform the full refresh
     const result = await requestUsageRefresh(true)
-    if (result?.ok && result.data) return result.data
-    return { success: false, error: result?.error || 'Worker hard-refresh failed' }
+    if (result?.ok && result.data) {
+      // Send the fresh data as final update
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('usage-update', {
+          ...result.data,
+          isPartial: false,
+          source: 'fresh'
+        })
+        console.log('✅ Sent fresh data as final update')
+      }
+      return result.data
+    }
+    return { success: false, error: result?.error || 'Usage hard-refresh failed' }
   } catch (error) {
-    console.error('Error performing hard refresh (worker):', error)
+    console.error('Error performing hard refresh:', error)
     return { success: false }
   }
 })
@@ -2723,11 +2799,11 @@ ipcMain.handle('save-settings', async (_, settings: any) => {
       console.log(`Claude plan changed from '${oldSettings.claudePlan || 'auto'}' to '${settings.claudePlan}' - triggering hard refresh`)
       
       try {
-        // Reset cache and clear cached worker data
+        // Reset cache and clear cached usage data
         resetUsageCache()
-        lastWorkerBlock = null // Clear cached worker data to force fresh data
+        lastUsageBlock = null // Clear cached data to force fresh data
         
-        // Force tray menu to fetch fresh data (since lastWorkerBlock is cleared)
+        // Force tray menu to fetch fresh data (since lastUsageBlock is cleared)
         setTimeout(async () => {
           try {
             await updateTrayMenu()

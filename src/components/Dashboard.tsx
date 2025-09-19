@@ -89,8 +89,6 @@ export function Dashboard() {
 
   const [autoRefresh, setAutoRefresh] = useState(false)
   const [autoRefreshInterval, setAutoRefreshInterval] = useState(60) // Align with cache window
-  const [initialLoad, setInitialLoad] = useState(false)
-  const [isInitialLoad, setIsInitialLoad] = useState(true)
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [showUsageDetails, setShowUsageDetails] = useState(false)
   const [isWindowFocused, setIsWindowFocused] = useState(true)
@@ -118,35 +116,31 @@ export function Dashboard() {
     }
   }, [])
 
-  // Load user's plan setting
+  // Start background data loading and user plan loading - both deferred to not block UI
   useEffect(() => {
-    const loadUserPlan = async () => {
-      try {
-        if (!window.electronAPI?.getSettings) {
-          console.warn('Running in development mode - Electron API not available')
-          return
-        }
-        const settings = await window.electronAPI.getSettings()
-        if (settings?.claudePlan) {
-          setUserPlan(settings.claudePlan)
-        }
-      } catch (error) {
-        console.error('Failed to load user plan setting:', error)
-      }
-    }
-    loadUserPlan()
-  }, [])
-
-  // Start background data loading immediately, don't block UI
-  useEffect(() => {
-    // Show UI immediately, load data in background
-    setIsInitialLoad(false)
-    
-    // Start background loading after a brief delay for UI to render
+    // Defer all async operations to ensure UI renders immediately
     const timeoutId = setTimeout(() => {
+      // Load user plan setting in background
+      const loadUserPlan = async () => {
+        try {
+          if (!window.electronAPI?.getSettings) {
+            console.warn('Running in development mode - Electron API not available')
+            return
+          }
+          const settings = await window.electronAPI.getSettings()
+          if (settings?.claudePlan) {
+            setUserPlan(settings.claudePlan)
+          }
+        } catch (error) {
+          console.error('Failed to load user plan setting:', error)
+        }
+      }
+      
+      // Start both operations in parallel
       loadDataInBackground()
       refreshStatus()
-    }, 100)
+      loadUserPlan()
+    }, 50) // Minimal delay to ensure DOM rendering
     
     return () => clearTimeout(timeoutId)
   }, [])
@@ -354,110 +348,124 @@ export function Dashboard() {
 
           {/* Stats Cards */}
           <div className="grid gap-4 md:grid-cols-3">
-        <Card className="glass-card">
-          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Total Cost</CardTitle>
-            <DollarSign className="h-4 w-4 text-muted-foreground" />
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">
-              {formatCurrency(summary.totalCost)}
-            </div>
-            <p className="text-xs text-muted-foreground">Today</p>
-          </CardContent>
-        </Card>
-
-        <Card className="glass-card">
-          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Total Tokens</CardTitle>
-            <Zap className="h-4 w-4 text-muted-foreground" />
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">
-              {formatTokens(summary.totalTokens)}
-            </div>
-            <p className="text-xs text-muted-foreground">Today</p>
-          </CardContent>
-        </Card>
-
-
-        <Card className="glass-card">
-          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">
-              {currentBlock && currentBlock.isActive ? 'Time Remaining' : 'Next Session'}
-            </CardTitle>
-            {currentBlock && currentBlock.isActive ? (
-              <Clock className="h-4 w-4 text-muted-foreground" />
+            {/* Total Cost Card */}
+            {loadingStates.summary ? (
+              <StatCardSkeleton />
             ) : (
-              <Calendar className="h-4 w-4 text-muted-foreground" />
+              <Card className="glass-card">
+                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                  <CardTitle className="text-sm font-medium">Total Cost</CardTitle>
+                  <DollarSign className="h-4 w-4 text-muted-foreground" />
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-bold">
+                    {formatCurrency(summary.totalCost)}
+                  </div>
+                  <p className="text-xs text-muted-foreground">Today</p>
+                </CardContent>
+              </Card>
             )}
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">
-              {currentBlock && currentBlock.isActive ? (
-                formatTimeRemaining(status.timeRemaining)
-              ) : status.nextRenewal ? (
-                (() => {
-                  const now = new Date()
-                  const nextRenewal = new Date(status.nextRenewal)
-                  const diffMs = nextRenewal.getTime() - now.getTime()
-                  const diffMinutes = Math.max(0, Math.floor(diffMs / (1000 * 60)))
-                  
-                  if (diffMinutes < 60) {
-                    return diffMinutes <= 1 ? 'Soon' : `${diffMinutes}m`
-                  } else if (diffMinutes < 24 * 60) {
-                    const hours = Math.floor(diffMinutes / 60)
-                    const mins = diffMinutes % 60
-                    return mins === 0 ? `${hours}h` : `${hours}h ${mins}m`
-                  } else {
-                    const isToday = nextRenewal.toDateString() === now.toDateString()
-                    const isTomorrow = nextRenewal.toDateString() === new Date(now.getTime() + 24 * 60 * 60 * 1000).toDateString()
-                    
-                    if (isToday) {
-                      return nextRenewal.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-                    } else if (isTomorrow) {
-                      return `Tomorrow`
-                    } else {
-                      return nextRenewal.toLocaleDateString([], { month: 'short', day: 'numeric' })
+
+            {/* Total Tokens Card */}
+            {loadingStates.summary ? (
+              <StatCardSkeleton />
+            ) : (
+              <Card className="glass-card">
+                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                  <CardTitle className="text-sm font-medium">Total Tokens</CardTitle>
+                  <Zap className="h-4 w-4 text-muted-foreground" />
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-bold">
+                    {formatTokens(summary.totalTokens)}
+                  </div>
+                  <p className="text-xs text-muted-foreground">Today</p>
+                </CardContent>
+              </Card>
+            )}
+
+            {/* Time Remaining / Next Session Card */}
+            {loadingStates.summary ? (
+              <StatCardSkeleton />
+            ) : (
+              <Card className="glass-card">
+                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                  <CardTitle className="text-sm font-medium">
+                    {currentBlock && currentBlock.isActive ? 'Time Remaining' : 'Next Session'}
+                  </CardTitle>
+                  {currentBlock && currentBlock.isActive ? (
+                    <Clock className="h-4 w-4 text-muted-foreground" />
+                  ) : (
+                    <Calendar className="h-4 w-4 text-muted-foreground" />
+                  )}
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-bold">
+                    {currentBlock && currentBlock.isActive ? (
+                      formatTimeRemaining(status.timeRemaining)
+                    ) : status.nextRenewal ? (
+                      (() => {
+                        const now = new Date()
+                        const nextRenewal = new Date(status.nextRenewal)
+                        const diffMs = nextRenewal.getTime() - now.getTime()
+                        const diffMinutes = Math.max(0, Math.floor(diffMs / (1000 * 60)))
+                        
+                        if (diffMinutes < 60) {
+                          return diffMinutes <= 1 ? 'Soon' : `${diffMinutes}m`
+                        } else if (diffMinutes < 24 * 60) {
+                          const hours = Math.floor(diffMinutes / 60)
+                          const mins = diffMinutes % 60
+                          return mins === 0 ? `${hours}h` : `${hours}h ${mins}m`
+                        } else {
+                          const isToday = nextRenewal.toDateString() === now.toDateString()
+                          const isTomorrow = nextRenewal.toDateString() === new Date(now.getTime() + 24 * 60 * 60 * 1000).toDateString()
+                          
+                          if (isToday) {
+                            return nextRenewal.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                          } else if (isTomorrow) {
+                            return `Tomorrow`
+                          } else {
+                            return nextRenewal.toLocaleDateString([], { month: 'short', day: 'numeric' })
+                          }
+                        }
+                      })()
+                    ) : (
+                      'Unknown'
+                    )}
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {currentBlock && currentBlock.isActive 
+                      ? 'Until next reset' 
+                      : status.nextRenewal 
+                        ? (() => {
+                            const nextRenewal = new Date(status.nextRenewal)
+                            const now = new Date()
+                            const isToday = nextRenewal.toDateString() === now.toDateString()
+                            const isTomorrow = nextRenewal.toDateString() === new Date(now.getTime() + 24 * 60 * 60 * 1000).toDateString()
+                            
+                            if (isToday) {
+                              return `Today at ${nextRenewal.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+                            } else if (isTomorrow) {
+                              return `Tomorrow at ${nextRenewal.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+                            } else {
+                              return nextRenewal.toLocaleDateString([], { 
+                                weekday: 'short', 
+                                month: 'short', 
+                                day: 'numeric',
+                                hour: '2-digit', 
+                                minute: '2-digit' 
+                              })
+                            }
+                          })()
+                        : status.enabled 
+                          ? 'Auto-renewal will start soon'
+                          : 'Enable auto-renewal to schedule'
                     }
-                  }
-                })()
-              ) : (
-                'Unknown'
-              )}
-            </div>
-            <p className="text-xs text-muted-foreground">
-              {currentBlock && currentBlock.isActive 
-                ? 'Until next reset' 
-                : status.nextRenewal 
-                  ? (() => {
-                      const nextRenewal = new Date(status.nextRenewal)
-                      const now = new Date()
-                      const isToday = nextRenewal.toDateString() === now.toDateString()
-                      const isTomorrow = nextRenewal.toDateString() === new Date(now.getTime() + 24 * 60 * 60 * 1000).toDateString()
-                      
-                      if (isToday) {
-                        return `Today at ${nextRenewal.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
-                      } else if (isTomorrow) {
-                        return `Tomorrow at ${nextRenewal.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
-                      } else {
-                        return nextRenewal.toLocaleDateString([], { 
-                          weekday: 'short', 
-                          month: 'short', 
-                          day: 'numeric',
-                          hour: '2-digit', 
-                          minute: '2-digit' 
-                        })
-                      }
-                    })()
-                  : status.enabled 
-                    ? 'Auto-renewal will start soon'
-                    : 'Enable auto-renewal to schedule'
-              }
-            </p>
-          </CardContent>
-        </Card>
-      </div>
+                  </p>
+                </CardContent>
+              </Card>
+            )}
+          </div>
 
       {/* Auto-Renewal Management */}
       <div className="grid gap-6 md:grid-cols-2">
@@ -540,15 +548,19 @@ export function Dashboard() {
           </CardContent>
         </Card>
 
-        <Card className="glass-card">
-          <CardHeader>
-            <CardTitle className="flex items-center space-x-2">
-              <Zap className="h-5 w-5" />
-              <span>Usage Block</span>
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            {currentBlock && currentBlock.isActive ? (
+        {/* Usage Block Card */}
+        {loadingStates.currentBlock ? (
+          <CurrentBlockSkeleton />
+        ) : (
+          <Card className="glass-card">
+            <CardHeader>
+              <CardTitle className="flex items-center space-x-2">
+                <Zap className="h-5 w-5" />
+                <span>Usage Block</span>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {currentBlock && currentBlock.isActive ? (
               <>
                 {/* Usage Progress */}
                 <div className="space-y-2">
@@ -713,93 +725,98 @@ export function Dashboard() {
                   <p className="text-xs text-muted-foreground">Start using Claude to begin a new usage block</p>
                 </div>
               </div>
-            )}
-          </CardContent>
-        </Card>
+              )}
+            </CardContent>
+          </Card>
+        )}
       </div>
 
       {/* Usage Chart */}
-      <Card className="glass-card">
-        <CardHeader>
-          <div className="flex items-center justify-between">
-            <div>
-              <CardTitle className="flex items-center space-x-2">
-                <TrendingUp className="h-5 w-5" />
-                <span>Usage Trends</span>
-              </CardTitle>
-              <CardDescription>Last 7 days activity</CardDescription>
-            </div>
-            <div className="flex items-center space-x-2">
-              <Button
-                variant={chartType === 'area' ? 'default' : 'outline'}
-                size="sm"
-                onClick={() => setChartType('area')}
-              >
-                Area
-              </Button>
-              <Button
-                variant={chartType === 'bar' ? 'default' : 'outline'}
-                size="sm"
-                onClick={() => setChartType('bar')}
-              >
-                Bar
-              </Button>
-            </div>
-          </div>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-4">
+      {loadingStates.chart ? (
+        <ChartSkeleton />
+      ) : (
+        <Card className="glass-card">
+          <CardHeader>
             <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-4">
-                <Button
-                  variant={chartView === 'daily' ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => setChartView('daily')}
-                >
-                  <Calendar className="h-4 w-4 mr-2" />
-                  Daily
-                </Button>
-                <Button
-                  variant={chartView === 'sessions' ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => {
-                    // Debug: sessions series; disabled for performance
-                    setChartView('sessions')
-                  }}
-                >
-                  <MessageCircle className="h-4 w-4 mr-2" />
-                  Sessions ({usageData.sessions?.length || 0})
-                </Button>
+              <div>
+                <CardTitle className="flex items-center space-x-2">
+                  <TrendingUp className="h-5 w-5" />
+                  <span>Usage Trends</span>
+                </CardTitle>
+                <CardDescription>Last 7 days activity</CardDescription>
               </div>
               <div className="flex items-center space-x-2">
                 <Button
-                  variant={chartMetric === 'tokens' ? 'default' : 'outline'}
+                  variant={chartType === 'area' ? 'default' : 'outline'}
                   size="sm"
-                  onClick={() => setChartMetric('tokens')}
+                  onClick={() => setChartType('area')}
                 >
-                  <Zap className="h-4 w-4 mr-2" />
-                  Tokens
+                  Area
                 </Button>
                 <Button
-                  variant={chartMetric === 'cost' ? 'default' : 'outline'}
+                  variant={chartType === 'bar' ? 'default' : 'outline'}
                   size="sm"
-                  onClick={() => setChartMetric('cost')}
+                  onClick={() => setChartType('bar')}
                 >
-                  <DollarSign className="h-4 w-4 mr-2" />
-                  Cost
+                  Bar
                 </Button>
               </div>
             </div>
-            <UsageChart
-              data={chartView === 'daily' ? usageData.daily : (usageData.sessions || [])}
-              height={250}
-              type={chartType}
-              showCost={chartMetric === 'cost'}
-              viewType={chartView}
-            />
-          </div>
-        </CardContent>
-      </Card>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-4">
+                  <Button
+                    variant={chartView === 'daily' ? 'default' : 'outline'}
+                    size="sm"
+                    onClick={() => setChartView('daily')}
+                  >
+                    <Calendar className="h-4 w-4 mr-2" />
+                    Daily
+                  </Button>
+                  <Button
+                    variant={chartView === 'sessions' ? 'default' : 'outline'}
+                    size="sm"
+                    onClick={() => {
+                      // Debug: sessions series; disabled for performance
+                      setChartView('sessions')
+                    }}
+                  >
+                    <MessageCircle className="h-4 w-4 mr-2" />
+                    Sessions ({usageData.sessions?.length || 0})
+                  </Button>
+                </div>
+                <div className="flex items-center space-x-2">
+                  <Button
+                    variant={chartMetric === 'tokens' ? 'default' : 'outline'}
+                    size="sm"
+                    onClick={() => setChartMetric('tokens')}
+                  >
+                    <Zap className="h-4 w-4 mr-2" />
+                    Tokens
+                  </Button>
+                  <Button
+                    variant={chartMetric === 'cost' ? 'default' : 'outline'}
+                    size="sm"
+                    onClick={() => setChartMetric('cost')}
+                  >
+                    <DollarSign className="h-4 w-4 mr-2" />
+                    Cost
+                  </Button>
+                </div>
+              </div>
+              <UsageChart
+                data={chartView === 'daily' ? usageData.daily : (usageData.sessions || [])}
+                height={250}
+                type={chartType}
+                showCost={chartMetric === 'cost'}
+                viewType={chartView}
+              />
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Mode Selection Dialog */}
       <Dialog open={showModeSelection} onOpenChange={setShowModeSelection}>

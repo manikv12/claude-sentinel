@@ -177,31 +177,68 @@ function loadUsageFile(filePath: string, projectName?: string): SentinelUsageEnt
 /**
  * Find all JSONL files in Claude data directories
  */
-function findUsageFiles(dataPaths: string[]): Array<{ path: string; project: string }> {
-  const files: Array<{ path: string; project: string }> = []
-  
+function findUsageFiles(dataPaths: string[]): Array<{ path: string; project: string; mtime: number }> {
+  const files: Array<{ path: string; project: string; mtime: number }> = []
+  const cutoffMs = Date.now() - (7 * 24 * 60 * 60 * 1000) // 7 days
+
   for (const basePath of dataPaths) {
     if (!existsSync(basePath)) continue
-    
+
     try {
       const projects = readdirSync(basePath, { withFileTypes: true })
         .filter(dirent => dirent.isDirectory())
         .map(dirent => dirent.name)
-      
+
       for (const project of projects) {
         const projectPath = join(basePath, project)
         const jsonlFiles = readdirSync(projectPath)
           .filter(file => file.endsWith('.jsonl'))
-          .map(file => ({ path: join(projectPath, file), project }))
-        
+          .map(file => {
+            const fullPath = join(projectPath, file)
+            let mtime = 0
+            try {
+              mtime = statSync(fullPath).mtime.getTime()
+            } catch (statError) {
+              if (DEBUG) {
+                console.warn(`Failed to stat usage file ${fullPath}:`, statError)
+              }
+            }
+            return { path: fullPath, project, mtime }
+          })
+
         files.push(...jsonlFiles)
       }
     } catch (error) {
       console.warn(`Failed to scan directory ${basePath}:`, error)
     }
   }
-  
-  return files
+
+  if (files.length === 0) return []
+
+  const sortedFiles = [...files].sort((a, b) => b.mtime - a.mtime)
+
+  const recentFiles = sortedFiles.filter(file => file.mtime >= cutoffMs)
+  let selected: Array<{ path: string; project: string; mtime: number }>
+
+  if (recentFiles.length > 0) {
+    selected = recentFiles.slice(0, 20)
+  } else {
+    selected = sortedFiles.slice(0, 10)
+  }
+
+  if (selected.length === 0) {
+    selected = files.slice(0, Math.min(files.length, 10))
+  }
+
+  if (DEBUG) {
+    const oldestSelected = selected[selected.length - 1]
+    const oldestLabel = oldestSelected ? new Date(oldestSelected.mtime).toISOString() : 'n/a'
+    console.log(
+      `Sentinel: Filtered usage files - total=${files.length}, recent=${recentFiles.length}, selected=${selected.length}, oldestSelected=${oldestLabel}`
+    )
+  }
+
+  return selected
 }
 
 /**
@@ -551,12 +588,7 @@ function loadIncrementalUpdates(): SentinelUsageEntry[] | null {
   const newEntries: SentinelUsageEntry[] = []
   
   // Sort files by modification time (newest first) to prioritize recent files
-  const sortedFiles = usageFiles
-    .map(fileInfo => ({
-      ...fileInfo,
-      mtime: statSync(fileInfo.path).mtime.getTime()
-    }))
-    .sort((a, b) => b.mtime - a.mtime)
+  const sortedFiles = usageFiles.sort((a, b) => b.mtime - a.mtime)
   
   // Check only the most recent few files for changes
   const filesToCheck = sortedFiles.slice(0, 3) // Check only 3 most recent files
@@ -642,7 +674,9 @@ export async function loadSentinelUsageData(userPlan: string = 'auto'): Promise<
     const entries = loadUsageFile(fileInfo.path, fileInfo.project)
     allEntries.push(...entries)
     // Update modification time tracking
-    fileModTimes.set(fileInfo.path, statSync(fileInfo.path).mtime.getTime())
+    if (fileInfo.mtime) {
+      fileModTimes.set(fileInfo.path, fileInfo.mtime)
+    }
   }
   
   if (DEBUG) console.log(`Sentinel: Full reload - loaded ${allEntries.length} usage entries`)

@@ -105,9 +105,9 @@
     user-select: none;
   }
   body {
-    @apply text-foreground;
+    @apply text-foreground bg-background;
     min-height: 100vh;
-    background: transparent;
+    /* Solid background instead of transparent for immediate visibility */
   }
 }
 
