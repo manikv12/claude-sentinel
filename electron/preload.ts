@@ -103,6 +103,14 @@ const electronAPI = {
     ipcRenderer.on('renewal-check-complete', (_, result) => callback(result))
   },
 
+  onAutoRefreshSettingsChanged: (callback: (settings: { enabled: boolean, interval: number }) => void) => {
+    ipcRenderer.on('auto-refresh-settings-changed', (_, settings) => callback(settings))
+  },
+
+  removeAutoRefreshSettingsListener: (callback: (settings: { enabled: boolean, interval: number }) => void) => {
+    ipcRenderer.removeListener('auto-refresh-settings-changed', (_, settings) => callback(settings))
+  },
+
   // Remove listeners
   removeAllListeners: (channel: string) => {
     ipcRenderer.removeAllListeners(channel)

@@ -745,6 +745,57 @@ const startTrayUsageUpdates = () => {
   }, 120 * 1000) // Increased from 60s to 120s
 }
 
+const updateTrayRefreshInterval = (autoRefreshSettings: { enabled: boolean, interval: number }) => {
+  // Clear existing interval
+  if (trayUsageInterval) {
+    clearInterval(trayUsageInterval)
+    trayUsageInterval = null
+  }
+  
+  // Only start interval if auto-refresh is enabled
+  if (autoRefreshSettings.enabled) {
+    // Use the same interval as the UI components, with minimum of 30s
+    const intervalMs = Math.max(autoRefreshSettings.interval, 30) * 1000
+    
+    trayUsageInterval = setInterval(() => {
+      // Only refresh if not already in flight to prevent overlapping requests
+      if (!usageRefreshInFlight) {
+        scheduleBackgroundRefresh().catch(() => {})
+      }
+    }, intervalMs)
+  }
+}
+
+const initializeTrayRefresh = async () => {
+  try {
+    // Load auto-refresh settings from saved settings
+    const settingsFile = getSettingsFilePath()
+    let autoRefreshSettings = { enabled: false, interval: 30 } // default
+    
+    if (fs.existsSync(settingsFile)) {
+      try {
+        const fileContent = fs.readFileSync(settingsFile, 'utf8')
+        const savedSettings = JSON.parse(fileContent)
+        if (savedSettings.autoRefresh) {
+          autoRefreshSettings = savedSettings.autoRefresh
+        }
+      } catch (error) {
+        console.warn('Could not parse settings for auto-refresh, using defaults:', error)
+      }
+    }
+    
+    // Start with a background refresh to get initial data
+    scheduleBackgroundRefresh().catch(() => {})
+    
+    // Set up tray refresh based on settings
+    updateTrayRefreshInterval(autoRefreshSettings)
+  } catch (error) {
+    console.error('Error initializing tray refresh:', error)
+    // Fallback to default behavior
+    startTrayUsageUpdates()
+  }
+}
+
 const createWindow = () => {
   // Prevent creating multiple windows
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -1052,8 +1103,8 @@ const createTray = () => {
     }, 300)
   })
 
-  // Kick off periodic usage updates for tray title/tooltip
-  startTrayUsageUpdates()
+  // Kick off periodic usage updates for tray title/tooltip based on saved settings
+  initializeTrayRefresh()
 }
 
 // App event handlers
@@ -2699,6 +2750,10 @@ const getDefaultSettings = () => ({
   theme: 'system',
   dataPath: '',
   claudePlan: 'auto',
+  autoRefresh: {
+    enabled: false,
+    interval: 30 // seconds - default to 30s
+  },
   autoRenewal: {
     enabled: false,
     checkInterval: 5,
@@ -2741,6 +2796,10 @@ ipcMain.handle('get-settings', async () => {
         const mergedSettings = {
           ...defaultSettings,
           ...savedSettings,
+          autoRefresh: {
+            ...defaultSettings.autoRefresh,
+            ...(savedSettings.autoRefresh || {})
+          },
           autoRenewal: {
             ...defaultSettings.autoRenewal,
             ...(savedSettings.autoRenewal || {})
@@ -2783,6 +2842,12 @@ ipcMain.handle('save-settings', async (_, settings: any) => {
     // Check if Claude plan changed
     const claudePlanChanged = oldSettings.claudePlan !== settings.claudePlan
     console.log(`Plan change detection: oldPlan='${oldSettings.claudePlan}', newPlan='${settings.claudePlan}', changed=${claudePlanChanged}`)
+    
+    // Check if auto-refresh settings changed
+    const oldAutoRefresh = oldSettings.autoRefresh || { enabled: false, interval: 30 }
+    const newAutoRefresh = settings.autoRefresh || { enabled: false, interval: 30 }
+    const autoRefreshChanged = oldAutoRefresh.enabled !== newAutoRefresh.enabled || oldAutoRefresh.interval !== newAutoRefresh.interval
+    const shouldBroadcast = autoRefreshChanged || newAutoRefresh.enabled
     
     // Save all settings to the main settings file
     try {
@@ -2874,6 +2939,22 @@ ipcMain.handle('save-settings', async (_, settings: any) => {
       } catch (error) {
         console.error('Error triggering hard refresh after plan change:', error)
       }
+    }
+    
+    // If auto-refresh settings changed, broadcast to all windows and update tray interval
+    if (shouldBroadcast) {
+      // Broadcast to main window
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('auto-refresh-settings-changed', newAutoRefresh)
+      }
+      
+      // Broadcast to floating window
+      if (floatingWindow && !floatingWindow.isDestroyed()) {
+        floatingWindow.webContents.send('auto-refresh-settings-changed', newAutoRefresh)
+      }
+      
+      // Update tray refresh interval
+      updateTrayRefreshInterval(newAutoRefresh)
     }
     
     console.log('Settings saved:', settings)

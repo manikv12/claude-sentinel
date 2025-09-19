@@ -88,10 +88,16 @@ export function Dashboard() {
   } = useRenewalStore()
 
   const [autoRefresh, setAutoRefresh] = useState(false)
-  const [autoRefreshInterval, setAutoRefreshInterval] = useState(60) // Align with cache window
+  const [autoRefreshInterval, setAutoRefreshInterval] = useState(30) // Default to 30 seconds
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [showUsageDetails, setShowUsageDetails] = useState(false)
-  const [isWindowFocused, setIsWindowFocused] = useState(true)
+  const [isWindowFocused, setIsWindowFocused] = useState(() => {
+    // Initialize based on actual document focus state
+    if (typeof document !== 'undefined') {
+      return document.hasFocus() && !document.hidden
+    }
+    return true
+  })
   const [userPlan, setUserPlan] = useState<'pro' | 'max-5x' | 'max-20x' | 'auto'>('auto')
   const [chartType, setChartType] = useState<'area' | 'bar'>('area')
   const [chartMetric, setChartMetric] = useState<'tokens' | 'cost'>('tokens')
@@ -102,17 +108,55 @@ export function Dashboard() {
   const [selectedMode, setSelectedMode] = useState<'immediate' | 'scheduled'>('immediate')
   const [scheduledTime, setScheduledTime] = useState('')
 
-  // Track window focus to pause auto-refresh when not visible
+  // Track window focus
   useEffect(() => {
-    const handleFocus = () => setIsWindowFocused(true)
-    const handleBlur = () => setIsWindowFocused(false)
+    const updateFocusState = () => {
+      const focused = document.hasFocus() && !document.hidden
+      setIsWindowFocused(focused)
+    }
+    
+    const handleFocus = () => updateFocusState()
+    const handleBlur = () => updateFocusState()
+    const handleVisibilityChange = () => updateFocusState()
+    
+    // Set initial focus state
+    updateFocusState()
     
     window.addEventListener('focus', handleFocus)
     window.addEventListener('blur', handleBlur)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
     
     return () => {
       window.removeEventListener('focus', handleFocus)
       window.removeEventListener('blur', handleBlur)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
+  }, [])
+
+  // Save auto-refresh settings when they change
+  useEffect(() => {
+    // Skip saving during initial load
+    if (autoRefresh === false && autoRefreshInterval === 30) return
+    
+    saveAutoRefreshSettings(autoRefresh, autoRefreshInterval)
+  }, [autoRefresh, autoRefreshInterval])
+
+  // Listen for auto-refresh settings changes from other windows
+  useEffect(() => {
+    if (!window.electronAPI?.onAutoRefreshSettingsChanged) return
+
+    const handleAutoRefreshChange = (settings: { enabled: boolean, interval: number }) => {
+      setAutoRefresh(settings.enabled)
+      setAutoRefreshInterval(settings.interval)
+    }
+
+    window.electronAPI.onAutoRefreshSettingsChanged(handleAutoRefreshChange)
+    
+    return () => {
+      // Clean up listener if API provides it
+      if (window.electronAPI?.removeAutoRefreshSettingsListener) {
+        window.electronAPI.removeAutoRefreshSettingsListener(handleAutoRefreshChange)
+      }
     }
   }, [])
 
@@ -120,7 +164,7 @@ export function Dashboard() {
   useEffect(() => {
     // Defer all async operations to ensure UI renders immediately
     const timeoutId = setTimeout(() => {
-      // Load user plan setting in background
+      // Load user plan and auto-refresh settings in background
       const loadUserPlan = async () => {
         try {
           if (!window.electronAPI?.getSettings) {
@@ -131,8 +175,14 @@ export function Dashboard() {
           if (settings?.claudePlan) {
             setUserPlan(settings.claudePlan)
           }
+          
+          // Load auto-refresh settings
+          if (settings?.autoRefresh) {
+            setAutoRefresh(settings.autoRefresh.enabled)
+            setAutoRefreshInterval(settings.autoRefresh.interval)
+          }
         } catch (error) {
-          console.error('Failed to load user plan setting:', error)
+          console.error('Failed to load user settings:', error)
         }
       }
       
@@ -145,22 +195,19 @@ export function Dashboard() {
     return () => clearTimeout(timeoutId)
   }, [])
 
-  // Auto-refresh functionality - respects cache window and window focus
+  // Auto-refresh functionality
   useEffect(() => {
-    if (!autoRefresh || isRefreshing || !isWindowFocused) return
+    if (!autoRefresh || isRefreshing) return
 
-    // Increase minimum interval to 120s to reduce CPU usage
-    const effectiveInterval = Math.max(autoRefreshInterval, 120)
+    // Use the user-selected interval with minimum of 30s
+    const effectiveInterval = Math.max(autoRefreshInterval, 30)
     
     const interval = setInterval(() => {
-      // Double-check focus state and visibility before refreshing
-      if (document.hasFocus() && !document.hidden) {
-        handleRefresh()
-      }
+      handleRefresh()
     }, effectiveInterval * 1000)
 
     return () => clearInterval(interval)
-  }, [autoRefresh, autoRefreshInterval, isRefreshing, isWindowFocused])
+  }, [autoRefresh, autoRefreshInterval, isRefreshing])
 
   const handleRefresh = async () => {
     if (isRefreshing) return // Prevent concurrent refreshes
@@ -172,6 +219,32 @@ export function Dashboard() {
       await refreshStatus()
     } finally {
       setIsRefreshing(false)
+    }
+  }
+
+  const saveAutoRefreshSettings = async (enabled: boolean, interval: number) => {
+    try {
+      if (!window.electronAPI?.getSettings || !window.electronAPI?.saveSettings) {
+        console.warn('Running in development mode - Electron API not available')
+        return
+      }
+      
+      // Get current settings
+      const currentSettings = await window.electronAPI.getSettings()
+      
+      // Update auto-refresh settings
+      const updatedSettings = {
+        ...currentSettings,
+        autoRefresh: {
+          enabled,
+          interval
+        }
+      }
+      
+      // Save settings (this will trigger broadcast to other windows)
+      await window.electronAPI.saveSettings(updatedSettings)
+    } catch (error) {
+      console.error('Failed to save auto-refresh settings:', error)
     }
   }
 
@@ -327,9 +400,9 @@ export function Dashboard() {
                     onChange={(e) => setAutoRefreshInterval(parseInt(e.target.value))}
                     className="px-2 py-1 border rounded text-xs bg-background focus:outline-none focus:ring-1 focus:ring-primary"
                   >
+                    <option value={30}>30s</option>
                     <option value={60}>1m</option>
                     <option value={120}>2m</option>
-                    <option value={300}>5m</option>
                   </select>
                 )}
               </div>
