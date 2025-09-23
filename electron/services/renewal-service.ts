@@ -42,7 +42,7 @@ export function loadConfig(): SimpleConfig {
   const defaultConfig: SimpleConfig = {
     enabled: false,
     checkInterval: 5,
-    enableLogging: false
+    enableLogging: false  // Keep as false for less verbose logging
   }
 
   try {
@@ -249,10 +249,10 @@ function acquireLock(): boolean {
         const lockAgeMinutes = (lockAge / 60000).toFixed(1)
         // Additional check: verify if the PID actually exists
         if (lockInfo.pid) {
-          try {
-            process.kill(lockInfo.pid, 0) // Check if process exists
-            renewalLogger.info(`🔒 Lock held by active PID ${lockInfo.pid} (${lockAgeMinutes} min ago)`, 'service')
-            return false // Lock is held by active process
+    try {
+      process.kill(lockInfo.pid, 0) // Check if process exists
+      renewalLogger.debug(`🔒 Lock held by active PID ${lockInfo.pid} (${lockAgeMinutes} min ago)`, 'service')
+      return false // Lock is held by active process
           } catch (e) {
             // Process doesn't exist, remove stale lock
             renewalLogger.warn(`🔓 Removing lock from dead process PID ${lockInfo.pid} (${lockAgeMinutes} min ago)`, 'service')
@@ -276,7 +276,7 @@ function acquireLock(): boolean {
       operation: 'renewal-check'
     }
     writeFileSync(RENEWAL_LOCK_FILE, JSON.stringify(lockInfo))
-    renewalLogger.info(`🔒 Lock acquired by PID ${process.pid}`, 'service')
+    renewalLogger.debug(`🔒 Lock acquired by PID ${process.pid}`, 'service')
     return true
   } catch (error) {
     renewalLogger.error(`Failed to acquire lock: ${error instanceof Error ? error.message : String(error)}`, 'service')
@@ -324,7 +324,7 @@ function recordSuccessfulRenewal() {
       isoTime: new Date().toISOString()
     }
     writeFileSync(LAST_SUCCESSFUL_RENEWAL_FILE, JSON.stringify(renewalData))
-    renewalLogger.info(`Recorded successful renewal at ${renewalData.isoTime}`, 'renewal')
+    renewalLogger.debug(`Recorded successful renewal at ${renewalData.isoTime}`, 'renewal')
   } catch (error) {
     renewalLogger.warn(`Failed to record successful renewal: ${error instanceof Error ? error.message : String(error)}`, 'service')
   }
@@ -351,7 +351,7 @@ function getRandomRenewalDelay(): number {
   const minSeconds = 60   // 1 minute
   const maxSeconds = 120  // 2 minutes
   const randomDelay = Math.floor(Math.random() * (maxSeconds - minSeconds + 1)) + minSeconds
-  renewalLogger.info(`Generated random renewal delay: ${randomDelay}s (${(randomDelay / 60).toFixed(1)} minutes)`, 'renewal')
+  renewalLogger.debug(`Generated random renewal delay: ${randomDelay}s`, 'renewal')
   return randomDelay
 }
 
@@ -473,17 +473,17 @@ export async function performRenewalCheck(): Promise<{ success: boolean; action?
     }
 
     if (!canPerformRenewalCheck()) {
-      renewalLogger.info('⏱️ Rate limiting: renewal check too frequent, skipping', 'renewal')
+      renewalLogger.debug('⏱️ Rate limiting: renewal check too frequent, skipping', 'renewal')
       return { success: true }
     }
 
     if (!acquireLock()) {
-      renewalLogger.info('🔒 Another renewal check in progress, skipping', 'renewal')
+      renewalLogger.debug('🔒 Another renewal check in progress, skipping', 'renewal')
       return { success: true }
     }
 
     try {
-      renewalLogger.info('Starting renewal check...', 'renewal')
+      renewalLogger.debug('Starting renewal check...', 'renewal')
       recordRenewalCheck()
 
       const renewalCheck = canPerformRenewal()
@@ -597,7 +597,7 @@ export async function performRenewalCheck(): Promise<{ success: boolean; action?
             renewalLogger.info(`⏳ WAITING: No block data but session started ${(hoursSinceLastRenewal * 60).toFixed(1)} minutes ago`, 'renewal')
           } else {
             renewalReason = `No block data for ${hoursSinceLastRenewal.toFixed(1)} hours`
-            renewalLogger.info(`✅ TRIGGER: ${renewalReason}`, 'renewal')
+            renewalLogger.debug(`✅ TRIGGER: ${renewalReason}`, 'renewal')
           }
         }
       } else {
@@ -609,10 +609,10 @@ export async function performRenewalCheck(): Promise<{ success: boolean; action?
           renewalLogger.info(`✅ TRIGGER: Block expired (${timeRemainingHours.toFixed(1)} hours remaining, active=${block.isActive})`, 'renewal')
         } else if (!block.isActive) {
           // Block is inactive but still has time remaining (unusual case)
-          renewalLogger.info(`⏳ WAITING: Block inactive but has ${timeRemainingHours.toFixed(1)} hours remaining`, 'renewal')
+          renewalLogger.debug(`⏳ WAITING: Block inactive but has ${timeRemainingHours.toFixed(1)} hours remaining`, 'renewal')
         } else {
           // Block is active and has time remaining
-          renewalLogger.info(`⏳ WAITING: Block still active, ${timeRemainingHours.toFixed(1)} hours remaining`, 'renewal')
+          renewalLogger.debug(`⏳ WAITING: Block still active, ${timeRemainingHours.toFixed(1)} hours remaining`, 'renewal')
         }
       }
 

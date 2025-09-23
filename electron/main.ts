@@ -1330,12 +1330,19 @@ const scheduleNextRenewal = async (): Promise<void> => {
               try { await updateTrayUsage() } catch (trayError) { console.error(trayError) }
             }
 
-            reschedule(2000)
+            // Don't automatically reschedule - let the system naturally detect when next renewal is needed
+            renewalLogger.debug('Scheduled renewal completed - not rescheduling', 'schedule')
           } catch (error) {
             const errorLabel = type === 'overdue'
               ? '❌ Error in overdue scheduled renewal'
               : '❌ Error in late scheduled renewal'
             renewalLogger.error(`${errorLabel}: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+            // Recalculate proper timing on error instead of using fixed delay
+            scheduleNextRenewal().catch(error => {
+              renewalLogger.error(`Error recalculating renewal timing after scheduled error: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+              // Fallback to 2-minute delay if recalculation fails
+              reschedule(120000)
+            })
           }
         }, 1000)
       }
@@ -1344,7 +1351,7 @@ const scheduleNextRenewal = async (): Promise<void> => {
         const totalDelay = scheduledTime.getTime() - now.getTime()
         const actualTriggerTime = new Date(now.getTime() + totalDelay)
 
-        renewalLogger.info(`🕐 SCHEDULED RENEWAL SET: Will trigger at ${actualTriggerTime.toISOString()} (exact scheduled time ${scheduledTime.toISOString()})`, 'schedule')
+        renewalLogger.debug(`🕐 Scheduled renewal set for ${actualTriggerTime.toISOString()}`, 'schedule')
 
         scheduledRenewalTimer = setTimeout(async () => {
           try {
@@ -1359,10 +1366,16 @@ const scheduleNextRenewal = async (): Promise<void> => {
               try { await updateTrayUsage() } catch (trayError) { console.error(trayError) }
             }
 
-            reschedule(2000)
+            // Don't automatically reschedule - let the system naturally detect when next renewal is needed
+            renewalLogger.debug('Scheduled renewal completed - not rescheduling', 'schedule')
           } catch (error) {
             renewalLogger.error(`❌ Error in scheduled renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
-            reschedule(120000) // Increased from 60s to 120s
+            // Recalculate proper timing on error instead of using fixed delay
+            scheduleNextRenewal().catch(error => {
+              renewalLogger.error(`Error recalculating renewal timing after scheduled error: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+              // Fallback to 2-minute delay if recalculation fails
+              reschedule(120000)
+            })
           }
         }, totalDelay)
 
@@ -1388,13 +1401,13 @@ const scheduleNextRenewal = async (): Promise<void> => {
 
     // Only proceed with block-based renewals if auto-renewal is enabled AND no scheduled time
     if (!status.enabled || !status.running) {
-      renewalLogger.info('🔄 Auto-renewal disabled, not scheduling block-based renewals', 'service')
+      renewalLogger.debug('Auto-renewal disabled, not scheduling block-based renewals', 'service')
       return
     }
 
     // If there's a scheduled time, skip all intermediate block-based renewals
     if (status.scheduledStartTime) {
-      renewalLogger.info('📅 Scheduled renewal set - SKIPPING all intermediate block-based renewals', 'service')
+      renewalLogger.debug('Scheduled renewal set - skipping intermediate block-based renewals', 'service')
       return
     }
 
@@ -1420,7 +1433,7 @@ const scheduleNextRenewal = async (): Promise<void> => {
           try {
             renewalLogger.info(`Executing scheduled renewal (${reason})`, 'renewal')
             const result = await performRenewalCheck()
-            
+
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('renewal-status-update', await getRenewalStatus())
             }
@@ -1429,14 +1442,29 @@ const scheduleNextRenewal = async (): Promise<void> => {
               try { await updateTrayUsage() } catch (trayError) { console.error(trayError) }
             }
 
-            reschedule(2000)
+            // Don't automatically reschedule - let the system naturally detect when next renewal is needed
+            // Only reschedule if there's an actual block expiration time to wait for
+            if (result.success && result.action && result.action.includes('queued')) {
+              renewalLogger.debug('Renewal queued successfully - monitoring will resume after session starts', 'schedule')
+              // For queued renewals, wait for session to complete before checking again
+              setTimeout(() => {
+                scheduleNextRenewal().catch(error => {
+                  renewalLogger.error(`Error rescheduling after queued renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+                })
+              }, 300000) // 5 minutes after session starts
+            }
           } catch (error) {
             renewalLogger.error(`Error in scheduled renewal: ${error instanceof Error ? error.message : String(error)}`, 'renewal')
-            reschedule(120000) // Increased from 60s to 120s
+            // Recalculate proper timing on error instead of using fixed delay
+            scheduleNextRenewal().catch(error => {
+              renewalLogger.error(`Error recalculating renewal timing after scheduled error: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+              // Fallback to 2-minute delay if recalculation fails
+              reschedule(120000)
+            })
           }
         }, delay)
 
-        renewalLogger.info(`Next ${reason} at ${targetTime.toISOString()}, renewal scheduled exactly at target time`, 'schedule')
+        renewalLogger.debug(`Next ${reason} scheduled for ${targetTime.toISOString()}`, 'schedule')
       } else {
         renewalLogger.warn(`Target time ${targetTime.toISOString()} is in the past, checking immediately`, 'schedule')
         // Schedule immediate check
@@ -1461,15 +1489,32 @@ const scheduleNextRenewal = async (): Promise<void> => {
             }
             // Only reschedule if the renewal check didn't queue a session
             if (result.success && result.action && result.action.includes('queued')) {
-              renewalLogger.info('Renewal queued successfully - monitoring will resume after session starts', 'schedule')
+              renewalLogger.debug('Renewal queued successfully - monitoring will resume after session starts', 'schedule')
             } else {
-              // If renewal didn't queue a session, try again with longer interval
-              renewalLogger.info('Renewal check completed without queuing session - will retry in 30 seconds', 'schedule')
-              reschedule(30000)
+              // Don't immediately reschedule - let the system naturally detect when next renewal is needed
+              renewalLogger.debug('Renewal check completed without queuing session - not rescheduling', 'schedule')
+              // Only reschedule if there's an actual block expiration time to wait for
+              if (status.currentBlock?.endTime) {
+                const endTime = new Date(status.currentBlock.endTime)
+                const now = new Date()
+                if (endTime > now) {
+                  const delay = endTime.getTime() - now.getTime()
+                  setTimeout(() => {
+                    scheduleNextRenewal().catch(error => {
+                      renewalLogger.error(`Error rescheduling after renewal check: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+                    })
+                  }, delay)
+                }
+              }
             }
           } catch (error) {
             renewalLogger.error(`Error in immediate renewal check: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
-            reschedule(120000) // Increased from 60s to 120s
+            // Recalculate proper timing on error instead of using fixed delay
+            scheduleNextRenewal().catch(error => {
+              renewalLogger.error(`Error recalculating renewal timing after error: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+              // Fallback to 2-minute delay if recalculation fails
+              reschedule(120000)
+            })
           }
         }, 2000) // Small delay to avoid rapid firing
         return
@@ -1498,8 +1543,12 @@ const scheduleNextRenewal = async (): Promise<void> => {
     }
   } catch (error) {
     renewalLogger.error(`Error scheduling next renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
-    // Retry in 1 minute
-    reschedule(60000)
+    // Recalculate proper timing on error instead of using fixed delay
+    scheduleNextRenewal().catch(error => {
+      renewalLogger.error(`Error recalculating renewal timing after error: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+      // Fallback to 1-minute delay if recalculation fails
+      reschedule(60000)
+    })
   }
 }
 

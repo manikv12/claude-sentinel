@@ -327,7 +327,7 @@ export function loadConfig(): RenewalConfig {
   const defaultConfig: RenewalConfig = {
     enabled: false,
     checkInterval: 5,
-    enableLogging: false
+    enableLogging: false  // Keep as false for less verbose logging
   }
   
   try {
@@ -382,7 +382,10 @@ export function saveConfig(config: RenewalConfig): void {
     }
     
     writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2))
-    log(`Configuration saved to both files: enabled=${config.enabled}`)
+    // Only log config changes if logging is enabled and it's an important change
+    if (config.enableLogging) {
+      log(`Configuration saved: enabled=${config.enabled}`, 'info', 'service')
+    }
   } catch (error) {
     log(`Error saving config: ${error}`)
     throw error

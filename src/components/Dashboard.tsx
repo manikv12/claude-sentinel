@@ -582,6 +582,48 @@ export function Dashboard() {
               </div>
             </div>
 
+            {/* Next Renewal Time - Show when auto-renewal is enabled */}
+            {status.enabled && status.nextRenewal && (
+              <div className="p-3 bg-primary/5 border border-primary/10 rounded-lg">
+                <div className="flex items-center space-x-2">
+                  <Clock className="h-4 w-4 text-primary/70" />
+                  <div>
+                    <div className="text-xs text-muted-foreground">Next Renewal</div>
+                    <div className="text-sm font-medium text-primary/80">
+                      {(() => {
+                        const now = new Date()
+                        const nextRenewal = new Date(status.nextRenewal!)
+                        const diffMs = nextRenewal.getTime() - now.getTime()
+                        const diffMinutes = Math.max(0, Math.floor(diffMs / (1000 * 60)))
+
+                        if (diffMinutes < 60) {
+                          return diffMinutes <= 1 ? 'Soon' : `${diffMinutes}m`
+                        } else if (diffMinutes < 24 * 60) {
+                          const hours = Math.floor(diffMinutes / 60)
+                          const mins = diffMinutes % 60
+                          return mins === 0 ? `${hours}h` : `${hours}h ${mins}m`
+                        } else {
+                          const isToday = nextRenewal.toDateString() === now.toDateString()
+                          const isTomorrow = nextRenewal.toDateString() === new Date(now.getTime() + 24 * 60 * 60 * 1000).toDateString()
+
+                          if (isToday) {
+                            return nextRenewal.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                          } else if (isTomorrow) {
+                            return `Tomorrow`
+                          } else {
+                            return nextRenewal.toLocaleDateString([], { month: 'short', day: 'numeric' })
+                          }
+                        }
+                      })()}
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      {status.nextRenewal.toLocaleString()}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* Show scheduled start time if auto-renewal is not active yet */}
             {!status.enabled && (
               <div className="p-3 bg-primary/10 border border-primary/20 rounded-lg">
