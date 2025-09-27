@@ -1,10 +1,8 @@
 import React from 'react'
 import { Button } from './ui/button'
 import { Minimize2, X, Activity } from 'lucide-react'
-import { useRenewalStore } from '@/stores/renewalStore'
 
 export function Header() {
-  const { status } = useRenewalStore()
 
   const handleMinimize = () => {
     window.electronAPI.minimizeToTray()
@@ -18,40 +16,38 @@ export function Header() {
 
   return (
     <header
-      className={`grid grid-cols-3 items-center p-4 glass-header border-b-0 drag-region ${isMac ? 'pl-20 pt-6' : ''}`}
+      className={`relative z-30 flex items-center justify-between h-12 px-4 py-2 glass-header border-b border-white/10 drag-region ${isMac ? 'pl-20' : ''}`}
     >
-      {/* Left spacer to balance right controls for true centering */}
-      <div />
-
-      {/* Centered app branding */}
-      <div className="flex items-center justify-center space-x-2 no-drag">
-        <Activity className="h-5 w-5 text-primary" />
-        <h1 className="text-xl font-semibold">Claude Sentinel</h1>
+      {/* Left spacer for window controls on macOS */}
+      <div className="flex items-center">
+        {isMac && <div className="w-16" />}
       </div>
 
-      {/* Right-side status + window controls */}
-      <div className="flex items-center justify-end space-x-3 no-drag">
-        <div className="flex items-center space-x-2 text-xs text-muted-foreground">
-          <span className={`inline-block h-2.5 w-2.5 rounded-full ${status.enabled ? 'bg-green-500' : 'bg-red-500'}`} />
-          <span>Auto-Renewal</span>
-        </div>
+      {/* Centered app branding - absolutely positioned for perfect centering */}
+      <div className="absolute left-1/2 transform -translate-x-1/2 flex items-center space-x-2 no-drag">
+        <Activity className="h-4 w-4 text-primary" />
+        <h1 className="text-sm font-medium">Claude Sentinel</h1>
+      </div>
+
+      {/* Right-side window controls */}
+      <div className="flex items-center justify-end no-drag">
         {!isMac && (
-          <div className="flex items-center space-x-2">
+          <div className="flex items-center space-x-1">
             <Button
               variant="ghost"
-              size="icon"
+              size="sm"
               onClick={handleMinimize}
-              className="h-8 w-8 glass-button border-0"
+              className="h-7 w-7 p-0 hover:bg-white/10 border-0 opacity-60 hover:opacity-100"
             >
-              <Minimize2 className="h-4 w-4" />
+              <Minimize2 className="h-3.5 w-3.5" />
             </Button>
             <Button
               variant="ghost"
-              size="icon"
+              size="sm"
               onClick={handleClose}
-              className="h-8 w-8 glass-button border-0 hover:bg-destructive/20 hover:text-destructive"
+              className="h-7 w-7 p-0 hover:bg-destructive/20 hover:text-destructive border-0 opacity-60 hover:opacity-100"
             >
-              <X className="h-4 w-4" />
+              <X className="h-3.5 w-3.5" />
             </Button>
           </div>
         )}

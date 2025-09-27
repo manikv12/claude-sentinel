@@ -16,13 +16,56 @@ export function DatePicker({ value, onChange, minDate, className }: DatePickerPr
     value ? new Date(value) : new Date()
   )
   const [selectedTime, setSelectedTime] = useState<string>(
-    value ? new Date(value).toTimeString().slice(0, 5) : '12:00'
+    value ? (() => {
+      const date = new Date(value)
+      const hours = date.getHours()
+      const minutes = date.getMinutes()
+      const hour12 = hours === 0 ? 12 : hours > 12 ? hours - 12 : hours
+      return `${hour12.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`
+    })() : '06:00'
+  )
+  const [selectedAmPm, setSelectedAmPm] = useState<'AM' | 'PM'>(
+    value ? (new Date(value).getHours() >= 12 ? 'PM' : 'AM') : 'AM'
   )
   const [viewDate, setViewDate] = useState<Date>(
     value ? new Date(value) : new Date()
   )
+  const [dropdownPosition, setDropdownPosition] = useState<'left' | 'right'>('left')
   
   const containerRef = useRef<HTMLDivElement>(null)
+
+  // Calculate dropdown position based on available space
+  useEffect(() => {
+    if (isOpen && containerRef.current) {
+      const rect = containerRef.current.getBoundingClientRect()
+      const dropdownWidth = 280 // Reduced from 320 to fit better in modals
+      const spaceToRight = window.innerWidth - rect.right
+      const spaceToLeft = rect.left
+      
+      // Find the closest modal container to respect its boundaries
+      const modalContainer = containerRef.current.closest('[role="dialog"]') || 
+                           containerRef.current.closest('.fixed') ||
+                           containerRef.current.closest('[data-radix-dialog-content]')
+      
+      let availableSpaceToRight = spaceToRight
+      let availableSpaceToLeft = spaceToLeft
+      
+      if (modalContainer) {
+        const modalRect = modalContainer.getBoundingClientRect()
+        availableSpaceToRight = modalRect.right - rect.right
+        availableSpaceToLeft = rect.left - modalRect.left
+      }
+      
+      // In modal contexts, strongly prefer right positioning
+      if (modalContainer) {
+        // Always try right positioning first in modals
+        setDropdownPosition('right')
+      } else {
+        // For dashboard contexts, also use right positioning but with different height
+        setDropdownPosition('right')
+      }
+    }
+  }, [isOpen])
 
   // Close when clicking outside
   useEffect(() => {
@@ -68,22 +111,33 @@ export function DatePicker({ value, onChange, minDate, className }: DatePickerPr
   const handleDateSelect = (day: number) => {
     const newDate = new Date(viewDate.getFullYear(), viewDate.getMonth(), day)
     setSelectedDate(newDate)
-    
-    // Combine date and time
-    const [hours, minutes] = selectedTime.split(':').map(Number)
-    newDate.setHours(hours, minutes, 0, 0)
-    
-    onChange(newDate.toISOString())
+    updateDateTime(selectedTime, selectedAmPm)
   }
 
   const handleTimeChange = (time: string) => {
     setSelectedTime(time)
-    
-    // Combine date and time
+    updateDateTime(time, selectedAmPm)
+  }
+
+  const handleAmPmChange = (ampm: 'AM' | 'PM') => {
+    setSelectedAmPm(ampm)
+    updateDateTime(selectedTime, ampm)
+  }
+
+  const updateDateTime = (time: string, ampm: 'AM' | 'PM') => {
+    // Combine date and time with AM/PM
     const newDate = new Date(selectedDate)
     const [hours, minutes] = time.split(':').map(Number)
-    newDate.setHours(hours, minutes, 0, 0)
-    
+
+    // Convert 12-hour format to 24-hour format
+    let hour24 = hours
+    if (ampm === 'PM' && hours !== 12) {
+      hour24 = hours + 12
+    } else if (ampm === 'AM' && hours === 12) {
+      hour24 = 0
+    }
+
+    newDate.setHours(hour24, minutes, 0, 0)
     onChange(newDate.toISOString())
   }
 
@@ -154,7 +208,18 @@ export function DatePicker({ value, onChange, minDate, className }: DatePickerPr
       </Button>
 
       {isOpen && (
-        <div className="absolute top-1/2 -translate-y-1/2 left-full z-50 ml-2 w-80 bg-white/10 dark:bg-black/10 backdrop-blur-xl border border-white/20 dark:border-white/10 rounded-xl shadow-2xl shadow-black/25">
+        <div className={`absolute z-50 bg-white/10 dark:bg-black/10 backdrop-blur-xl border border-white/20 dark:border-white/10 rounded-xl shadow-2xl shadow-black/25 ${
+          dropdownPosition === 'right' ? 'left-full ml-8' : 'top-full left-0 mt-2'
+        }`} style={{ 
+          width: '280px',
+          ...(dropdownPosition === 'right' && {
+            top: containerRef.current?.closest('[role="dialog"]') || 
+                 containerRef.current?.closest('.fixed') ||
+                 containerRef.current?.closest('[data-radix-dialog-content]') 
+                 ? '-240px' // Position higher for modal contexts
+                 : '-180px' // Position slightly lower for dashboard context
+          })
+        }}>
           <div className="p-4">
             {/* Calendar Header */}
             <div className="flex items-center justify-between mb-4">
@@ -200,12 +265,92 @@ export function DatePicker({ value, onChange, minDate, className }: DatePickerPr
                 <Clock className="h-4 w-4 text-foreground/70" />
                 <label className="text-sm font-medium text-foreground/90">Time</label>
               </div>
-              <input
-                type="time"
-                value={selectedTime}
-                onChange={(e) => handleTimeChange(e.target.value)}
-                className="w-full px-3 py-2 border border-white/30 dark:border-white/20 rounded-lg text-sm bg-white/20 dark:bg-white/10 backdrop-blur-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:bg-white/30 dark:focus:bg-white/20 text-foreground/90 placeholder:text-foreground/50"
-              />
+
+              <div className="flex space-x-2">
+                {/* Hour Selector */}
+                <select
+                  value={selectedTime.split(':')[0]}
+                  onChange={(e) => {
+                    const hour = e.target.value
+                    const minute = selectedTime.split(':')[1] || '00'
+                    const newTime = `${hour}:${minute}`
+                    setSelectedTime(newTime)
+                    updateDateTime(newTime, selectedAmPm)
+                  }}
+                  className="px-3 py-2 border border-white/30 dark:border-white/20 rounded-lg text-sm bg-white/20 dark:bg-white/10 backdrop-blur-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:bg-white/30 dark:focus:bg-white/20 text-foreground/90"
+                >
+                  {Array.from({ length: 12 }, (_, i) => {
+                    const hour = i + 1
+                    return (
+                      <option key={hour} value={hour.toString().padStart(2, '0')}>
+                        {hour}
+                      </option>
+                    )
+                  })}
+                </select>
+
+                {/* Minute Selector */}
+                <select
+                  value={selectedTime.split(':')[1] || '00'}
+                  onChange={(e) => {
+                    const hour = selectedTime.split(':')[0] || '12'
+                    const minute = e.target.value
+                    const newTime = `${hour}:${minute}`
+                    setSelectedTime(newTime)
+                    updateDateTime(newTime, selectedAmPm)
+                  }}
+                  className="px-3 py-2 border border-white/30 dark:border-white/20 rounded-lg text-sm bg-white/20 dark:bg-white/10 backdrop-blur-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:bg-white/30 dark:focus:bg-white/20 text-foreground/90"
+                >
+                  {Array.from({ length: 60 }, (_, i) => {
+                    const minute = i.toString().padStart(2, '0')
+                    return (
+                      <option key={minute} value={minute}>
+                        {minute}
+                      </option>
+                    )
+                  })}
+                </select>
+
+                {/* AM/PM Selector */}
+                <div className="flex border border-white/30 dark:border-white/20 rounded-lg overflow-hidden bg-white/20 dark:bg-white/10 backdrop-blur-sm">
+                  <button
+                    type="button"
+                    onClick={() => handleAmPmChange('AM')}
+                    className={`px-3 py-2 text-xs font-medium transition-all duration-200 ${
+                      selectedAmPm === 'AM'
+                        ? 'bg-blue-500/80 text-white shadow-sm'
+                        : 'text-foreground/70 hover:bg-white/20 dark:hover:bg-white/15'
+                    }`}
+                  >
+                    AM
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleAmPmChange('PM')}
+                    className={`px-3 py-2 text-xs font-medium transition-all duration-200 ${
+                      selectedAmPm === 'PM'
+                        ? 'bg-blue-500/80 text-white shadow-sm'
+                        : 'text-foreground/70 hover:bg-white/20 dark:hover:bg-white/15'
+                    }`}
+                  >
+                    PM
+                  </button>
+                </div>
+              </div>
+
+              {/* Time Preview */}
+              <div className="mt-2 text-xs text-foreground/60">
+                {(() => {
+                  const [hours, minutes] = selectedTime.split(':').map(Number)
+                  let hour24 = hours
+                  if (selectedAmPm === 'PM' && hours !== 12) {
+                    hour24 = hours + 12
+                  } else if (selectedAmPm === 'AM' && hours === 12) {
+                    hour24 = 0
+                  }
+                  return `${hours}:${minutes.toString().padStart(2, '0')} ${selectedAmPm} → ${hour24.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`
+                })()}
+              </div>
             </div>
 
             {/* Action Buttons */}
@@ -220,10 +365,7 @@ export function DatePicker({ value, onChange, minDate, className }: DatePickerPr
               <button
                 type="button"
                 onClick={() => {
-                  const newDate = new Date(selectedDate)
-                  const [hours, minutes] = selectedTime.split(':').map(Number)
-                  newDate.setHours(hours, minutes, 0, 0)
-                  onChange(newDate.toISOString())
+                  updateDateTime(selectedTime, selectedAmPm)
                   setIsOpen(false)
                 }}
                 className="px-4 py-2 rounded-lg bg-blue-500/80 backdrop-blur-sm border border-blue-400/50 hover:bg-blue-500/90 transition-all duration-200 text-sm font-medium text-white shadow-lg"

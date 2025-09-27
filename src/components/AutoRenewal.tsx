@@ -58,15 +58,16 @@ export function AutoRenewal() {
     )
   }
 
-  const { 
-    status, 
-    isLoading, 
+  const {
+    status,
+    isLoading,
     settings,
     toggleAutoRenewal,
     updateSettings,
     setScheduledStartTime,
-    refreshStatus 
+    refreshStatus
   } = storeData
+
   
   const [scheduledTime, setScheduledTime] = useState('')
   const [isInitialLoad, setIsInitialLoad] = useState(true)
@@ -171,9 +172,15 @@ export function AutoRenewal() {
   useEffect(() => {
     if (!settings.autoRefresh) return
 
+    // Use minimum 120s interval to reduce CPU usage and add visibility check
+    const effectiveInterval = Math.max(settings.autoRefreshInterval, 120)
+    
     const interval = setInterval(() => {
-      refreshStatus()
-    }, settings.autoRefreshInterval * 1000)
+      // Only refresh if document is visible
+      if (!document.hidden) {
+        refreshStatus()
+      }
+    }, effectiveInterval * 1000)
 
     return () => clearInterval(interval)
   }, [settings.autoRefresh, settings.autoRefreshInterval, refreshStatus])
@@ -407,10 +414,13 @@ export function AutoRenewal() {
               </div>
             </div>
 
-            {/* Date/Time Picker for Scheduled Mode */}
+            {/* Date/Time Picker for Scheduled Mode - Below the options */}
             {selectedMode === 'scheduled' && (
               <div className="space-y-3 border-l-2 border-primary/20 pl-4 ml-4">
-                <label className="text-sm font-medium">Select start date and time:</label>
+                <label className="text-sm font-medium flex items-center gap-2">
+                  <Calendar className="h-4 w-4" />
+                  Select start date and time:
+                </label>
                 <div className="relative overflow-visible">
                   <DatePicker
                     value={scheduledTime}
@@ -419,6 +429,9 @@ export function AutoRenewal() {
                     className="w-full"
                   />
                 </div>
+                <p className="text-xs text-muted-foreground">
+                  Choose when to begin auto-renewal monitoring
+                </p>
               </div>
             )}
           </div>
@@ -535,61 +548,67 @@ export function AutoRenewal() {
                 <h4 className="font-semibold">When to Start</h4>
               </div>
 
-              <div className="grid gap-4">
-                {/* Start Now Option */}
-                <div className="flex items-center space-x-3 p-3 border rounded-lg hover:bg-secondary/20 transition-colors">
-                  <input
-                    type="radio"
-                    id="start-now"
-                    name="startOption"
-                    checked={!status.scheduledStartTime}
-                    onChange={clearSchedule}
-                    className="w-4 h-4 text-primary"
-                  />
-                  <div className="flex-1">
-                    <label htmlFor="start-now" className="font-medium cursor-pointer flex items-center space-x-2">
-                      <Zap className="h-4 w-4 text-green-500" />
-                      <span>Start Immediately</span>
-                    </label>
-                    <p className="text-sm text-muted-foreground">
-                      Begin monitoring and auto-renewal right away
-                    </p>
+              <div className="flex gap-6">
+                {/* Left side - Mode selection */}
+                <div className="flex-1 space-y-4">
+                  {/* Start Now Option */}
+                  <div className="flex items-center space-x-3 p-3 border rounded-lg hover:bg-secondary/20 transition-colors">
+                    <input
+                      type="radio"
+                      id="start-now"
+                      name="startOption"
+                      checked={!status.scheduledStartTime}
+                      onChange={clearSchedule}
+                      className="w-4 h-4 text-primary"
+                    />
+                    <div className="flex-1">
+                      <label htmlFor="start-now" className="font-medium cursor-pointer flex items-center space-x-2">
+                        <Zap className="h-4 w-4 text-green-500" />
+                        <span>Start Immediately</span>
+                      </label>
+                      <p className="text-sm text-muted-foreground">
+                        Begin monitoring and auto-renewal right away
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Schedule Later Option */}
+                  <div className="flex items-center space-x-3 p-3 border rounded-lg hover:bg-secondary/20 transition-colors">
+                    <input
+                      type="radio"
+                      id="start-scheduled"
+                      name="startOption"
+                      checked={!!status.scheduledStartTime}
+                      onChange={async () => {
+                        if (!status.scheduledStartTime) {
+                          const defaultTime = new Date()
+                          defaultTime.setHours(defaultTime.getHours() + 1, 0, 0, 0)
+                          const timeString = defaultTime.toISOString().slice(0, 16)
+                          setScheduledTime(timeString)
+                          await setScheduledStartTime(defaultTime.toISOString())
+                        }
+                      }}
+                      className="w-4 h-4 text-primary"
+                    />
+                    <div className="flex-1">
+                      <label htmlFor="start-scheduled" className="font-medium cursor-pointer flex items-center space-x-2">
+                        <Timer className="h-4 w-4 text-blue-500" />
+                        <span>Schedule for Later</span>
+                      </label>
+                      <p className="text-sm text-muted-foreground">
+                        Choose a specific date and time to begin auto-renewal
+                      </p>
+                    </div>
                   </div>
                 </div>
 
-                {/* Schedule Later Option */}
-                <div className="flex items-center space-x-3 p-3 border rounded-lg hover:bg-secondary/20 transition-colors">
-                  <input
-                    type="radio"
-                    id="start-scheduled"
-                    name="startOption"
-                    checked={!!status.scheduledStartTime}
-                    onChange={async () => {
-                      if (!status.scheduledStartTime) {
-                        const defaultTime = new Date()
-                        defaultTime.setHours(defaultTime.getHours() + 1, 0, 0, 0)
-                        const timeString = defaultTime.toISOString().slice(0, 16)
-                        setScheduledTime(timeString)
-                        await setScheduledStartTime(defaultTime.toISOString())
-                      }
-                    }}
-                    className="w-4 h-4 text-primary"
-                  />
-                  <div className="flex-1">
-                    <label htmlFor="start-scheduled" className="font-medium cursor-pointer flex items-center space-x-2">
-                      <Timer className="h-4 w-4 text-blue-500" />
-                      <span>Schedule for Later</span>
-                    </label>
-                    <p className="text-sm text-muted-foreground">
-                      Choose a specific date and time to begin auto-renewal
-                    </p>
-                  </div>
-                </div>
-
-                {/* DateTime Picker - Only show when "Schedule for Later" is selected */}
+                {/* Right side - DateTime Picker - Only show when "Schedule for Later" is selected */}
                 {!!status.scheduledStartTime && (
-                  <div className="ml-7 space-y-3">
-                    <label className="text-sm font-medium">Select start date and time:</label>
+                  <div className="flex-1 space-y-3 border-l border-border pl-6">
+                    <label className="text-sm font-medium flex items-center gap-2">
+                      <Calendar className="h-4 w-4" />
+                      Select start date and time:
+                    </label>
                     <div className="flex space-x-2">
                       <DatePicker
                         value={scheduledTime}

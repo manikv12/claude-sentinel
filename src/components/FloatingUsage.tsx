@@ -8,6 +8,7 @@ export function FloatingUsage() {
   const { currentBlock, isLoading, refreshData } = useUsageStore()
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [platform, setPlatform] = useState<string>('win32')
+  const [autoRefreshSettings, setAutoRefreshSettings] = useState({ enabled: false, interval: 30 })
 
   // Toggle between showing remaining %/values and used values when user clicks
   // Use same storage key as Dashboard for consistency
@@ -67,18 +68,59 @@ export function FloatingUsage() {
     }
   }
 
-  // Load data on mount and auto-refresh every 60 seconds
+  // Load auto-refresh settings and initial data
   useEffect(() => {
+    const loadSettings = async () => {
+      try {
+        if (!window.electronAPI?.getSettings) {
+          console.warn('Running in development mode - Electron API not available')
+          return
+        }
+        const settings = await window.electronAPI.getSettings()
+        if (settings?.autoRefresh) {
+          setAutoRefreshSettings(settings.autoRefresh)
+        }
+      } catch (error) {
+        console.error('Failed to load auto-refresh settings:', error)
+      }
+    }
+    
     // Load data immediately when component mounts
     handleRefresh()
+    loadSettings()
+  }, [])
+
+  // Listen for auto-refresh settings changes from other windows
+  useEffect(() => {
+    if (!window.electronAPI?.onAutoRefreshSettingsChanged) return
+
+    const handleAutoRefreshChange = (settings: { enabled: boolean, interval: number }) => {
+      setAutoRefreshSettings(settings)
+    }
+
+    window.electronAPI.onAutoRefreshSettingsChanged(handleAutoRefreshChange)
     
-    // Set up auto-refresh interval
+    return () => {
+      if (window.electronAPI?.removeAutoRefreshSettingsListener) {
+        window.electronAPI.removeAutoRefreshSettingsListener(handleAutoRefreshChange)
+      }
+    }
+  }, [])
+
+  // Auto-refresh based on shared settings
+  useEffect(() => {
+    if (!autoRefreshSettings.enabled) return
+
+    const intervalMs = Math.max(autoRefreshSettings.interval, 30) * 1000
     const interval = setInterval(() => {
-      handleRefresh()
-    }, 60000)
+      // Only refresh if window is focused and visible
+      if (!document.hidden && document.hasFocus()) {
+        handleRefresh()
+      }
+    }, intervalMs)
 
     return () => clearInterval(interval)
-  }, [])
+  }, [autoRefreshSettings])
 
   const handleClose = () => {
     window.electronAPI.hideFloatingWindow()

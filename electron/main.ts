@@ -1,10 +1,13 @@
-import { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, Notification } from 'electron'
+import { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, Notification, dialog, shell } from 'electron'
 import { join } from 'path'
+import { fileURLToPath } from 'url'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
 import { isDev } from './utils'
+
 import { loadUsageData, getRecentUsage, getCurrentBlockInfo, resetUsageCache } from './services/ccusage-service'
+import { normalizeClaudePlan, ClaudePlan } from './services/plan-utils'
 import { 
   getRenewalStatus, 
   startRenewalService, 
@@ -14,13 +17,212 @@ import {
   loadConfig
 } from './services/renewal-service'
 import { renewalLogger } from './services/log-service'
+import { specService } from './services/spec-service'
+
+// Claude plan limits mapping (matches ccusage-integration.ts)
+const PLAN_LIMITS: Record<Exclude<ClaudePlan, 'auto'>, number> = {
+  'pro': 31_000_000,        // 31M tokens (base plan limit)
+  'max-5x': 155_000_000,    // 155M tokens (5x base plan)
+  'max-20x': 620_000_000    // 620M tokens (20x base plan)
+}
 
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'] || 'http://localhost:5173'
 
 let mainWindow: BrowserWindow | null = null
 let floatingWindow: BrowserWindow | null = null
 let tray: Tray | null = null
+// Track when the tray menu is open so we avoid heavy work or menu rebuilds
+let isTrayMenuOpen = false
 let trayUsageInterval: NodeJS.Timeout | null = null
+let usageRefreshInFlight: Promise<UsageRefreshPayload> | null = null
+let queuedHardUsageRefresh = false
+let queuedSoftUsageRefresh = false
+let usageDataReady = false
+let lastUsageBlock: any = null
+let pendingMenuRefreshFromClick = false
+
+type RenewalStatusResult = ReturnType<typeof getRenewalStatus> extends Promise<infer T> ? T : ReturnType<typeof getRenewalStatus>
+
+// Cached renewal status to avoid frequent checks
+let cachedRenewalStatus: RenewalStatusResult | null = null
+let renewalStatusCacheTime: number = 0
+const RENEWAL_CACHE_DURATION = 8 * 60 * 1000 // 8 minutes - increased from 4 to reduce CPU usage
+
+// Check if we need to refresh renewal status based on timing
+const shouldRefreshRenewalStatus = (currentBlock?: any): boolean => {
+  const now = Date.now()
+  
+  // Always refresh if cache is empty or expired
+  if (!cachedRenewalStatus || (now - renewalStatusCacheTime) > RENEWAL_CACHE_DURATION) {
+    return true
+  }
+  
+  // Refresh if renewal is coming up soon (within 5 minutes)
+  if (cachedRenewalStatus.nextRenewal) {
+    const nextRenewalTime = new Date(cachedRenewalStatus.nextRenewal).getTime()
+    const timeUntilRenewal = nextRenewalTime - now
+    if (timeUntilRenewal <= 5 * 60 * 1000) { // 5 minutes
+      return true
+    }
+  }
+  
+  // Refresh if current block is expiring soon (within 5 minutes)
+  if (currentBlock?.endTime) {
+    const blockEndTime = new Date(currentBlock.endTime).getTime()
+    const timeUntilBlockEnd = blockEndTime - now
+    if (timeUntilBlockEnd <= 5 * 60 * 1000) { // 5 minutes
+      return true
+    }
+  }
+  
+  return false
+}
+
+// Get renewal status with caching
+const getCachedRenewalStatus = async (forceRefresh = false): Promise<RenewalStatusResult> => {
+  if (forceRefresh || shouldRefreshRenewalStatus()) {
+    cachedRenewalStatus = await getRenewalStatus()
+    renewalStatusCacheTime = Date.now()
+  }
+  return cachedRenewalStatus!
+}
+
+type RecentUsageResult = Awaited<ReturnType<typeof getRecentUsage>>
+type UsageBlockResult = Awaited<ReturnType<typeof getCurrentBlockInfo>>
+
+interface UsageRefreshPayload {
+  daily: Array<{
+    date: string
+    inputTokens: number
+    outputTokens: number
+    totalTokens: number
+    cost: number
+    model: string
+    sessionsCount: number
+  }>
+  summary: {
+    totalCost: number
+    totalTokens: number
+    totalSessions: number
+    averageTokensPerSession: number
+  }
+  currentBlock: UsageBlockResult
+}
+
+const buildUsagePayload = (recentData: RecentUsageResult, blockInfo: UsageBlockResult): UsageRefreshPayload => ({
+  daily: recentData.daily.map(day => ({
+    date: day.date,
+    inputTokens: day.inputTokens,
+    outputTokens: day.outputTokens,
+    totalTokens: day.totalTokens,
+    cost: day.cost,
+    model: 'mixed',
+    sessionsCount: Array.from(day.blocks || new Set()).length
+  })),
+  summary: {
+    totalCost: recentData.totalCost,
+    totalTokens: recentData.totalTokens,
+    totalSessions: recentData.totalSessions,
+    averageTokensPerSession: recentData.totalSessions > 0 ?
+      recentData.totalTokens / recentData.totalSessions : 0
+  },
+  currentBlock: blockInfo
+})
+
+const broadcastUsagePayload = async (payload: UsageRefreshPayload, source: string) => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('usage-update', payload)
+  }
+  if (floatingWindow && !floatingWindow.isDestroyed()) {
+    floatingWindow.webContents.send('usage-update', payload)
+  }
+
+  lastUsageBlock = payload.currentBlock
+  usageDataReady = true
+
+  try {
+    await updateTrayUsage(payload.currentBlock)
+    if (pendingMenuRefreshFromClick) {
+      pendingMenuRefreshFromClick = false
+      Promise.resolve().then(() => updateTrayMenu()).catch((err) => console.error(err))
+    }
+  } catch (trayError) {
+    console.error('Failed to update tray usage after refresh:', trayError)
+  }
+
+  if (process.env.SENTINEL_DEBUG === '1') {
+    console.log(`[UsageRefresh] Broadcast (${source}) → days=${payload.daily.length}, totalTokens=${payload.summary.totalTokens.toLocaleString()}`)
+  }
+}
+
+const refreshUsageData = async (hard = false, source = 'manual'): Promise<UsageRefreshPayload> => {
+  if (usageRefreshInFlight) {
+    if (hard) {
+      queuedHardUsageRefresh = true
+    } else if (!queuedHardUsageRefresh) {
+      queuedSoftUsageRefresh = true
+    }
+    return usageRefreshInFlight
+  }
+
+  const effectiveHard = hard || queuedHardUsageRefresh
+  queuedHardUsageRefresh = false
+  queuedSoftUsageRefresh = false
+
+  const start = Date.now()
+  if (effectiveHard) {
+    resetUsageCache()
+  }
+
+  const label = effectiveHard ? 'hard' : 'soft'
+  console.log(`[UsageRefresh] Starting ${label} refresh (${source})`)
+
+  usageRefreshInFlight = (async () => {
+    const userPlan = await getUserClaudePlan()
+    const dataStart = Date.now()
+    const recentData = await getRecentUsage(30, userPlan)
+    const loadDuration = Date.now() - dataStart
+    const blockInfo = await getCurrentBlockInfo(userPlan)
+    const payload = buildUsagePayload(recentData, blockInfo)
+    const totalDuration = Date.now() - start
+    console.log(`[UsageRefresh] Completed ${label} refresh (${source}) in ${totalDuration}ms (dataLoad=${loadDuration}ms, daily=${payload.daily.length})`)
+    await broadcastUsagePayload(payload, source)
+    return payload
+  })()
+
+  usageRefreshInFlight.catch((error) => {
+    console.error(`[UsageRefresh] ${label} refresh (${source}) failed:`, error)
+  }).finally(() => {
+    usageRefreshInFlight = null
+    const shouldRequeue = queuedHardUsageRefresh || queuedSoftUsageRefresh
+    const nextHard = queuedHardUsageRefresh
+    if (shouldRequeue) {
+      queuedHardUsageRefresh = false
+      queuedSoftUsageRefresh = false
+      setImmediate(() => {
+        refreshUsageData(nextHard, 'queued').catch((err) => {
+          console.error('[UsageRefresh] Queued refresh failed:', err)
+        })
+      })
+    }
+  })
+
+  return usageRefreshInFlight
+}
+
+const scheduleBackgroundRefresh = async (hard = false) => {
+  return refreshUsageData(hard, hard ? 'background-hard' : 'background')
+}
+
+const requestUsageRefresh = async (hard = false): Promise<{ ok: boolean; data?: UsageRefreshPayload; error?: string }> => {
+  try {
+    const data = await refreshUsageData(hard, hard ? 'hard-request' : 'ipc-request')
+    return { ok: true, data }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return { ok: false, error: message }
+  }
+}
 
 
 // Create a high-quality PNG pulse icon for macOS menu bar
@@ -290,9 +492,10 @@ const formatTokens = (tokens: number) => {
   return tokens.toLocaleString()
 }
 
-const getUsagePercent = () => {
+const getUsagePercent = async () => {
   try {
-    const block = getCurrentBlockInfo()
+    const userPlan = await getUserClaudePlan()
+    const block = await getCurrentBlockInfo(userPlan)
     if (!block || !block.limit || block.limit <= 0) return { percent: null as number | null, block }
     const percent = Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100)))
     return { percent, block }
@@ -301,54 +504,103 @@ const getUsagePercent = () => {
   }
 }
 
-const updateTrayUsage = () => {
-  if (!tray) return
-  const { percent, block } = getUsagePercent()
+const updateTrayUsage = async (blockData?: any) => {
+  if (!tray || tray.isDestroyed()) return
+  
+  let block, percent
+  if (blockData) {
+    // Use data passed from refresh
+    block = blockData
+  } else if (lastUsageBlock) {
+    // Use last cached refresh data
+    block = lastUsageBlock
+  } else {
+    // No block data available
+    block = null
+  }
+  
+  // Apply user's plan override to ensure tooltip matches dashboard
+  if (block) {
+    try {
+      const userPlan = await getUserClaudePlan()
+      if (userPlan && userPlan !== 'auto') {
+        const normalizedPlan = normalizeClaudePlan(userPlan)
+        if (normalizedPlan !== 'auto' && PLAN_LIMITS[normalizedPlan]) {
+          // Override the limit with user's plan setting
+          block = {
+            ...block,
+            limit: PLAN_LIMITS[normalizedPlan]
+          }
+        }
+      }
+    } catch (planError) {
+      console.error('Error applying plan override to tray tooltip:', planError)
+    }
+  }
+  
+  // Calculate percentage only if block is active and has a limit
+  if (block && block.isActive && block.limit > 0) {
+    percent = Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100)))
+  } else {
+    percent = null
+  }
 
   // Use battery icon to show REMAINING tokens (100 - used percentage)
   try {
-    const usedPercentage = percent || 0
-    const remainingPercentage = Math.max(0, 100 - usedPercentage) // Invert to show remaining
+    if (tray && !tray.isDestroyed()) {
+      const usedPercentage = percent || 0
+      const remainingPercentage = Math.max(0, 100 - usedPercentage) // Invert to show remaining
 
-    const batteryIcon = createBatteryIcon({
-      size: 16,
-      percentage: remainingPercentage
-    })
-    tray.setImage(batteryIcon)
-    console.log(`Updated tray battery icon: ${remainingPercentage}% remaining (${usedPercentage}% used)`)
+      const batteryIcon = createBatteryIcon({
+        size: 16,
+        percentage: remainingPercentage
+      })
+      tray.setImage(batteryIcon)
+      if (process.env.SENTINEL_DEBUG === '1') {
+        console.log(`Updated tray battery icon: ${remainingPercentage}% remaining (${usedPercentage}% used)`)
+      }
+    }
   } catch (error) {
     console.warn('Failed to update tray battery icon:', error)
     // Fallback to text if icon fails
     try {
-      tray.setImage(nativeImage.createEmpty())
-      const displayText = percent === null ? '—' : `${100 - percent}%`
-      tray.setTitle(displayText)
-    } catch {}
+      if (tray && !tray.isDestroyed()) {
+        tray.setImage(nativeImage.createEmpty())
+        const displayText = percent === null ? '—' : `${100 - percent}%`
+        tray.setTitle(displayText)
+      }
+    } catch (fallbackError) {
+      console.warn('Failed to update tray fallback:', fallbackError)
+    }
   }
 
   // Clear title since we're using icon
   if (process.platform === 'darwin') {
     try {
-      tray.setTitle('')
-    } catch {}
+      if (tray && !tray.isDestroyed()) {
+        tray.setTitle('')
+      }
+    } catch (titleError) {
+      console.warn('Failed to clear tray title:', titleError)
+    }
   }
 
   // Tooltip with details including next renewal time
   const timeLeft = block?.timeRemaining ?? null
-  const usageText = block ? `${formatTokens(block.usage)} / ${formatTokens(block.limit || 0)} tokens` : 'Usage unavailable'
+  const usageText = (block && block.isActive) 
+    ? `${formatTokens(block.usage)} / ${formatTokens(block.limit || 0)} tokens` 
+    : 'No active session'
   
   // Get next renewal time from the renewal service
   let renewalInfo = ''
+  let renewalStatus: RenewalStatusResult | null = null
   try {
-    const renewalStatus = getRenewalStatus()
+    renewalStatus = await getRenewalStatus()
     if (renewalStatus.enabled) {
       renewalInfo = '\nAuto-renewal: ON'
 
-      // Use the actual next renewal time from the service
       if (renewalStatus.nextRenewal) {
         const nextRenewalTime = new Date(renewalStatus.nextRenewal)
-
-        // Format the time in a readable way
         const timeOptions: Intl.DateTimeFormatOptions = {
           hour: '2-digit',
           minute: '2-digit',
@@ -362,7 +614,7 @@ const updateTrayUsage = () => {
 
         const now = new Date()
         const isToday = nextRenewalTime.toDateString() === now.toDateString()
-        const isTomorrow = nextRenewalTime.toDateString() === new Date(now.getTime() + 24*60*60*1000).toDateString()
+        const isTomorrow = nextRenewalTime.toDateString() === new Date(now.getTime() + 24 * 60 * 60 * 1000).toDateString()
 
         let timeStr
         if (isToday) {
@@ -375,7 +627,6 @@ const updateTrayUsage = () => {
 
         renewalInfo += `\nNext session: ${timeStr}`
       } else if (renewalStatus.timeRemaining) {
-        // If no specific next renewal time, show time remaining in current block
         renewalInfo += `\nTime remaining: ${renewalStatus.timeRemaining}`
       } else {
         renewalInfo += '\nNext session: TBD'
@@ -415,8 +666,7 @@ const updateTrayUsage = () => {
   }
 
   // Add renewal status info
-  try {
-    const renewalStatus = getRenewalStatus()
+  if (renewalStatus) {
     if (renewalStatus.enabled) {
       tooltipLines.push('')
       tooltipLines.push('Auto-renewal: ON')
@@ -425,7 +675,7 @@ const updateTrayUsage = () => {
         const nextRenewalTime = new Date(renewalStatus.nextRenewal)
         const now = new Date()
         const isToday = nextRenewalTime.toDateString() === now.toDateString()
-        const isTomorrow = nextRenewalTime.toDateString() === new Date(now.getTime() + 24*60*60*1000).toDateString()
+        const isTomorrow = nextRenewalTime.toDateString() === new Date(now.getTime() + 24 * 60 * 60 * 1000).toDateString()
 
         const timeOptions: Intl.DateTimeFormatOptions = {
           hour: '2-digit',
@@ -457,24 +707,93 @@ const updateTrayUsage = () => {
       tooltipLines.push('')
       tooltipLines.push('Auto-renewal: OFF')
     }
-  } catch (configError) {
+  } else {
     tooltipLines.push('')
     tooltipLines.push('Auto-renewal: Status unknown')
   }
 
   // Set the tooltip
-  tray.setToolTip(tooltipLines.join('\n'))
+  try {
+    if (tray && !tray.isDestroyed()) {
+      tray.setToolTip(tooltipLines.join('\n'))
+    }
+  } catch (tooltipError) {
+    console.warn('Failed to set tray tooltip:', tooltipError)
+  }
 
   // Refresh tray context menu to reflect latest usage
-  try { updateTrayMenu() } catch {}
+  // Avoid rebuilding the menu while it is open to prevent UI freeze
+  if (!isTrayMenuOpen) {
+    try {
+      await updateTrayMenu()
+    } catch (menuError) {
+      console.error('Failed to update tray menu:', menuError)
+    }
+  }
 }
 
 const startTrayUsageUpdates = () => {
-  // Immediately update once tray exists
-  updateTrayUsage()
-  // Refresh every minute
+  // Kick off a worker refresh so tray receives consistent data
+  scheduleBackgroundRefresh().catch(() => {})
+  // Refresh via worker every 2 minutes to reduce CPU usage
   if (trayUsageInterval) { clearInterval(trayUsageInterval); trayUsageInterval = null }
-  trayUsageInterval = setInterval(updateTrayUsage, 60 * 1000)
+  trayUsageInterval = setInterval(() => {
+    // Only refresh if not already in flight to prevent overlapping requests
+    if (!usageRefreshInFlight) {
+      scheduleBackgroundRefresh().catch(() => {})
+    }
+  }, 120 * 1000) // Increased from 60s to 120s
+}
+
+const updateTrayRefreshInterval = (autoRefreshSettings: { enabled: boolean, interval: number }) => {
+  // Clear existing interval
+  if (trayUsageInterval) {
+    clearInterval(trayUsageInterval)
+    trayUsageInterval = null
+  }
+  
+  // Only start interval if auto-refresh is enabled
+  if (autoRefreshSettings.enabled) {
+    // Use the same interval as the UI components, with minimum of 30s
+    const intervalMs = Math.max(autoRefreshSettings.interval, 30) * 1000
+    
+    trayUsageInterval = setInterval(() => {
+      // Only refresh if not already in flight to prevent overlapping requests
+      if (!usageRefreshInFlight) {
+        scheduleBackgroundRefresh().catch(() => {})
+      }
+    }, intervalMs)
+  }
+}
+
+const initializeTrayRefresh = async () => {
+  try {
+    // Load auto-refresh settings from saved settings
+    const settingsFile = getSettingsFilePath()
+    let autoRefreshSettings = { enabled: false, interval: 30 } // default
+    
+    if (fs.existsSync(settingsFile)) {
+      try {
+        const fileContent = fs.readFileSync(settingsFile, 'utf8')
+        const savedSettings = JSON.parse(fileContent)
+        if (savedSettings.autoRefresh) {
+          autoRefreshSettings = savedSettings.autoRefresh
+        }
+      } catch (error) {
+        console.warn('Could not parse settings for auto-refresh, using defaults:', error)
+      }
+    }
+    
+    // Start with a background refresh to get initial data
+    scheduleBackgroundRefresh().catch(() => {})
+    
+    // Set up tray refresh based on settings
+    updateTrayRefreshInterval(autoRefreshSettings)
+  } catch (error) {
+    console.error('Error initializing tray refresh:', error)
+    // Fallback to default behavior
+    startTrayUsageUpdates()
+  }
 }
 
 const createWindow = () => {
@@ -496,10 +815,16 @@ const createWindow = () => {
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     trafficLightPosition: process.platform === 'darwin' ? { x: 20, y: 10 } : undefined,
     icon: process.platform !== 'darwin' ? createActivityIcon({ size: 256, color: '#3b82f6' }) : undefined,
+    // Show window immediately for faster perceived startup
+    show: true,
     webPreferences: {
       preload: join(__dirname, '../preload/preload.js'),
       nodeIntegration: false,
       contextIsolation: true,
+      // Enable background throttling for better performance
+      backgroundThrottling: true,
+      webgl: false, // Disable WebGL to reduce GPU usage
+      offscreen: false, // Disable offscreen rendering
     },
   })
 
@@ -511,9 +836,19 @@ const createWindow = () => {
   }
 
   // Open DevTools for debugging
-  if (isDev) {
+  if (isDev && mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.openDevTools()
   }
+
+  // Add keyboard shortcut for DevTools (Cmd+Option+I on macOS, F12 on Windows/Linux)
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    if (input.key === 'F12' ||
+        (input.key === 'i' && input.meta && input.alt)) {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.toggleDevTools()
+      }
+    }
+  })
 
   // Handle window close button - hide to menu bar instead of closing
   mainWindow.on('close', (event) => {
@@ -635,6 +970,9 @@ const createFloatingWindow = () => {
       preload: join(__dirname, '../preload/preload.js'),
       nodeIntegration: false,
       contextIsolation: true,
+      backgroundThrottling: true,
+      webgl: false, // Disable WebGL to reduce GPU usage
+      offscreen: false, // Disable offscreen rendering
     },
   })
 
@@ -671,7 +1009,7 @@ const createFloatingWindow = () => {
 }
 
 const createTray = () => {
-  console.log('=== Creating macOS menu bar tray ===')
+  if (process.env.SENTINEL_DEBUG === '1') console.log('=== Creating macOS menu bar tray ===')
 
   // Create initial battery icon at 100% remaining (full battery)
   let trayIcon
@@ -680,13 +1018,13 @@ const createTray = () => {
       size: 16,
       percentage: 100 // Start with full battery (100% tokens remaining)
     })
-    console.log('Created initial full battery icon (100% tokens remaining)')
+  if (process.env.SENTINEL_DEBUG === '1') console.log('Created initial full battery icon (100% tokens remaining)')
   } catch (error) {
     console.error('Failed to create initial battery icon:', error)
     trayIcon = nativeImage.createEmpty()
   }
 
-  console.log('Creating tray...')
+  if (process.env.SENTINEL_DEBUG === '1') console.log('Creating tray...')
   tray = new Tray(trayIcon)
   
   // Verify tray was created successfully
@@ -695,7 +1033,7 @@ const createTray = () => {
     return
   }
   
-  console.log('Tray created successfully')
+  if (process.env.SENTINEL_DEBUG === '1') console.log('Tray created successfully')
   
   const contextMenu = Menu.buildFromTemplate([
     {
@@ -749,39 +1087,63 @@ const createTray = () => {
 
   // Set initial basic tooltip and context menu
   tray.setToolTip('Claude Sentinel - Loading...')
+  // Track open/close to throttle updates while visible
+  contextMenu.on('menu-will-show', () => { isTrayMenuOpen = true })
+  contextMenu.on('menu-will-close', () => { isTrayMenuOpen = false })
   tray.setContextMenu(contextMenu)
 
-  // Handle tray click - show context menu only (no direct app opening)
-  // Note: The context menu will be shown automatically on click, we don't need to handle direct clicks
+  // Handle tray click - keep it light; defer any heavy refresh until after menu closes
+  tray.on('click', () => {
+    // Defer just a bit, but always refresh in background (hard) when clicked
+    setTimeout(() => {
+      try {
+        pendingMenuRefreshFromClick = true
+        scheduleBackgroundRefresh(true)
+      } catch {}
+    }, 300)
+  })
 
-  // Start periodic usage updates for tray title/tooltip
-  startTrayUsageUpdates()
+  // Kick off periodic usage updates for tray title/tooltip based on saved settings
+  initializeTrayRefresh()
 }
 
 // App event handlers
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  // Create window first for fast UI display
   createWindow()
-  createTray()
-  // Ensure Dock icon is explicitly set and shown on macOS
+  
+  // Defer heavy operations to avoid blocking main thread
+  setImmediate(() => {
+    createTray()
+  })
+  
+  
+  // Defer dock icon setup (macOS)
   if (process.platform === 'darwin' && app.dock) {
-    try {
-      const icnsPath = path.join(process.resourcesPath, 'icon.icns')
-      if (fs.existsSync(icnsPath)) {
-        app.dock.setIcon(icnsPath)
-      } else {
-        // Fallback to generated colored icon
-        const dockIcon = createActivityIcon({ size: 256, color: '#3b82f6' })
-        app.dock.setIcon(dockIcon)
+    setTimeout(() => {
+      try {
+        const icnsPath = path.join(process.resourcesPath, 'icon.icns')
+        if (fs.existsSync(icnsPath)) {
+          app.dock.setIcon(icnsPath)
+        } else {
+          // Fallback to generated colored icon
+          const dockIcon = createActivityIcon({ size: 256, color: '#3b82f6' })
+          app.dock.setIcon(dockIcon)
+        }
+        app.dock.show()
+      } catch {
+        // Best-effort; ignore failures
       }
-      app.dock.show()
-    } catch {
-      // Best-effort; ignore failures
-    }
+    }, 50)
   }
-  try {
-    const cfg = loadConfig()
-    if (cfg.enabled) startRenewalMonitoring()
-  } catch {}
+  
+  // Defer renewal monitoring startup
+  setTimeout(() => {
+    try {
+      const cfg = loadConfig()
+      if (cfg.enabled) startRenewalMonitoring()
+    } catch {}
+  }, 200)
 })
 
 app.on('activate', () => {
@@ -793,21 +1155,93 @@ app.on('activate', () => {
   }
 })
 
+// Handle Cmd+Q on macOS properly
+app.on('will-quit', (event) => {
+  console.log('🔄 App will quit - preventing default to run cleanup')
+  // Let the before-quit handler run first
+})
+
+// Ensure app quits when all windows are closed on macOS too (if user forces it)
+app.on('quit', () => {
+  console.log('🔄 App quit event triggered')
+})
+
 app.on('window-all-closed', () => {
-  // Keep app running in menu bar/system tray on all platforms
-  // The app should only quit when explicitly requested from the tray menu
-  return
+  // On macOS, keep app running in system tray unless explicitly quit
+  if (process.platform !== 'darwin') {
+    app.quit()
+  }
+  // On macOS, when all windows are closed, hide the dock icon but keep running in tray
+  else if (process.platform === 'darwin') {
+    try { 
+      if (app.dock) app.dock.hide() 
+    } catch {}
+  }
 })
 
 app.on('before-quit', () => {
+  console.log('🔄 App is quitting - cleaning up background processes...')
+  
   // Clean up tray
   if (tray) {
     tray.destroy()
+    tray = null
   }
+  
+  // Clear all intervals and timers
   if (trayUsageInterval) {
     clearInterval(trayUsageInterval)
     trayUsageInterval = null
   }
+  
+  if (renewalTimer) {
+    clearTimeout(renewalTimer)
+    renewalTimer = null
+  }
+  
+  if (scheduledRenewalTimer) {
+    clearTimeout(scheduledRenewalTimer)
+    scheduledRenewalTimer = null
+  }
+
+  // Stop renewal monitoring and kill any renewal child processes
+  try { 
+    stopRenewalMonitoring() 
+    console.log('✅ Stopped renewal monitoring')
+  } catch (e) {
+    console.warn('⚠️ Failed to stop renewal monitoring:', e)
+  }
+  
+  try {
+    const { killAllRenewalChildren } = require('./services/renewal-service')
+    if (killAllRenewalChildren) {
+      killAllRenewalChildren()
+      console.log('✅ Killed renewal child processes')
+    }
+  } catch (e) {
+    console.warn('⚠️ Failed to kill renewal children:', e)
+  }
+
+  // Close all windows forcefully
+  try {
+    const allWindows = BrowserWindow.getAllWindows()
+    allWindows.forEach(window => {
+      if (!window.isDestroyed()) {
+        window.destroy()
+      }
+    })
+    console.log('✅ Destroyed all windows')
+  } catch (e) {
+    console.warn('⚠️ Failed to destroy windows:', e)
+  }
+
+  // Force kill all remaining processes after cleanup
+  setTimeout(() => {
+    console.log('🔥 Force quitting all processes...')
+    process.exit(0)
+  }, 1000) // Give 1 second for cleanup, then force quit
+
+  console.log('🔄 Background cleanup completed')
 })
 
 
@@ -818,10 +1252,10 @@ let scheduledRenewalTimer: NodeJS.Timeout | null = null
 // Configuration for grace periods
 const RENEWAL_CONFIG = {
   gracePeriod: {
-    min: 30,  // seconds
-    max: 60   // seconds
+    min: 60,  // seconds - increased from 30
+    max: 120  // seconds - increased from 60
   },
-  fallbackCheckInterval: 30 * 60 * 1000, // 30 minutes in ms for emergency fallback only
+  fallbackCheckInterval: 60 * 60 * 1000, // 60 minutes in ms for emergency fallback only - increased from 30
 }
 
 // Helper to add grace period to any time
@@ -834,7 +1268,7 @@ const addGracePeriod = (targetTime: Date) => {
 }
 
 // Smart timer-based renewal scheduling
-const scheduleNextRenewal = () => {
+const scheduleNextRenewal = async (): Promise<void> => {
   // Clear block-based renewal timer
   if (renewalTimer) {
     clearTimeout(renewalTimer)
@@ -843,13 +1277,33 @@ const scheduleNextRenewal = () => {
 
   // Only clear scheduled timer if we're about to set a new one
   // This preserves running scheduled timers when just doing block-based scheduling
-  const status = getRenewalStatus()
+  let status: RenewalStatusResult
+  try {
+    status = await getRenewalStatus()
+  } catch (error) {
+    renewalLogger.error(`Failed to load renewal status for scheduling: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+    setTimeout(() => {
+      scheduleNextRenewal().catch(err => {
+        renewalLogger.error(`Error scheduling next renewal: ${err instanceof Error ? err.message : String(err)}`, 'schedule')
+      })
+    }, 120000) // Increased from 60s to 120s
+    return
+  }
+
   const hasScheduledTime = !!status.scheduledStartTime
 
   if (hasScheduledTime && scheduledRenewalTimer) {
     // There's already a scheduled timer running - clear it to set new one
     clearTimeout(scheduledRenewalTimer)
     scheduledRenewalTimer = null
+  }
+
+  const reschedule = (delay: number) => {
+    setTimeout(() => {
+      scheduleNextRenewal().catch(err => {
+        renewalLogger.error(`Error scheduling next renewal: ${err instanceof Error ? err.message : String(err)}`, 'schedule')
+      })
+    }, delay)
   }
 
   try {
@@ -859,35 +1313,69 @@ const scheduleNextRenewal = () => {
     if (status.scheduledStartTime) {
       const scheduledTime = new Date(status.scheduledStartTime)
 
-      if (scheduledTime > now) {
-        // Add 1-2 minute random delay to scheduled renewals
-        const baseDelay = scheduledTime.getTime() - now.getTime()
-        const randomDelayMs = (60 + Math.random() * 60) * 1000 // 1-2 minutes in milliseconds
-        const totalDelay = baseDelay + randomDelayMs
-        const actualTriggerTime = new Date(now.getTime() + totalDelay)
-
-        renewalLogger.info(`🕐 SCHEDULED RENEWAL SET: Will trigger at ${actualTriggerTime.toISOString()} (scheduled for ${scheduledTime.toISOString()} + ${(randomDelayMs / 60000).toFixed(1)} min delay)`, 'schedule')
-
-        scheduledRenewalTimer = setTimeout(() => {
+      const runScheduledRenewalImmediately = (type: 'late' | 'overdue') => {
+        setTimeout(async () => {
           try {
-            renewalLogger.info(`🚀 EXECUTING SCHEDULED RENEWAL at ${new Date().toISOString()}`, 'schedule')
-            const result = performRenewalCheck()
+            const actionLabel = type === 'overdue'
+              ? '🚀 EXECUTING OVERDUE SCHEDULED RENEWAL'
+              : '🚀 EXECUTING LATE SCHEDULED RENEWAL'
+            renewalLogger.info(actionLabel, 'schedule')
+            const result = await performRenewalCheck()
 
-            // Send status updates
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
+              mainWindow.webContents.send('renewal-status-update', await getRenewalStatus())
             }
             if (result.success && result.action && tray) {
-              updateTrayMenu()
-              updateTrayUsage()
+              try { await updateTrayMenu() } catch (trayError) { console.error(trayError) }
+              try { await updateTrayUsage() } catch (trayError) { console.error(trayError) }
             }
 
-            // Schedule next renewal after scheduled execution
-            setTimeout(() => scheduleNextRenewal(), 2000)
+            // Don't automatically reschedule - let the system naturally detect when next renewal is needed
+            renewalLogger.debug('Scheduled renewal completed - not rescheduling', 'schedule')
+          } catch (error) {
+            const errorLabel = type === 'overdue'
+              ? '❌ Error in overdue scheduled renewal'
+              : '❌ Error in late scheduled renewal'
+            renewalLogger.error(`${errorLabel}: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+            // Recalculate proper timing on error instead of using fixed delay
+            scheduleNextRenewal().catch(error => {
+              renewalLogger.error(`Error recalculating renewal timing after scheduled error: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+              // Fallback to 2-minute delay if recalculation fails
+              reschedule(120000)
+            })
+          }
+        }, 1000)
+      }
+
+      if (scheduledTime > now) {
+        const totalDelay = scheduledTime.getTime() - now.getTime()
+        const actualTriggerTime = new Date(now.getTime() + totalDelay)
+
+        renewalLogger.debug(`🕐 Scheduled renewal set for ${actualTriggerTime.toISOString()}`, 'schedule')
+
+        scheduledRenewalTimer = setTimeout(async () => {
+          try {
+            renewalLogger.info(`🚀 EXECUTING SCHEDULED RENEWAL at ${new Date().toISOString()}`, 'schedule')
+            const result = await performRenewalCheck()
+
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('renewal-status-update', await getRenewalStatus())
+            }
+            if (result.success && result.action && tray) {
+              try { await updateTrayMenu() } catch (trayError) { console.error(trayError) }
+              try { await updateTrayUsage() } catch (trayError) { console.error(trayError) }
+            }
+
+            // Don't automatically reschedule - let the system naturally detect when next renewal is needed
+            renewalLogger.debug('Scheduled renewal completed - not rescheduling', 'schedule')
           } catch (error) {
             renewalLogger.error(`❌ Error in scheduled renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
-            // Retry in 1 minute
-            setTimeout(() => scheduleNextRenewal(), 60000)
+            // Recalculate proper timing on error instead of using fixed delay
+            scheduleNextRenewal().catch(error => {
+              renewalLogger.error(`Error recalculating renewal timing after scheduled error: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+              // Fallback to 2-minute delay if recalculation fails
+              reschedule(120000)
+            })
           }
         }, totalDelay)
 
@@ -899,43 +1387,27 @@ const scheduleNextRenewal = () => {
 
         if (timeSinceScheduled <= fiveMinutesInMs) {
           renewalLogger.info(`⚡ Scheduled time recently passed (${Math.round(timeSinceScheduled / 1000)}s ago), triggering immediate renewal`, 'schedule')
-
-          // Trigger immediate renewal
-          setTimeout(() => {
-            try {
-              renewalLogger.info('🚀 EXECUTING LATE SCHEDULED RENEWAL', 'schedule')
-              const result = performRenewalCheck()
-
-              // Send status updates
-              if (mainWindow && !mainWindow.isDestroyed()) {
-                mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
-              }
-              if (result.success && result.action && tray) {
-                updateTrayMenu()
-                updateTrayUsage()
-              }
-
-              // Schedule next renewal after immediate execution
-              setTimeout(() => scheduleNextRenewal(), 2000)
-            } catch (error) {
-              renewalLogger.error(`❌ Error in late scheduled renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
-            }
-          }, 1000) // Small delay to ensure proper execution
-
+          runScheduledRenewalImmediately('late')
           return // Exit early after scheduling immediate renewal
         }
+
+        // If we miss by more than 5 minutes, fall back to an immediate catch-up renewal
+        const minutesLate = (timeSinceScheduled / 60000).toFixed(1)
+        renewalLogger.warn(`⚠️ Scheduled renewal missed by ${minutesLate} minutes, running immediately`, 'schedule')
+        runScheduledRenewalImmediately('overdue')
+        return
       }
     }
 
     // Only proceed with block-based renewals if auto-renewal is enabled AND no scheduled time
     if (!status.enabled || !status.running) {
-      renewalLogger.info('🔄 Auto-renewal disabled, not scheduling block-based renewals', 'service')
+      renewalLogger.debug('Auto-renewal disabled, not scheduling block-based renewals', 'service')
       return
     }
 
     // If there's a scheduled time, skip all intermediate block-based renewals
     if (status.scheduledStartTime) {
-      renewalLogger.info('📅 Scheduled renewal set - SKIPPING all intermediate block-based renewals', 'service')
+      renewalLogger.debug('Scheduled renewal set - skipping intermediate block-based renewals', 'service')
       return
     }
 
@@ -954,54 +1426,112 @@ const scheduleNextRenewal = () => {
     }
 
     if (targetTime && targetTime > now) {
-      const { renewalTime, gracePeriodSeconds } = addGracePeriod(targetTime)
-      const delay = renewalTime.getTime() - now.getTime()
+      const delay = targetTime.getTime() - now.getTime()
 
       if (delay > 0) {
-        renewalTimer = setTimeout(() => {
+        renewalTimer = setTimeout(async () => {
           try {
             renewalLogger.info(`Executing scheduled renewal (${reason})`, 'renewal')
-            const result = performRenewalCheck()
-            
-            // Send status updates
+            const result = await performRenewalCheck()
+
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
+              mainWindow.webContents.send('renewal-status-update', await getRenewalStatus())
             }
             if (result.success && result.action && tray) {
-              updateTrayMenu()
-              updateTrayUsage()
+              try { await updateTrayMenu() } catch (trayError) { console.error(trayError) }
+              try { await updateTrayUsage() } catch (trayError) { console.error(trayError) }
             }
 
-            // Schedule next renewal
-            setTimeout(() => scheduleNextRenewal(), 2000) // Brief delay before rescheduling
+            // Don't automatically reschedule - let the system naturally detect when next renewal is needed
+            // Only reschedule if there's an actual block expiration time to wait for
+            if (result.success && result.action && result.action.includes('queued')) {
+              renewalLogger.debug('Renewal queued successfully - monitoring will resume after session starts', 'schedule')
+              // For queued renewals, wait for session to complete before checking again
+              setTimeout(() => {
+                scheduleNextRenewal().catch(error => {
+                  renewalLogger.error(`Error rescheduling after queued renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+                })
+              }, 300000) // 5 minutes after session starts
+            }
           } catch (error) {
             renewalLogger.error(`Error in scheduled renewal: ${error instanceof Error ? error.message : String(error)}`, 'renewal')
-            // Retry scheduling in 1 minute
-            renewalTimer = setTimeout(() => scheduleNextRenewal(), 60000)
+            // Recalculate proper timing on error instead of using fixed delay
+            scheduleNextRenewal().catch(error => {
+              renewalLogger.error(`Error recalculating renewal timing after scheduled error: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+              // Fallback to 2-minute delay if recalculation fails
+              reschedule(120000)
+            })
           }
         }, delay)
 
-        renewalLogger.info(`Next ${reason} at ${targetTime.toISOString()}, renewal scheduled for ${renewalTime.toISOString()} (${gracePeriodSeconds}s grace period)`, 'schedule')
+        renewalLogger.debug(`Next ${reason} scheduled for ${targetTime.toISOString()}`, 'schedule')
       } else {
         renewalLogger.warn(`Target time ${targetTime.toISOString()} is in the past, checking immediately`, 'schedule')
         // Schedule immediate check
-        renewalTimer = setTimeout(() => {
-          performRenewalCheck()
-          scheduleNextRenewal()
+        renewalTimer = setTimeout(async () => {
+          await performRenewalCheck()
+          // Don't reschedule immediately - let the renewal check result determine next action
         }, 1000)
       }
     } else {
+      // Check if auto-renewal is enabled but no active block - trigger immediate check
+      if (status.enabled && (!status.currentBlock || !status.currentBlock.startTime)) {
+        renewalLogger.info('⚡ Auto-renewal enabled with no active session - triggering immediate renewal check', 'schedule')
+        renewalTimer = setTimeout(async () => {
+          try {
+            const result = await performRenewalCheck()
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('renewal-status-update', await getRenewalStatus())
+            }
+            if (result.success && result.action && tray) {
+              try { await updateTrayMenu() } catch (trayError) { console.error(trayError) }
+              try { await updateTrayUsage() } catch (trayError) { console.error(trayError) }
+            }
+            // Only reschedule if the renewal check didn't queue a session
+            if (result.success && result.action && result.action.includes('queued')) {
+              renewalLogger.debug('Renewal queued successfully - monitoring will resume after session starts', 'schedule')
+            } else {
+              // Don't immediately reschedule - let the system naturally detect when next renewal is needed
+              renewalLogger.debug('Renewal check completed without queuing session - not rescheduling', 'schedule')
+              // Only reschedule if there's an actual block expiration time to wait for
+              if (status.currentBlock?.endTime) {
+                const endTime = new Date(status.currentBlock.endTime)
+                const now = new Date()
+                if (endTime > now) {
+                  const delay = endTime.getTime() - now.getTime()
+                  setTimeout(() => {
+                    scheduleNextRenewal().catch(error => {
+                      renewalLogger.error(`Error rescheduling after renewal check: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+                    })
+                  }, delay)
+                }
+              }
+            }
+          } catch (error) {
+            renewalLogger.error(`Error in immediate renewal check: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+            // Recalculate proper timing on error instead of using fixed delay
+            scheduleNextRenewal().catch(error => {
+              renewalLogger.error(`Error recalculating renewal timing after error: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+              // Fallback to 2-minute delay if recalculation fails
+              reschedule(120000)
+            })
+          }
+        }, 2000) // Small delay to avoid rapid firing
+        return
+      }
+      
       // No valid target time - only use emergency fallback if system is in unknown state
-      const currentStatus = getRenewalStatus()
+      const currentStatus = await getRenewalStatus()
       if (!currentStatus.currentBlock && currentStatus.enabled && currentStatus.running) {
         renewalLogger.warn(`No current block detected and no renewal time available, using emergency fallback check in ${RENEWAL_CONFIG.fallbackCheckInterval / 60000} minutes`, 'schedule')
-        renewalTimer = setTimeout(() => {
+        renewalTimer = setTimeout(async () => {
           try {
-            performRenewalCheck()
+            await performRenewalCheck()
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
+              mainWindow.webContents.send('renewal-status-update', await getRenewalStatus())
             }
-            scheduleNextRenewal() // Reschedule once to see if we now have valid timing
+            // Don't immediately reschedule to avoid infinite loops
+            // The usage monitoring system will handle rescheduling when block state changes
           } catch (error) {
             renewalLogger.error(`Error in emergency fallback renewal check: ${error instanceof Error ? error.message : String(error)}`, 'renewal')
           }
@@ -1013,10 +1543,55 @@ const scheduleNextRenewal = () => {
     }
   } catch (error) {
     renewalLogger.error(`Error scheduling next renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
-    // Retry in 1 minute
-    renewalTimer = setTimeout(() => scheduleNextRenewal(), 60000)
+    // Recalculate proper timing on error instead of using fixed delay
+    scheduleNextRenewal().catch(error => {
+      renewalLogger.error(`Error recalculating renewal timing after error: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+      // Fallback to 1-minute delay if recalculation fails
+      reschedule(60000)
+    })
   }
 }
+
+// Handle internal events from renewal service
+ipcMain.on('internal-session-started', async () => {
+  try {
+    // Invalidate renewal status cache when session state changes
+    cachedRenewalStatus = null
+    renewalStatusCacheTime = 0
+    
+    renewalLogger.info('🔄 Session started event received - updating UI and tray', 'service')
+    
+    // Force refresh usage data to detect new block
+    const result = await requestUsageRefresh(true)
+    
+    // Update all UI components
+    if (result?.ok && result.data) {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('usage-update', result.data)
+      }
+      if (floatingWindow && !floatingWindow.isDestroyed()) {
+        floatingWindow.webContents.send('usage-update', result.data)
+      }
+      
+      // Update tray with fresh data - let updateTrayMenu() handle plan adjustments
+      try {
+        await updateTrayUsage(result.data.currentBlock)
+        await updateTrayMenu()
+      } catch (trayError) {
+        renewalLogger.error(`Failed to update tray after session start: ${trayError}`, 'service')
+      }
+      
+      renewalLogger.info('✅ UI and tray updated after session start', 'service')
+    }
+    
+    // Send renewal status update
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('renewal-status-update', await getRenewalStatus())
+    }
+  } catch (error) {
+    renewalLogger.error(`Error handling session started event: ${error instanceof Error ? error.message : String(error)}`, 'service')
+  }
+})
 
 // Start renewal monitoring when app starts
 const startRenewalMonitoring = () => {
@@ -1026,7 +1601,9 @@ const startRenewalMonitoring = () => {
   }
 
   renewalLogger.info('Starting timer-based renewal monitoring', 'service')
-  scheduleNextRenewal()
+  scheduleNextRenewal().catch(error => {
+    renewalLogger.error(`Error starting renewal monitoring: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+  })
 }
 
 const stopRenewalMonitoring = () => {
@@ -1055,22 +1632,69 @@ const forceStopAllTimers = () => {
   renewalLogger.info('🛑 ALL timers force-stopped', 'service')
 }
 
-const updateTrayMenu = () => {
-  if (!tray) return
+const updateTrayMenu = async () => {
+  if (!tray || tray.isDestroyed()) return
 
-  const status = getRenewalStatus()
-  const block = getCurrentBlockInfo()
-  const percent = block && block.limit > 0 ? Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100))) : null
-  const usageLine = percent === null ? 'Usage: unknown' : `Usage: ${percent}% (${formatTokens(block.usage)} / ${formatTokens(block.limit)})`
-  const timeLine = `Time remaining: ${formatMinutes(block?.timeRemaining ?? null)}`
+  console.log('Updating tray menu...')
+  
+  // Get the user's manual plan setting and apply it consistently
+  const userPlan = await getUserClaudePlan()
+  // Prefer the freshest block data to keep tray in sync with Dashboard
+  let block = lastUsageBlock ? { ...lastUsageBlock } : await getCurrentBlockInfo(userPlan)
+  
+  // Use cached renewal status unless refresh is needed
+  const status = await getCachedRenewalStatus()
+  if (shouldRefreshRenewalStatus(block)) {
+    console.log('Renewal status check needed for tray menu')
+  }
+  
+  // Apply user's plan override to ensure tray matches dashboard
+  if (block && userPlan && userPlan !== 'auto') {
+    const normalizedPlan = normalizeClaudePlan(userPlan)
+    if (normalizedPlan !== 'auto' && PLAN_LIMITS[normalizedPlan]) {
+      // Override the limit with user's plan setting
+      block = {
+        ...block,
+        limit: PLAN_LIMITS[normalizedPlan]
+      }
+      console.log(`Tray menu: Using manual plan ${userPlan} (${normalizedPlan}) with limit: ${formatTokens(block.limit)}`)
+    } else {
+      console.log('Tray menu: Active block with auto-detected limit:', formatTokens(block.limit))
+    }
+  }
+  
+  // If no active block, show appropriate message
+  if (!block || !block.isActive) {
+    console.log('Tray menu: No active block detected')
+  }
+  
+  const percent = (block && block.isActive && block.limit > 0) 
+    ? Math.max(0, Math.min(100, Math.round((block.usage / block.limit) * 100))) 
+    : null
+    
+  const usageLine = (block && block.isActive) 
+    ? (percent !== null ? `Usage: ${percent}% (${formatTokens(block.usage)} / ${formatTokens(block.limit)})` : 'Usage: calculating...')
+    : 'No active session'
+    
+  const timeLine = (block && block.isActive) 
+    ? `Time remaining: ${formatMinutes(block.timeRemaining ?? null)}`
+    : 'Time remaining: —'
 
   // Get next session time
   let nextSessionLine = null
+  if (process.env.SENTINEL_DEBUG === '1') {
+    console.log(`Tray menu update: status.enabled=${status.enabled}, status.nextRenewal=${status.nextRenewal}`)
+  }
+  
   if (status.enabled && status.nextRenewal) {
     const nextRenewalTime = new Date(status.nextRenewal)
     const now = new Date()
     const isToday = nextRenewalTime.toDateString() === now.toDateString()
     const isTomorrow = nextRenewalTime.toDateString() === new Date(now.getTime() + 24*60*60*1000).toDateString()
+
+    if (process.env.SENTINEL_DEBUG === '1') {
+      console.log(`Next renewal time: ${nextRenewalTime.toISOString()}, isToday: ${isToday}, isTomorrow: ${isTomorrow}`)
+    }
 
     const timeOptions: Intl.DateTimeFormatOptions = {
       hour: '2-digit',
@@ -1088,6 +1712,11 @@ const updateTrayMenu = () => {
         day: 'numeric'
       }
       nextSessionLine = `Next session: ${nextRenewalTime.toLocaleDateString('en-US', dateOptions)} at ${nextRenewalTime.toLocaleTimeString('en-US', timeOptions)}`
+    }
+    if (process.env.SENTINEL_DEBUG === '1') console.log(`Generated next session line: ${nextSessionLine}`)
+  } else {
+    if (process.env.SENTINEL_DEBUG === '1') {
+      console.log(`Next session line not generated: enabled=${status.enabled}, nextRenewal=${status.nextRenewal}`)
     }
   }
 
@@ -1140,21 +1769,37 @@ const updateTrayMenu = () => {
       checked: status.enabled,
       click: async (menuItem) => {
         try {
+          console.log(`Tray auto-renewal toggle clicked: checked=${menuItem.checked}`)
+          
           if (menuItem.checked) {
+            console.log('Starting renewal service from tray...')
             await startRenewalService()
             startRenewalMonitoring()
+            console.log('Renewal service started from tray')
           } else {
+            console.log('Stopping renewal service from tray...')
             await stopRenewalService()
             stopRenewalMonitoring()
+            console.log('Renewal service stopped from tray')
           }
           
           // Notify renderer
           if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
+            try {
+              const latestStatus = await getRenewalStatus()
+              console.log('Sending renewal status update to renderer:', latestStatus)
+              mainWindow.webContents.send('renewal-status-update', latestStatus)
+            } catch (statusError) {
+              console.error(statusError)
+            }
           }
           
           // Update tray menu
-          updateTrayMenu()
+          try {
+            await updateTrayMenu()
+          } catch (menuError) {
+            console.error(menuError)
+          }
         } catch (error) {
           console.error('Error toggling auto-renewal from tray:', error)
         }
@@ -1170,6 +1815,9 @@ const updateTrayMenu = () => {
     }
   ])
   
+  // Track menu open/close to prevent rebuild stalls
+  contextMenu.on('menu-will-show', () => { isTrayMenuOpen = true })
+  contextMenu.on('menu-will-close', () => { isTrayMenuOpen = false })
   tray.setContextMenu(contextMenu)
 }
 
@@ -1180,29 +1828,11 @@ ipcMain.handle('app-version', () => {
 
 ipcMain.handle('get-usage-data', async () => {
   try {
-    const recentData = getRecentUsage(30) // Last 30 days
-    const blockInfo = getCurrentBlockInfo()
+    const userPlan = await getUserClaudePlan()
+    const recentData = await getRecentUsage(30, userPlan) // Last 30 days
+    const blockInfo = await getCurrentBlockInfo(userPlan)
     
-    return {
-      daily: recentData.daily.map(day => ({
-        date: day.date,
-        inputTokens: day.inputTokens,
-        outputTokens: day.outputTokens,
-        totalTokens: day.totalTokens,
-        cost: day.cost,
-        model: 'mixed', // Could be enhanced to show model breakdown
-        // Expose session count for per-day summaries on the dashboard
-        sessionsCount: Array.from(day.sessions).length
-      })),
-      summary: {
-        totalCost: recentData.totalCost,
-        totalTokens: recentData.totalTokens,
-        totalSessions: recentData.totalSessions,
-        averageTokensPerSession: recentData.totalSessions > 0 ? 
-          recentData.totalTokens / recentData.totalSessions : 0
-      },
-      currentBlock: blockInfo
-    }
+    return buildUsagePayload(recentData, blockInfo)
   } catch (error) {
     console.error('Error loading usage data:', error)
     return { 
@@ -1213,9 +1843,27 @@ ipcMain.handle('get-usage-data', async () => {
   }
 })
 
+// Get usage data for specific number of days (for Reports page)
+ipcMain.handle('get-usage-data-range', async (_, days: number = 30) => {
+  try {
+    const userPlan = await getUserClaudePlan()
+    const recentData = await getRecentUsage(days, userPlan)
+    const blockInfo = await getCurrentBlockInfo(userPlan)
+    
+    return buildUsagePayload(recentData, blockInfo)
+  } catch (error) {
+    console.error('Error loading usage data for range:', error)
+    return { 
+      daily: [], 
+      summary: { totalCost: 0, totalTokens: 0, totalSessions: 0, averageTokensPerSession: 0 },
+      currentBlock: null 
+    }
+  }
+})
+
 ipcMain.handle('get-renewal-status', async () => {
   try {
-    return getRenewalStatus()
+    return await getRenewalStatus()
   } catch (error) {
     console.error('Error getting renewal status:', error)
     return { 
@@ -1229,27 +1877,36 @@ ipcMain.handle('get-renewal-status', async () => {
 
 ipcMain.handle('toggle-auto-renewal', async (_, enabled: boolean, scheduledTime?: string) => {
   try {
+    // Invalidate renewal status cache when settings change
+    cachedRenewalStatus = null
+    renewalStatusCacheTime = 0
+    
     let result
     
     if (enabled) {
       result = startRenewalService()
-      if (scheduledTime) setScheduledStartTime(scheduledTime)
+
+      if (scheduledTime) {
+        setScheduledStartTime(scheduledTime)
+      } else {
+        // Clear any lingering schedule when user requests immediate start
+        setScheduledStartTime(null)
+      }
       if (result.success) {
         startRenewalMonitoring()
         
         // When auto-renewal is first turned on, perform immediate check with random delay
         // This ensures we start a session if needed without waiting for the next scheduled check
         renewalLogger.info('🚀 AUTO-RENEWAL ENABLED: Performing immediate renewal check with delay', 'service')
-        setTimeout(() => {
+        setTimeout(async () => {
           try {
-            const renewalResult = performRenewalCheck()
+            const renewalResult = await performRenewalCheck()
             if (renewalResult.success && renewalResult.action) {
               renewalLogger.info(`✅ Initial renewal check completed: ${renewalResult.action}`, 'service')
             }
             
-            // Update status after initial check
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
+              mainWindow.webContents.send('renewal-status-update', await getRenewalStatus())
             }
           } catch (error) {
             renewalLogger.error(`❌ Error in initial renewal check: ${error instanceof Error ? error.message : String(error)}`, 'service')
@@ -1264,7 +1921,11 @@ ipcMain.handle('toggle-auto-renewal', async (_, enabled: boolean, scheduledTime?
     }
     
     // Update tray menu
-    updateTrayMenu()
+    try {
+      await updateTrayMenu()
+    } catch (menuError) {
+      console.error(menuError)
+    }
     
     return { success: result.success, enabled, error: result.error }
   } catch (error) {
@@ -1279,13 +1940,21 @@ ipcMain.handle('toggle-auto-renewal', async (_, enabled: boolean, scheduledTime?
 
 ipcMain.handle('set-scheduled-start-time', async (_, isoTime: string | null) => {
   try {
+    // Invalidate renewal status cache when scheduled time changes
+    cachedRenewalStatus = null
+    renewalStatusCacheTime = 0
+    
     const result = setScheduledStartTime(isoTime)
     if (result.success) {
-      // Reschedule with new time
-      const status = getRenewalStatus()
-      if (status.enabled && status.running) {
-        renewalLogger.info('Scheduled time changed, rescheduling renewal', 'schedule')
-        scheduleNextRenewal()
+      // Only reschedule if absolutely necessary and no immediate renewal is queued
+      const status = await getCachedRenewalStatus(true) // Force refresh
+      if (status.enabled && status.running && !status.nextRenewal) {
+        renewalLogger.info('Scheduled time changed and no renewal queued, rescheduling', 'schedule')
+        scheduleNextRenewal().catch(error => {
+          renewalLogger.error(`Error rescheduling renewal: ${error instanceof Error ? error.message : String(error)}`, 'schedule')
+        })
+      } else {
+        renewalLogger.info('Scheduled time changed but renewal already active/queued, not rescheduling', 'schedule')
       }
     }
     return result
@@ -1331,38 +2000,9 @@ ipcMain.handle('minimize-to-tray', async () => {
 
 ipcMain.handle('refresh-usage-data', async () => {
   try {
-    const recentData = getRecentUsage(30) // Last 30 days
-    const blockInfo = getCurrentBlockInfo()
-    
-    const data = {
-      daily: recentData.daily.map(day => ({
-        date: day.date,
-        inputTokens: day.inputTokens,
-        outputTokens: day.outputTokens,
-        totalTokens: day.totalTokens,
-        cost: day.cost,
-        model: 'mixed', // Could be enhanced to show model breakdown
-        sessionsCount: Array.from(day.sessions).length
-      })),
-      summary: {
-        totalCost: recentData.totalCost,
-        totalTokens: recentData.totalTokens,
-        totalSessions: recentData.totalSessions,
-        averageTokensPerSession: recentData.totalSessions > 0 ? 
-          recentData.totalTokens / recentData.totalSessions : 0
-      },
-      currentBlock: blockInfo
-    }
-    
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('usage-update', data)
-    }
-    if (floatingWindow && !floatingWindow.isDestroyed()) {
-      floatingWindow.webContents.send('usage-update', data)
-    }
-    // Update tray usage immediately
-    updateTrayUsage()
-    return data
+    const result = await requestUsageRefresh(false)
+    if (result?.ok && result.data) return result.data
+    throw new Error(result?.error || 'Usage refresh failed')
   } catch (error) {
     console.error('Error refreshing usage data:', error)
     throw error
@@ -1372,44 +2012,41 @@ ipcMain.handle('refresh-usage-data', async () => {
 // Force reset usage cache and perform a fresh usage read (hard refresh)
 ipcMain.handle('hard-refresh-usage-data', async () => {
   try {
-    // Reset analysis/cache so next read hits disk
-    resetUsageCache()
-
-    // Small delay to allow filesystem writes to settle when called after imports
-    await new Promise((r) => setTimeout(r, 200))
-
-    const recentData = getRecentUsage(30)
-    const blockInfo = getCurrentBlockInfo()
-
-    const data = {
-      daily: recentData.daily.map(day => ({
-        date: day.date,
-        inputTokens: day.inputTokens,
-        outputTokens: day.outputTokens,
-        totalTokens: day.totalTokens,
-        cost: day.cost,
-        model: 'mixed',
-        sessionsCount: Array.from(day.sessions).length
-      })),
-      summary: {
-        totalCost: recentData.totalCost,
-        totalTokens: recentData.totalTokens,
-        totalSessions: recentData.totalSessions,
-        averageTokensPerSession: recentData.totalSessions > 0 ?
-          recentData.totalTokens / recentData.totalSessions : 0
-      },
-      currentBlock: blockInfo
-    }
-
+    // First, immediately send any cached data to show something quickly
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('usage-update', data)
+      try {
+        const userPlan = await getUserClaudePlan()
+        const cachedData = await getRecentUsage(30, userPlan) // Use cached data first
+        const cachedBlockInfo = await getCurrentBlockInfo(userPlan)
+        const cachedPayload = buildUsagePayload(cachedData, cachedBlockInfo)
+        
+        // Send cached data immediately as a "partial update"
+        mainWindow.webContents.send('usage-partial-update', {
+          ...cachedPayload,
+          isPartial: true,
+          source: 'cache'
+        })
+        console.log('📦 Sent cached data for immediate display')
+      } catch (cacheError) {
+        console.warn('Could not load cached data for quick display:', cacheError)
+      }
     }
-    if (floatingWindow && !floatingWindow.isDestroyed()) {
-      floatingWindow.webContents.send('usage-update', data)
+
+    // Now perform the full refresh
+    const result = await requestUsageRefresh(true)
+    if (result?.ok && result.data) {
+      // Send the fresh data as final update
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('usage-update', {
+          ...result.data,
+          isPartial: false,
+          source: 'fresh'
+        })
+        console.log('✅ Sent fresh data as final update')
+      }
+      return result.data
     }
-    // Update tray usage immediately
-    updateTrayUsage()
-    return data
+    return { success: false, error: result?.error || 'Usage hard-refresh failed' }
   } catch (error) {
     console.error('Error performing hard refresh:', error)
     return { success: false }
@@ -1419,26 +2056,21 @@ ipcMain.handle('hard-refresh-usage-data', async () => {
 ipcMain.handle('perform-renewal-check', async () => {
   try {
     // Return immediately to avoid blocking the UI
-    setImmediate(() => {
+    setImmediate(async () => {
       try {
-        const result = performRenewalCheck()
+        const result = await performRenewalCheck()
         
-        // Send status update to renderer after check completes
         if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('renewal-status-update', getRenewalStatus())
+          mainWindow.webContents.send('renewal-status-update', await getRenewalStatus())
         }
         
-        // Update tray menu if needed
         if (result.success && result.action && tray) {
-          updateTrayMenu()
-          updateTrayUsage()
+          try { await updateTrayMenu() } catch (trayError) { console.error(trayError) }
+          try { await updateTrayUsage() } catch (trayError) { console.error(trayError) }
         }
         
-        // Reschedule next renewal after manual check (in case block state changed)
-        const status = getRenewalStatus()
-        if (status.enabled && status.running) {
-          setTimeout(() => scheduleNextRenewal(), 2000)
-        }
+        // Don't reschedule after manual renewal checks to avoid timer conflicts
+        // The automatic renewal monitoring will handle scheduling properly
       } catch (error) {
         console.error('Error in manual renewal check:', error)
       }
@@ -1850,9 +2482,9 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
           .filter((name: string) => name.startsWith('-Users-'))
           .map((name: string) => {
             const match = name.match(/^(-Users-[^-]+-)/)
-            return match ? match[1] : null
+            return (match ? match[1] : null) as string | null
           })
-          .filter((pattern): pattern is string => Boolean(pattern))
+          .filter((pattern: string | null): pattern is string => Boolean(pattern))
         
         if (userPatterns.length > 0) {
           const currentPattern = userPatterns[0]
@@ -2087,11 +2719,12 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
 
     // Trigger usage cache rebuild by resetting cache then pushing updated usage
     try {
-      const { resetUsageCache } = require('../src/lib/ccusage-integration')
+      const { resetUsageCache } = require('./services/ccusage-integration')
       resetUsageCache()
-      setTimeout(() => {
+      setTimeout(async () => {
         try {
-          const data = getRecentUsage(30)
+          const userPlan = await getUserClaudePlan()
+          const data = await getRecentUsage(30, userPlan)
           const usageUpdateData = {
             daily: data.daily.map(day => ({
               date: day.date,
@@ -2100,7 +2733,7 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
               totalTokens: day.totalTokens,
               cost: day.cost,
               model: 'mixed',
-              sessionsCount: Array.from(day.sessions).length
+              sessionsCount: Array.from(day.blocks || new Set()).length
             })),
             summary: {
               totalCost: data.totalCost,
@@ -2108,7 +2741,7 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
               totalSessions: data.totalSessions,
               averageTokensPerSession: data.totalSessions > 0 ? data.totalTokens / data.totalSessions : 0
             },
-            currentBlock: getCurrentBlockInfo()
+            currentBlock: await getCurrentBlockInfo(userPlan)
           }
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('usage-update', usageUpdateData)
@@ -2155,7 +2788,7 @@ ipcMain.handle('import-claude-usage-logs', async (_, options: { mergeMode?: bool
 })
 
 // Settings management
-const getSettingsFilePath = () => path.join(os.homedir(), '.claude-sentinel-settings.json')
+const getSettingsFilePath = () => path.join(app.getPath('userData'), 'settings.json')
 
 const getDefaultSettings = () => ({
   autoStart: false,
@@ -2166,14 +2799,36 @@ const getDefaultSettings = () => ({
   theme: 'system',
   dataPath: '',
   claudePlan: 'auto',
+  autoRefresh: {
+    enabled: false,
+    interval: 30 // seconds - default to 30s
+  },
   autoRenewal: {
     enabled: false,
     checkInterval: 5,
-    enableLogging: true,
+    enableLogging: false,
     notifyOnRenewal: true,
     waitTimeBeforeSession: 60
   }
 })
+
+// Helper function to get user's Claude plan from settings
+async function getUserClaudePlan(): Promise<string> {
+  try {
+    const settingsFile = getSettingsFilePath()
+    
+    if (fs.existsSync(settingsFile)) {
+      const fileContent = fs.readFileSync(settingsFile, 'utf8')
+      const savedSettings = JSON.parse(fileContent)
+      return normalizeClaudePlan(savedSettings.claudePlan)
+    }
+
+    return 'auto'
+  } catch (error) {
+    console.warn('Failed to get Claude plan from settings:', error)
+    return 'auto'
+  }
+}
 
 ipcMain.handle('get-settings', async () => {
   try {
@@ -2190,6 +2845,10 @@ ipcMain.handle('get-settings', async () => {
         const mergedSettings = {
           ...defaultSettings,
           ...savedSettings,
+          autoRefresh: {
+            ...defaultSettings.autoRefresh,
+            ...(savedSettings.autoRefresh || {})
+          },
           autoRenewal: {
             ...defaultSettings.autoRenewal,
             ...(savedSettings.autoRenewal || {})
@@ -2213,9 +2872,33 @@ ipcMain.handle('get-settings', async () => {
 
 ipcMain.handle('save-settings', async (_, settings: any) => {
   try {
-    // Save all settings to the main settings file
+    // Load existing settings to compare Claude plan
+    let oldSettings: any = {}
     const settingsFile = getSettingsFilePath()
     
+    try {
+      console.log(`Loading existing settings from: ${settingsFile}`)
+      if (fs.existsSync(settingsFile)) {
+        oldSettings = JSON.parse(fs.readFileSync(settingsFile, 'utf8'))
+        console.log(`Loaded existing settings:`, oldSettings)
+      } else {
+        console.log(`Settings file does not exist yet: ${settingsFile}`)
+      }
+    } catch (error) {
+      console.warn('Could not load existing settings for comparison:', error)
+    }
+    
+    // Check if Claude plan changed
+    const claudePlanChanged = oldSettings.claudePlan !== settings.claudePlan
+    console.log(`Plan change detection: oldPlan='${oldSettings.claudePlan}', newPlan='${settings.claudePlan}', changed=${claudePlanChanged}`)
+    
+    // Check if auto-refresh settings changed
+    const oldAutoRefresh = oldSettings.autoRefresh || { enabled: false, interval: 30 }
+    const newAutoRefresh = settings.autoRefresh || { enabled: false, interval: 30 }
+    const autoRefreshChanged = oldAutoRefresh.enabled !== newAutoRefresh.enabled || oldAutoRefresh.interval !== newAutoRefresh.interval
+    const shouldBroadcast = autoRefreshChanged || newAutoRefresh.enabled
+    
+    // Save all settings to the main settings file
     try {
       fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2))
       console.log('Settings saved to:', settingsFile)
@@ -2250,6 +2933,77 @@ ipcMain.handle('save-settings', async (_, settings: any) => {
       
       fs.writeFileSync(configFile, JSON.stringify(currentConfig, null, 2))
       renewalLogger.info(`Settings saved: checkInterval=${currentConfig.checkInterval}min, enableLogging=${currentConfig.enableLogging}`, 'service')
+    }
+    
+    // If Claude plan changed, trigger hard refresh to apply new limits immediately
+    if (claudePlanChanged) {
+      console.log(`Claude plan changed from '${oldSettings.claudePlan || 'auto'}' to '${settings.claudePlan}' - triggering hard refresh`)
+      
+      try {
+        // Reset cache and clear cached usage data
+        resetUsageCache()
+        lastUsageBlock = null // Clear cached data to force fresh data
+        
+        // Force tray menu to fetch fresh data (since lastUsageBlock is cleared)
+        setTimeout(async () => {
+          try {
+            await updateTrayMenu()
+          } catch (error) {
+            console.error('Error updating tray menu after plan change:', error)
+          }
+        }, 50) // Very short delay to allow settings to be fully saved
+        
+        // Trigger hard refresh with new plan
+        setTimeout(async () => {
+          try {
+            const result = await requestUsageRefresh(true)
+            
+            // Send updated usage data to all renderer windows
+            if (result?.ok && result.data) {
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('usage-update', result.data)
+              }
+              if (floatingWindow && !floatingWindow.isDestroyed()) {
+                floatingWindow.webContents.send('usage-update', result.data)
+              }
+            }
+            
+            // Update tray with new limits after refresh completes
+            // Add small delay to ensure new data is processed
+            setTimeout(() => {
+              // Force tray to use fresh data from worker instead of cached data
+              if (result?.ok && result.data?.currentBlock) {
+                updateTrayUsage(result.data.currentBlock)
+              } else {
+                updateTrayUsage()
+              }
+              updateTrayMenu()
+            }, 200)
+            
+          } catch (error) {
+            console.error('Error during automatic hard refresh after plan change:', error)
+          }
+        }, 100) // Small delay to ensure settings are fully saved
+        
+      } catch (error) {
+        console.error('Error triggering hard refresh after plan change:', error)
+      }
+    }
+    
+    // If auto-refresh settings changed, broadcast to all windows and update tray interval
+    if (shouldBroadcast) {
+      // Broadcast to main window
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('auto-refresh-settings-changed', newAutoRefresh)
+      }
+      
+      // Broadcast to floating window
+      if (floatingWindow && !floatingWindow.isDestroyed()) {
+        floatingWindow.webContents.send('auto-refresh-settings-changed', newAutoRefresh)
+      }
+      
+      // Update tray refresh interval
+      updateTrayRefreshInterval(newAutoRefresh)
     }
     
     console.log('Settings saved:', settings)
@@ -2298,7 +3052,7 @@ ipcMain.handle('show-notification', async (_, message: string) => {
 // Session status and management IPC handlers
 ipcMain.handle('get-session-status', async () => {
   try {
-    const { getSessionStatus } = await import('../src/lib/auto-renewal-integration')
+    const { getSessionStatus } = await import('./services/auto-renewal-integration')
     return getSessionStatus()
   } catch (error) {
     console.error('Error getting session status:', error)
@@ -2308,12 +3062,12 @@ ipcMain.handle('get-session-status', async () => {
 
 ipcMain.handle('force-start-new-session', async () => {
   try {
-    const { forceStartNewSession } = await import('../src/lib/auto-renewal-integration')
+    const { forceStartNewSession } = await import('./services/auto-renewal-integration')
     const result = forceStartNewSession()
     
     // Send status update to renderer after forcing new session
     if (mainWindow && !mainWindow.isDestroyed()) {
-      const { getSessionStatus } = await import('../src/lib/auto-renewal-integration')
+      const { getSessionStatus } = await import('./services/auto-renewal-integration')
       mainWindow.webContents.send('session-status-update', getSessionStatus())
     }
     
@@ -2327,7 +3081,7 @@ ipcMain.handle('force-start-new-session', async () => {
 // Block tracking IPC handlers
 ipcMain.handle('get-block-events', async (_, hours: number = 24) => {
   try {
-    const { getRecentBlockEvents } = await import('../src/lib/block-tracker')
+    const { getRecentBlockEvents } = await import('./services/block-tracker')
     return getRecentBlockEvents(hours)
   } catch (error) {
     console.error('Error getting block events:', error)
@@ -2337,7 +3091,7 @@ ipcMain.handle('get-block-events', async (_, hours: number = 24) => {
 
 ipcMain.handle('get-block-snapshot', async () => {
   try {
-    const { loadBlockSnapshot } = await import('../src/lib/block-tracker')
+    const { loadBlockSnapshot } = await import('./services/block-tracker')
     return loadBlockSnapshot()
   } catch (error) {
     console.error('Error getting block snapshot:', error)
@@ -2348,7 +3102,8 @@ ipcMain.handle('get-block-snapshot', async () => {
 ipcMain.handle('get-daily-blocks', async (_, date?: string) => {
   try {
     const { getCurrentBlockInfo } = await import('./services/ccusage-service')
-    const blockInfo = getCurrentBlockInfo()
+    const userPlan = await getUserClaudePlan()
+    const blockInfo = await getCurrentBlockInfo(userPlan)
     
     // For now, return current block info. This could be enhanced to filter by date
     return blockInfo ? [blockInfo] : []
@@ -2457,12 +3212,13 @@ ipcMain.handle('clear-claude-usage-data', async (_, daysToKeep: number = 0) => {
     
     // Reset cache and refresh UI
     try {
-      const { resetUsageCache } = require('../src/lib/ccusage-integration')
+      const { resetUsageCache } = require('./services/ccusage-integration')
       resetUsageCache()
       
-      setTimeout(() => {
+      setTimeout(async () => {
         try {
-          const data = getRecentUsage(30)
+          const userPlan = await getUserClaudePlan()
+          const data = await getRecentUsage(30, userPlan)
           const usageUpdateData = {
             daily: data.daily.map(day => ({
               date: day.date,
@@ -2471,7 +3227,7 @@ ipcMain.handle('clear-claude-usage-data', async (_, daysToKeep: number = 0) => {
               totalTokens: day.totalTokens,
               cost: day.cost,
               model: 'mixed',
-              sessionsCount: Array.from(day.sessions).length
+              sessionsCount: Array.from(day.blocks || new Set()).length
             })),
             summary: {
               totalCost: data.totalCost,
@@ -2479,7 +3235,7 @@ ipcMain.handle('clear-claude-usage-data', async (_, daysToKeep: number = 0) => {
               totalSessions: data.totalSessions,
               averageTokensPerSession: data.totalSessions > 0 ? data.totalTokens / data.totalSessions : 0
             },
-            currentBlock: getCurrentBlockInfo()
+            currentBlock: await getCurrentBlockInfo(userPlan)
           }
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('usage-update', usageUpdateData)
@@ -2572,5 +3328,216 @@ ipcMain.handle('show-main-window', async () => {
   } catch (error) {
     console.error('Error showing main window:', error)
     return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+})
+
+// AI Specification Development IPC Handlers
+ipcMain.handle('spec-create-project', async (_, projectData) => {
+  try {
+    return await specService.createProject(projectData)
+  } catch (error) {
+    console.error('Error creating project:', error)
+    throw error
+  }
+})
+
+// Create user project from selected folder
+ipcMain.handle('spec-create-user-project', async (_, selectedPath, projectName, description) => {
+  try {
+    console.log('🏗️ Creating user project:', { selectedPath, projectName, description })
+    const result = await specService.createUserProject(selectedPath, projectName, description)
+    console.log('✅ User project created successfully:', result)
+    return result
+  } catch (error) {
+    console.error('❌ Error creating user project:', error)
+    throw error
+  }
+})
+
+// Create new project with spec-kit initialization
+ipcMain.handle('spec-create-new-project', async (_, parentPath, projectName, description) => {
+  try {
+    console.log('🆕 Creating new spec-kit project:', { parentPath, projectName, description })
+    const result = await specService.createNewProject(parentPath, projectName, description)
+    console.log('✅ New spec-kit project created successfully:', result)
+    return result
+  } catch (error) {
+    console.error('❌ Error creating new project:', error)
+    throw error
+  }
+})
+
+// Show folder selection dialog
+ipcMain.handle('show-open-dialog', async (_, options) => {
+  try {
+    console.log('🔍 show-open-dialog called with options:', options)
+    const result = mainWindow
+      ? await dialog.showOpenDialog(mainWindow, options)
+      : await dialog.showOpenDialog(options)
+    console.log('🔍 Dialog result:', result)
+    return result
+  } catch (error) {
+    console.error('❌ Error showing open dialog:', error)
+    throw error
+  }
+})
+
+// Show input dialog for text input
+ipcMain.handle('show-input-dialog', async (_, options) => {
+  try {
+    console.log('💬 show-input-dialog called with options:', options)
+    const result = mainWindow
+      ? await dialog.showMessageBox(mainWindow, {
+          type: 'question',
+          title: options.title || 'Input',
+          message: options.message || 'Enter value:',
+          detail: options.placeholder,
+          buttons: ['OK', 'Cancel'],
+          defaultId: 0,
+          cancelId: 1,
+          noLink: true
+        })
+      : await dialog.showMessageBox({
+          type: 'question',
+          title: options.title || 'Input',
+          message: options.message || 'Enter value:',
+          detail: options.placeholder,
+          buttons: ['OK', 'Cancel'],
+          defaultId: 0,
+          cancelId: 1,
+        })
+
+    // For now, return the default value if OK is clicked, null if canceled
+    // This is a simple implementation - in production you'd want a proper input dialog
+    if (result.response === 0) {
+      return options.defaultValue || 'New Project'
+    }
+    return null
+  } catch (error) {
+    console.error('❌ Error showing input dialog:', error)
+    throw error
+  }
+})
+
+
+ipcMain.handle('spec-get-projects', async () => {
+  try {
+    console.log('📂 Loading projects from backend...')
+    const projects = await specService.getProjects()
+    console.log('📂 Loaded projects:', projects)
+    return projects
+  } catch (error) {
+    console.error('❌ Error getting projects:', error)
+    return []
+  }
+})
+
+ipcMain.handle('spec-save-specification', async (_, projectId, spec) => {
+  try {
+    await specService.saveSpecification(projectId, spec)
+    return { success: true }
+  } catch (error) {
+    console.error('Error saving specification:', error)
+    throw error
+  }
+})
+
+ipcMain.handle('spec-load-specifications', async (_, projectId) => {
+  try {
+    return await specService.loadSpecifications(projectId)
+  } catch (error) {
+    console.error('Error loading specifications:', error)
+    return []
+  }
+})
+
+ipcMain.handle('spec-delete-specification', async (_, projectId, specId) => {
+  try {
+    await specService.deleteSpecification(projectId, specId)
+    return { success: true }
+  } catch (error) {
+    console.error('Error deleting specification:', error)
+    throw error
+  }
+})
+
+// Execute AI specification command with streaming support
+ipcMain.handle('spec-execute-command', async (_, command, content, projectPath) => {
+  try {
+    return await specService.executeClaudeCodeCommand(command, content, projectPath, mainWindow || undefined)
+  } catch (error) {
+    console.error('Error executing AI specification command:', error)
+    throw error
+  }
+})
+
+// Execute command with streaming (for real-time updates)
+ipcMain.handle('spec-execute-command-stream', async (_, command, content, projectPath) => {
+  try {
+    return new Promise((resolve, reject) => {
+      specService.executeClaudeCodeCommand(
+        command,
+        content,
+        projectPath,
+        mainWindow || undefined,
+        // Stream callback - send updates to renderer
+        (chunk: string) => {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('spec-command-stream', chunk)
+          }
+        }
+      ).then(resolve).catch(reject)
+    })
+  } catch (error) {
+    console.error('Error executing streaming command:', error)
+    throw error
+  }
+})
+
+// Get AI tools status
+ipcMain.handle('spec-get-ai-status', async () => {
+  try {
+    return await specService.getAIToolsStatus()
+  } catch (error) {
+    console.error('Error getting AI tools status:', error)
+    return { available: false, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+})
+
+// Open path in OS file manager
+ipcMain.handle('open-path', async (_, targetPath) => {
+  try {
+    await shell.openPath(targetPath)
+    return { success: true }
+  } catch (error) {
+    console.error('Error opening path:', error)
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+})
+
+ipcMain.handle('spec-export-specification', async (_, specId, projectId, format) => {
+  try {
+    return await specService.exportSpecification(specId, projectId, format)
+  } catch (error) {
+    console.error('Error exporting specification:', error)
+    throw error
+  }
+})
+
+ipcMain.handle('spec-get-stats', async () => {
+  try {
+    return await specService.getStats()
+  } catch (error) {
+    console.error('Error getting spec stats:', error)
+    return { projects: 0, specs: 0, totalSize: 0 }
+  }
+})
+
+ipcMain.handle('spec-get-directory', async () => {
+  try {
+    return await specService.getSpecDirectory()
+  } catch (error) {
+    console.error('Error getting spec directory:', error)
+    throw error
   }
 })

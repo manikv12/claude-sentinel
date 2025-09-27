@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card'
 import { Button } from './ui/button'
-import { 
+import {
   ScrollText,
   RefreshCw,
   Download,
@@ -11,8 +11,16 @@ import {
   Info,
   CheckCircle,
   Clock,
-  Trash2
+  Trash2,
+  Maximize2
 } from 'lucide-react'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle
+} from './ui/dialog'
 
 interface LogEntry {
   timestamp: string
@@ -36,6 +44,7 @@ export function LogViewer() {
   })
   const [logsPath, setLogsPath] = useState<string>('')
   const [isClearingLogs, setIsClearingLogs] = useState(false)
+  const [showLogsModal, setShowLogsModal] = useState(false)
 
   const loadLogs = async () => {
     setIsLoading(true)
@@ -132,15 +141,15 @@ export function LogViewer() {
   const clearOldLogs = async () => {
     setIsClearingLogs(true)
     try {
-      // Calculate date 1 day ago
-      const oneDayAgo = new Date()
-      oneDayAgo.setDate(oneDayAgo.getDate() - 1)
-      
-      const result = await window.electronAPI.clearRenewalLogs?.(oneDayAgo.toISOString())
+      // Calculate date 7 days ago (more aggressive clearing)
+      const sevenDaysAgo = new Date()
+      sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
+
+      const result = await window.electronAPI.clearRenewalLogs?.(sevenDaysAgo.toISOString())
       if (result?.success) {
         // Reload logs to show updated list
         await loadLogs()
-        console.log('Logs older than 1 day cleared successfully')
+        console.log('Logs older than 7 days cleared successfully')
       } else {
         console.error('Failed to clear old logs:', result?.error)
       }
@@ -169,15 +178,19 @@ export function LogViewer() {
             <Download className="h-4 w-4 mr-2" />
             Export
           </Button>
-          <Button 
-            onClick={clearOldLogs} 
-            disabled={isClearingLogs} 
-            variant="outline" 
+          <Button onClick={() => setShowLogsModal(true)} variant="outline" size="sm">
+            <Maximize2 className="h-4 w-4 mr-2" />
+            View Full
+          </Button>
+          <Button
+            onClick={clearOldLogs}
+            disabled={isClearingLogs}
+            variant="outline"
             size="sm"
             className="text-red-600 hover:text-red-700 hover:bg-red-50 dark:text-red-400 dark:hover:text-red-300 dark:hover:bg-red-950/20"
           >
             <Trash2 className="h-4 w-4 mr-2" />
-            {isClearingLogs ? 'Clearing...' : 'Clear Old'}
+            {isClearingLogs ? 'Clearing...' : 'Clear Old (7+ days)'}
           </Button>
         </div>
       </div>
@@ -241,13 +254,23 @@ export function LogViewer() {
         </CardContent>
       </Card>
 
-      {/* Log Entries */}
+      {/* Log Entries Preview */}
       <Card className="glass-card">
         <CardHeader>
-          <CardTitle>Log Entries ({filteredLogs.length})</CardTitle>
-          <CardDescription>
-            Auto-renewal scheduling, service events, and session activity
-          </CardDescription>
+          <div className="flex items-center justify-between">
+            <div>
+              <CardTitle>Log Entries ({filteredLogs.length})</CardTitle>
+              <CardDescription>
+                Auto-renewal scheduling, service events, and session activity
+              </CardDescription>
+            </div>
+            {filteredLogs.length > 0 && (
+              <Button onClick={() => setShowLogsModal(true)} variant="outline" size="sm">
+                <Maximize2 className="h-4 w-4 mr-2" />
+                View All ({filteredLogs.length})
+              </Button>
+            )}
+          </div>
         </CardHeader>
         <CardContent>
           <div className="space-y-2 max-h-96 overflow-y-auto">
@@ -262,37 +285,143 @@ export function LogViewer() {
                 </div>
               </div>
             ) : (
-              filteredLogs.map((log, index) => (
-                <div
-                  key={index}
-                  className="p-3 border rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors"
-                >
-                  <div className="flex items-start space-x-3">
-                    {getLevelIcon(log.level)}
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center space-x-2 mb-1">
-                        <span className={`text-xs font-medium uppercase tracking-wide ${getLevelColor(log.level)}`}>
-                          {log.level}
-                        </span>
-                        {log.category && (
-                          <span className="text-xs px-2 py-0.5 bg-primary/10 text-primary rounded">
-                            {log.category}
+              <>
+                {/* Show first 20 logs as preview */}
+                {filteredLogs.slice(0, 20).map((log, index) => (
+                  <div
+                    key={index}
+                    className="p-3 border rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors"
+                  >
+                    <div className="flex items-start space-x-3">
+                      {getLevelIcon(log.level)}
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center space-x-2 mb-1">
+                          <span className={`text-xs font-medium uppercase tracking-wide ${getLevelColor(log.level)}`}>
+                            {log.level}
                           </span>
-                        )}
-                        <div className="flex items-center space-x-1 text-xs text-muted-foreground ml-auto">
-                          <Clock className="h-3 w-3" />
-                          <span>{new Date(log.timestamp).toLocaleString()}</span>
+                          {log.category && (
+                            <span className="text-xs px-2 py-0.5 bg-primary/10 text-primary rounded">
+                              {log.category}
+                            </span>
+                          )}
+                          <div className="flex items-center space-x-1 text-xs text-muted-foreground ml-auto">
+                            <Clock className="h-3 w-3" />
+                            <span>{new Date(log.timestamp).toLocaleString()}</span>
+                          </div>
                         </div>
+                        <p className="text-sm text-foreground">{log.message}</p>
                       </div>
-                      <p className="text-sm text-foreground">{log.message}</p>
                     </div>
                   </div>
-                </div>
-              ))
+                ))}
+
+                {/* Show message if there are more logs */}
+                {filteredLogs.length > 20 && (
+                  <div className="text-center py-4">
+                    <p className="text-sm text-muted-foreground">
+                      Showing first 20 of {filteredLogs.length} logs
+                    </p>
+                    <Button onClick={() => setShowLogsModal(true)} variant="outline" size="sm" className="mt-2">
+                      <Maximize2 className="h-4 w-4 mr-2" />
+                      View All Logs
+                    </Button>
+                  </div>
+                )}
+              </>
             )}
           </div>
         </CardContent>
       </Card>
+
+      {/* Logs Modal */}
+      <Dialog open={showLogsModal} onOpenChange={setShowLogsModal}>
+        <DialogContent className="max-w-6xl max-h-[90vh] flex flex-col">
+          <DialogHeader>
+            <DialogTitle className="flex items-center justify-between">
+              <div className="flex items-center space-x-2">
+                <ScrollText className="h-5 w-5" />
+                <span>Full Log Viewer</span>
+              </div>
+              <div className="flex items-center space-x-2 text-sm text-muted-foreground">
+                <span>{filteredLogs.length} logs</span>
+                {logsPath && <span>• {logsPath}</span>}
+              </div>
+            </DialogTitle>
+            <DialogDescription>
+              Complete log entries with full details and timestamps
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="flex-1 overflow-hidden flex flex-col space-y-4">
+            {/* Modal Actions */}
+            <div className="flex justify-between items-center">
+              <div className="flex space-x-2">
+                <Button onClick={() => setShowLogsModal(false)} variant="outline" size="sm">
+                  <X className="h-4 w-4 mr-2" />
+                  Close
+                </Button>
+                <Button onClick={exportLogs} variant="outline" size="sm">
+                  <Download className="h-4 w-4 mr-2" />
+                  Export
+                </Button>
+              </div>
+              <Button
+                onClick={clearOldLogs}
+                disabled={isClearingLogs}
+                variant="outline"
+                size="sm"
+                className="text-red-600 hover:text-red-700 hover:bg-red-50 dark:text-red-400 dark:hover:text-red-300 dark:hover:bg-red-950/20"
+              >
+                <Trash2 className="h-4 w-4 mr-2" />
+                {isClearingLogs ? 'Clearing...' : 'Clear Old (7+ days)'}
+              </Button>
+            </div>
+
+            {/* Modal Log Content */}
+            <div className="flex-1 overflow-y-auto space-y-2">
+              {filteredLogs.length === 0 ? (
+                <div className="text-center py-12">
+                  <div className="flex flex-col items-center space-y-2">
+                    <ScrollText className="h-12 w-12 text-muted-foreground" />
+                    <p className="text-sm font-medium text-muted-foreground">No log entries found</p>
+                    <p className="text-xs text-muted-foreground">
+                      {logs.length === 0 ? 'No logs available' : 'Try adjusting your filters'}
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                filteredLogs.map((log, index) => (
+                  <div
+                    key={index}
+                    className="p-3 border rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors"
+                  >
+                    <div className="flex items-start space-x-3">
+                      {getLevelIcon(log.level)}
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center space-x-2 mb-1">
+                          <span className={`text-xs font-medium uppercase tracking-wide ${getLevelColor(log.level)}`}>
+                            {log.level}
+                          </span>
+                          {log.category && (
+                            <span className="text-xs px-2 py-0.5 bg-primary/10 text-primary rounded">
+                              {log.category}
+                            </span>
+                          )}
+                          <div className="flex items-center space-x-1 text-xs text-muted-foreground ml-auto">
+                            <Clock className="h-3 w-3" />
+                            <span>{new Date(log.timestamp).toLocaleString()}</span>
+                          </div>
+                        </div>
+                        <p className="text-sm text-foreground">{log.message}</p>
+                      </div>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

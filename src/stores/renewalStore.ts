@@ -48,7 +48,7 @@ export const useRenewalStore = create<RenewalStore>((set, get) => ({
   error: null,
   settings: {
     checkInterval: 5,
-    enableLogging: true,
+    enableLogging: false,
     notifyOnRenewal: true,
     autoRefresh: false,
     autoRefreshInterval: 120
@@ -86,13 +86,14 @@ export const useRenewalStore = create<RenewalStore>((set, get) => ({
       
       if (result && result.success) {
         set(state => ({
-          status: { 
-            ...state.status, 
+          status: {
+            ...state.status,
             enabled: result.enabled,
             scheduledStartTime: scheduledTime || null
           },
           isLoading: false
         }))
+
       } else {
         throw new Error(result?.error || 'Failed to toggle auto-renewal')
       }
@@ -129,10 +130,11 @@ export const useRenewalStore = create<RenewalStore>((set, get) => ({
         status: { ...state.status, scheduledStartTime: time },
         isLoading: false
       }))
+
     } catch (error) {
-      set({ 
+      set({
         error: error instanceof Error ? error.message : 'Failed to set scheduled time',
-        isLoading: false 
+        isLoading: false
       })
     }
   },
@@ -144,16 +146,22 @@ export const useRenewalStore = create<RenewalStore>((set, get) => ({
   refreshStatus: async () => {
     set({ isLoading: true, error: null })
     try {
+      if (!window.electronAPI?.getRenewalStatus) {
+        console.warn('Running in development mode - Electron API not available')
+        set({ isLoading: false })
+        return
+      }
+
       // Add timeout to prevent hanging
       const timeoutPromise = new Promise((_, reject) => {
         setTimeout(() => reject(new Error('Request timeout')), 8000) // 8 second timeout
       })
-      
+
       const status = await Promise.race([
         window.electronAPI.getRenewalStatus(),
         timeoutPromise
       ])
-      
+
       get().setRenewalStatus(status)
     } catch (error) {
       set({ error: error instanceof Error ? error.message : 'Failed to load renewal status' })

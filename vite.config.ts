@@ -18,7 +18,10 @@ export default defineConfig({
           build: {
             outDir: 'dist/main',
             rollupOptions: {
-              external: ['electron']
+              external: ['electron', 'fs', 'path', 'os', 'node:worker_threads', 'crypto', 'stream', 'util', 'events', 'child_process'],
+              output: {
+                format: 'cjs'
+              }
             }
           }
         }
@@ -29,7 +32,25 @@ export default defineConfig({
           build: {
             outDir: 'dist/preload',
             rollupOptions: {
-              external: ['electron']
+              external: ['electron', 'fs', 'path', 'os', 'node:worker_threads', 'crypto', 'stream', 'util', 'events', 'child_process'],
+              output: {
+                format: 'cjs'
+              }
+            }
+          }
+        }
+      },
+      // Build worker separately to keep heavy work off the main thread
+      {
+        entry: 'electron/workers/usageWorker.ts',
+        vite: {
+          build: {
+            outDir: 'dist/main/workers',
+            rollupOptions: {
+              external: ['electron', 'fs', 'path', 'os', 'node:worker_threads', 'crypto', 'stream', 'util', 'events', 'child_process'],
+              output: {
+                format: 'cjs'
+              }
             }
           }
         }

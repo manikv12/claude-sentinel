@@ -18,20 +18,66 @@ function getLogDir(): string {
   return LOG_DIR
 }
 
+export type RenewalLogLevel = 'info' | 'warn' | 'error'
+
+const levelOrder: Record<RenewalLogLevel, number> = {
+  info: 0,
+  warn: 1,
+  error: 2
+}
+
 export interface RenewalLogEntry {
   timestamp: string
-  level: 'info' | 'warn' | 'error'
+  level: RenewalLogLevel
   message: string
   category: 'schedule' | 'service' | 'renewal' | 'session'
 }
 
+let consoleStreamsHealthy = true
+let consoleGuardRegistered = false
+
+function ensureConsoleGuards() {
+  if (consoleGuardRegistered) return
+  consoleGuardRegistered = true
+
+  const handleStreamError = (stream: NodeJS.WriteStream | undefined) => {
+    if (!stream || typeof stream.on !== 'function') return
+    stream.on('error', (error: NodeJS.ErrnoException) => {
+      // When the host process closes stdout/stderr (common for background launchers)
+      // subsequent writes throw EIO/EPIPE asynchronously. Disable console logging entirely.
+      if (error?.code === 'EIO' || error?.code === 'EPIPE') {
+        consoleStreamsHealthy = false
+      }
+    })
+  }
+
+  handleStreamError(process.stdout as NodeJS.WriteStream | undefined)
+  handleStreamError(process.stderr as NodeJS.WriteStream | undefined)
+}
+
+function safeConsoleOutput(method: 'log' | 'warn' | 'error', ...args: unknown[]) {
+  if (!consoleStreamsHealthy) return
+  ensureConsoleGuards()
+
+  try {
+    console[method](...args)
+  } catch {
+    consoleStreamsHealthy = false
+  }
+}
+
 class RenewalLogService {
   private logsDir: string
+  private minLevel: RenewalLogLevel = 'warn'
 
   constructor() {
     this.logsDir = getLogDir()
     this.ensureLogDirectory()
     this.cleanOldLogs()
+  }
+
+  setLogLevel(level: RenewalLogLevel) {
+    this.minLevel = level
   }
 
   private ensureLogDirectory() {
@@ -40,8 +86,12 @@ class RenewalLogService {
         require('fs').mkdirSync(this.logsDir, { recursive: true })
       }
     } catch (error) {
-      console.error('Failed to create logs directory:', error)
+      safeConsoleOutput('error', 'Failed to create logs directory:', error)
     }
+  }
+
+  private shouldLog(level: RenewalLogLevel): boolean {
+    return levelOrder[level] >= levelOrder[this.minLevel]
   }
 
   private getTodayLogFile(): string {
@@ -55,18 +105,21 @@ class RenewalLogService {
   }
 
   log(level: RenewalLogEntry['level'], message: string, category: RenewalLogEntry['category'] = 'service') {
+    if (!this.shouldLog(level)) return
+
     try {
       const logFile = this.getTodayLogFile()
       const logEntry = this.formatLogEntry(level, message, category)
-      
+
       appendFileSync(logFile, logEntry)
-      
-      // Also log to console in development
+
+      // Also log to console in development - with error handling
       if (process.env.NODE_ENV === 'development') {
-        console.log(`[RENEWAL LOG] ${logEntry.trim()}`)
+        safeConsoleOutput('log', `[RENEWAL LOG] ${logEntry.trim()}`)
       }
     } catch (error) {
-      console.error('Failed to write to renewal log:', error)
+      // Only try console.error if we can safely do so
+      safeConsoleOutput('error', 'Failed to write to renewal log:', error)
     }
   }
 
@@ -80,6 +133,10 @@ class RenewalLogService {
 
   error(message: string, category: RenewalLogEntry['category'] = 'service') {
     this.log('error', message, category)
+  }
+
+  debug(message: string, category: RenewalLogEntry['category'] = 'service') {
+    this.log('info', `[DEBUG] ${message}`, category)
   }
 
   // Get all log entries from recent days
@@ -107,7 +164,7 @@ class RenewalLogService {
         }
       }
     } catch (error) {
-      console.error('Failed to read logs:', error)
+      safeConsoleOutput('error', 'Failed to read logs:', error)
     }
     
     // Sort by timestamp (newest first)
@@ -162,7 +219,7 @@ class RenewalLogService {
         }
       }
     } catch (error) {
-      console.error('Failed to clean old logs:', error)
+      safeConsoleOutput('error', 'Failed to clean old logs:', error)
     }
   }
 
@@ -185,7 +242,7 @@ class RenewalLogService {
         }
       }
     } catch (error) {
-      console.error('Failed to clear logs:', error)
+      safeConsoleOutput('error', 'Failed to clear logs:', error)
     }
   }
 

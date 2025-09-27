@@ -1,17 +1,47 @@
 /**
- * Auto-renewal service integrationits 
+ * Auto-renewal service integration
  * Extracted from ClaudeCodeAutoRenew for integration into Claude Sentinel
  */
 
-import * as fs from 'fs'
-import * as childProcess from 'child_process'
-import * as path from 'path'
-import * as os from 'os'
+const fs = require('fs')
+const childProcess = require('child_process')
+const path = require('path')
+const os = require('os')
 
-const { existsSync, readFileSync, writeFileSync, unlinkSync, appendFileSync } = fs
+// Import ccusage-integration at the top
+import { getCurrentBlockInfo as getCurrentBlockInfoLib } from './ccusage-integration'
+
+const { existsSync, readFileSync, writeFileSync, unlinkSync, appendFileSync, mkdirSync } = fs
 const { spawn, spawnSync } = childProcess
 const { join } = path
 const { homedir } = os
+// Track any spawned child PIDs so we can ensure cleanup on app quit
+const RENEWAL_CHILD_PIDS: Set<number> = new Set()
+
+export function killAllRenewalChildren(): void {
+  try {
+    for (const pid of Array.from(RENEWAL_CHILD_PIDS)) {
+      try { process.kill(pid, 'SIGTERM') } catch {}
+      RENEWAL_CHILD_PIDS.delete(pid)
+    }
+  } catch {}
+}
+
+
+// Get app data directory - prefer Electron app.getPath if available, fallback to home
+function getAppDataDir(): string {
+  try {
+    // Try to use Electron's app.getPath if available
+    const electron = require('electron')
+    const app = electron.app || electron.remote?.app
+    if (app) {
+      return app.getPath('userData')
+    }
+  } catch {
+    // Fallback to home directory if not in Electron context
+  }
+  return join(homedir(), '.claude-sentinel')
+}
 
 export interface RenewalConfig {
   enabled: boolean
@@ -30,18 +60,34 @@ export interface RenewalStatus {
   error?: string
 }
 
-const HOME = homedir()
-const PID_FILE = join(HOME, '.claude-sentinel-renewal.pid')
-const CONFIG_FILE = join(HOME, '.claude-sentinel-config.json')
-const LAST_ACTIVITY_FILE = join(HOME, '.claude-last-activity')
-const START_TIME_FILE = join(HOME, '.claude-auto-renew-start-time')
+const APP_DATA_DIR = getAppDataDir()
+// Use same PID file path as renewal-service.ts to avoid mismatch
+const { app } = require('electron')
+const USER_DATA = app.getPath('userData')
+const PID_FILE = join(USER_DATA, 'renewal.pid')
+const CONFIG_FILE = join(APP_DATA_DIR, 'config.json')
+const LAST_ACTIVITY_FILE = join(APP_DATA_DIR, 'last-activity')
+const START_TIME_FILE = join(APP_DATA_DIR, 'auto-renew-start-time')
+
+// Helper function to ensure directory exists before file operations
+function ensureAppDataDir() {
+  if (!existsSync(APP_DATA_DIR)) {
+    mkdirSync(APP_DATA_DIR, { recursive: true })
+  }
+}
 
 // Import renewal logger (dynamic import to avoid circular dependency)
 let renewalLogger: any = null
 try {
-  renewalLogger = require('../../electron/services/log-service').renewalLogger
+  renewalLogger = require('./log-service').renewalLogger
 } catch (error) {
   console.warn('Renewal logger not available in this context')
+}
+
+function applyLoggingPreference(enableLogging: boolean) {
+  if (renewalLogger && typeof renewalLogger.setLogLevel === 'function') {
+    renewalLogger.setLogLevel(enableLogging ? 'info' : 'warn')
+  }
 }
 
 /**
@@ -84,9 +130,7 @@ function getCcUsageCommand(): string | null {
  */
 function getMinutesUntilReset(): number | null {
   try {
-    // Import here to avoid circular dependencies
-    const { getCurrentBlockInfo } = require('./ccusage-integration')
-    const blockInfo = getCurrentBlockInfo()
+    const blockInfo = getCurrentBlockInfoLib()
     
     if (blockInfo && blockInfo.isActive && blockInfo.timeRemaining !== null) {
       return blockInfo.timeRemaining
@@ -135,6 +179,9 @@ export function startClaudeSession(): Promise<boolean> {
     }
     
     log(`Child process spawned with PID: ${child.pid}`, 'info', 'session')
+    if (typeof child.pid === 'number') {
+      RENEWAL_CHILD_PIDS.add(child.pid)
+    }
     
     let completed = false
     let stdoutData = ''
@@ -197,6 +244,11 @@ export function startClaudeSession(): Promise<boolean> {
       } else {
         log(`❌ Claude session failed with exit code ${code}`, 'error', 'session')
         log(`Failed session stderr: "${stderrData.trim()}"`, 'error', 'session')
+      }
+
+      // Remove from tracking set
+      if (typeof child.pid === 'number') {
+        RENEWAL_CHILD_PIDS.delete(child.pid)
       }
     })
     
@@ -275,18 +327,25 @@ export function loadConfig(): RenewalConfig {
   const defaultConfig: RenewalConfig = {
     enabled: false,
     checkInterval: 5,
-    enableLogging: true
+    enableLogging: false  // Keep as false for less verbose logging
   }
   
   try {
     if (existsSync(CONFIG_FILE)) {
       const configData = JSON.parse(readFileSync(CONFIG_FILE, 'utf8'))
-      return { ...defaultConfig, ...configData }
+      const config: RenewalConfig = {
+        ...defaultConfig,
+        ...configData,
+        enableLogging: configData.enableLogging === true
+      }
+      applyLoggingPreference(config.enableLogging)
+      return config
     }
   } catch (error) {
     log(`Error loading config: ${error}`)
   }
   
+  applyLoggingPreference(defaultConfig.enableLogging)
   return defaultConfig
 }
 
@@ -295,8 +354,38 @@ export function loadConfig(): RenewalConfig {
  */
 export function saveConfig(config: RenewalConfig): void {
   try {
+    ensureAppDataDir()
+    
+    // Save to legacy config file for backwards compatibility
     writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2))
-    log(`Configuration saved: enabled=${config.enabled}`)
+    
+    // Also save to main settings file to keep them synchronized
+    const SETTINGS_FILE = join(APP_DATA_DIR, 'settings.json')
+    let settings = {}
+    try {
+      if (existsSync(SETTINGS_FILE)) {
+        settings = JSON.parse(readFileSync(SETTINGS_FILE, 'utf8'))
+      }
+    } catch (error) {
+      log(`Warning: Could not read main settings file: ${error}`, 'warn', 'service')
+    }
+    
+    // Update autoRenewal section in main settings
+    settings = {
+      ...settings,
+      autoRenewal: {
+        ...(settings as any).autoRenewal || {},
+        enabled: config.enabled,
+        checkInterval: config.checkInterval || 5,
+        enableLogging: config.enableLogging === true
+      }
+    }
+    
+    writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2))
+    // Only log config changes if logging is enabled and it's an important change
+    if (config.enableLogging) {
+      log(`Configuration saved: enabled=${config.enabled}`, 'info', 'service')
+    }
   } catch (error) {
     log(`Error saving config: ${error}`)
     throw error
@@ -309,6 +398,7 @@ export function setScheduledStartTime(isoTime: string | null): { success: boolea
       if (existsSync(START_TIME_FILE)) unlinkSync(START_TIME_FILE)
       return { success: true }
     }
+    ensureAppDataDir()
     writeFileSync(START_TIME_FILE, isoTime)
     return { success: true }
   } catch (error) {
@@ -352,8 +442,7 @@ export function getRenewalStatus(): RenewalStatus {
   let lastActivity: Date | undefined
   let block: any = null
   try {
-    const { getCurrentBlockInfo } = require('./ccusage-integration')
-    block = getCurrentBlockInfo()
+    block = getCurrentBlockInfoLib()
     lastActivity = block && block.startTime ? new Date(block.startTime) : undefined
   } catch (error) {
     // Fallback if ccusage-integration is not available
@@ -392,6 +481,7 @@ export function startRenewalService(): { success: boolean; error?: string } {
     saveConfig(config)
     
     // Write PID file
+    ensureAppDataDir()
     writeFileSync(PID_FILE, process.pid.toString())
     
     // Start monitoring loop (this would run in the main process)
@@ -438,7 +528,7 @@ export function resetSessionTracking(): { success: boolean; error?: string } {
     const filesToReset = [
       LAST_ACTIVITY_FILE, 
       START_TIME_FILE,
-      join(homedir(), '.claude-last-block-state'),
+      join(APP_DATA_DIR, 'last-block-state'),
       join(homedir(), '.claude-last-renewal-check'),
       join(homedir(), '.claude-sentinel-renewal-lock')
     ]
@@ -512,7 +602,7 @@ export function getSessionStatus(): {
     START_TIME_FILE, 
     PID_FILE,
     CONFIG_FILE,
-    join(homedir(), '.claude-last-block-state'),
+    join(APP_DATA_DIR, 'last-block-state'),
     join(homedir(), '.claude-last-renewal-check'),
     join(homedir(), '.claude-sentinel-renewal-lock')
   ]
@@ -526,8 +616,7 @@ export function getSessionStatus(): {
   // Use block data instead of lastActivity file for session status
   let block: any = null
   try {
-    const { getCurrentBlockInfo } = require('./ccusage-integration')
-    block = getCurrentBlockInfo()
+    block = getCurrentBlockInfoLib()
   } catch (error) {
     // Fallback if ccusage-integration is not available
     block = null

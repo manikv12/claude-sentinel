@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react'
+import React, { useMemo, memo } from 'react'
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts'
 import { UsageData } from '@/stores/usageStore'
 import { formatTokens, formatCurrency } from '@/lib/utils'
@@ -11,7 +11,7 @@ interface UsageChartProps {
   viewType?: 'daily' | 'sessions'
 }
 
-export function UsageChart({ data, height = 250, type = 'area', showCost = false, viewType = 'daily' }: UsageChartProps) {
+function UsageChart({ data, height = 250, type = 'area', showCost = false, viewType = 'daily' }: UsageChartProps) {
   const chartData = useMemo(() => {
     if (!data.length) return []
 
@@ -118,7 +118,11 @@ export function UsageChart({ data, height = 250, type = 'area', showCost = false
   if (type === 'bar') {
     return (
       <ResponsiveContainer width="100%" height={height}>
-        <BarChart data={chartData} margin={{ top: 5, right: 5, left: 5, bottom: 5 }}>
+        <BarChart 
+          data={chartData} 
+          margin={{ top: 5, right: 5, left: 5, bottom: 5 }}
+          throttleDelay={100}
+        >
           <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" opacity={0.3} />
           <XAxis
             dataKey="date"
@@ -136,6 +140,8 @@ export function UsageChart({ data, height = 250, type = 'area', showCost = false
             fill="hsl(var(--primary))"
             radius={[2, 2, 0, 0]}
             opacity={0.8}
+            isAnimationActive={false}
+            animationDuration={0}
           />
         </BarChart>
       </ResponsiveContainer>
@@ -144,7 +150,11 @@ export function UsageChart({ data, height = 250, type = 'area', showCost = false
 
   return (
     <ResponsiveContainer width="100%" height={height}>
-      <AreaChart data={chartData} margin={{ top: 5, right: 5, left: 5, bottom: 5 }}>
+      <AreaChart 
+        data={chartData} 
+        margin={{ top: 5, right: 5, left: 5, bottom: 5 }}
+        throttleDelay={100}
+      >
         <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" opacity={0.3} />
         <XAxis
           dataKey="date"
@@ -164,8 +174,16 @@ export function UsageChart({ data, height = 250, type = 'area', showCost = false
           fill="hsl(var(--primary))"
           fillOpacity={0.2}
           strokeWidth={2}
+          isAnimationActive={false}
+          animationDuration={0}
         />
       </AreaChart>
     </ResponsiveContainer>
   )
 }
+
+// Memoize the component to prevent unnecessary re-renders
+const MemoizedUsageChart = memo(UsageChart)
+
+export { MemoizedUsageChart as UsageChart }
+export default MemoizedUsageChart
